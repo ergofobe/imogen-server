@@ -1,6 +1,9 @@
 services:
   imogen:
-    build: .
+    # Both repositories, because the client packages come from the sibling checkout.
+    build:
+      context: ..
+      dockerfile: imogen-server/Dockerfile
     image: ghcr.io/ergofobe/imogen-photos:latest
     restart: unless-stopped
     depends_on:

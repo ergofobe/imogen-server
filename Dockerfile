@@ -1,19 +1,31 @@
 # syntax=docker/dockerfile:1
 
+# The build context is the directory holding both imogen-server and imogen-sdk, not this
+# repository:
+#
+#     docker build -f imogen-server/Dockerfile -t imogen .
+#
+# The client packages are resolved from a sibling checkout until they are published, and a
+# build context cannot reach outside itself. Once they are on npm this reverts to an
+# ordinary context of `.` and the two COPY lines below go away.
+
 # ---- Build ----------------------------------------------------------------
 FROM oven/bun:1.3-debian AS build
 WORKDIR /app
 
+# /app/../imogen-sdk is where package.json's overrides say the client packages are, so
+# this is the layout the install expects rather than a convenience.
+COPY imogen-sdk/typescript/packages/shared /imogen-sdk/typescript/packages/shared
+COPY imogen-sdk/typescript/packages/sdk /imogen-sdk/typescript/packages/sdk
+
 # Manifests first, so a dependency layer is only rebuilt when dependencies change.
-COPY package.json bun.lock ./
-COPY packages/shared/package.json packages/shared/
-COPY packages/sdk/package.json packages/sdk/
-COPY packages/server/package.json packages/server/
-COPY packages/mcp/package.json packages/mcp/
-COPY packages/web/package.json packages/web/
+COPY imogen-server/package.json imogen-server/bun.lock ./
+COPY imogen-server/packages/server/package.json packages/server/
+COPY imogen-server/packages/mcp/package.json packages/mcp/
+COPY imogen-server/packages/web/package.json packages/web/
 RUN bun install --frozen-lockfile
 
-COPY . .
+COPY imogen-server/ .
 RUN bun run --filter '@imogen/web' build
 
 # The reference viewer is copied into the web bundle during that build, so the
@@ -45,8 +57,6 @@ ENV NODE_ENV=production \
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
-COPY --from=build /app/packages/shared ./packages/shared
-COPY --from=build /app/packages/sdk ./packages/sdk
 COPY --from=build /app/packages/server ./packages/server
 COPY --from=build /app/packages/mcp ./packages/mcp
 COPY --from=build /app/packages/web/dist ./packages/web/dist

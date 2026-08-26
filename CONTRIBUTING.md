@@ -4,6 +4,15 @@ Thanks for looking. imogen is small enough that a patch can land quickly.
 
 ## Getting set up
 
+The client libraries live in a sibling repository, and until they are published to npm
+this one resolves them from a checkout next to it:
+
+```bash
+git clone https://github.com/ergofobe/imogen-sdk.git ../imogen-sdk
+```
+
+Then:
+
 ```bash
 bun install
 docker compose -f docker/compose.dev.yml up -d
@@ -11,6 +20,13 @@ export DATABASE_URL='postgres://imogen:imogen@localhost:5432/imogen'
 bun run db:migrate
 bun run dev      # and, in another terminal, bun run dev:web
 ```
+
+The `overrides` block in the root `package.json` is what points `@imogen/sdk` and
+`@imogen/shared` at that checkout. Deleting it is the whole of the change once the packages
+are on npm.
+
+One wrinkle worth knowing: bun *copies* a `file:` dependency rather than symlinking it, so
+an edit in `../imogen-sdk` does not show up here until you run `bun install --force`.
 
 ## Before you open a pull request
 
@@ -39,9 +55,17 @@ Two habits are worth keeping:
 
 ## Changing the API
 
-`packages/shared` is the contract. Change the Zod schema there and the server, SDK, and
-web app all move together — that is the point of it. The OpenAPI document is generated
-from those schemas, so it cannot drift from what the server actually accepts.
+The contract is `@imogen/shared`, which lives in
+[imogen-sdk](https://github.com/ergofobe/imogen-sdk) alongside the five clients that have
+to keep to it. Change the Zod schema there and the server and web app move with it; the
+OpenAPI document is generated from those schemas, so it cannot drift from what the server
+actually accepts.
+
+A wire-format change needs both repositories. In imogen-sdk, update
+`conformance/` and every port; here, update the server and let
+`packages/server/src/api/sdk-contract.test.ts` confirm the two halves still agree. That
+test is the only place they meet: the fixtures over there prove the clients agree with each
+other, and nothing over there can prove the server answers them.
 
 ## Database changes
 

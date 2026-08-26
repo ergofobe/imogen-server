@@ -196,6 +196,10 @@ unnamed groupings and hidden people are not.
 The API is documented at `/api/v1/docs`, with the OpenAPI 3.1 description at
 `/api/v1/openapi.json`.
 
+There are clients for five languages in
+[imogen-sdk](https://github.com/ergofobe/imogen-sdk) — TypeScript, Rust, Python, Swift and
+Kotlin. In TypeScript:
+
 ```bash
 bun add @imogen/sdk
 ```
@@ -216,8 +220,9 @@ await imogen.assets.uploadMany(files, {
 
 ### Writing a mobile app
 
-The SDK ships the OAuth client a native app needs. Nothing is hard-coded: the app
-registers itself, so it works against any imogen server its user points it at.
+Every SDK ships the OAuth client a native app needs — the Swift and Kotlin ones are there
+for exactly this. Nothing is hard-coded: the app registers itself, so it works against any
+imogen server its user points it at.
 
 ```ts
 import { OAuthClient } from '@imogen/sdk'
@@ -266,11 +271,20 @@ exactly the parts a mock would let you get wrong.
 
 | Package | What it is |
 |---|---|
-| `packages/shared` | Zod schemas. The single source of truth for the API contract. |
 | `packages/server` | Hono app: routes, auth, media pipeline, job workers. |
 | `packages/web` | The React PWA. It consumes `@imogen/sdk` like any third-party client, which keeps the SDK honest. |
-| `packages/sdk` | `@imogen/sdk` — the typed client. |
 | `packages/mcp` | The stdio bridge for local agents. |
+
+The client libraries live in their own repository,
+[imogen-sdk](https://github.com/ergofobe/imogen-sdk) — TypeScript, Rust, Python, Swift and
+Kotlin, checked against one shared set of contract fixtures. `@imogen/shared`, the Zod
+schemas this server validates against and generates its OpenAPI document from, lives there
+too: it is the API contract, and the contract belongs with the clients that have to keep to
+it.
+
+`packages/server/src/api/sdk-contract.test.ts` is this side of that arrangement. It stands
+up a real app and drives it through the published TypeScript client, which is the only
+place the two halves can be shown to agree.
 
 The design document is in [`docs/superpowers/specs`](docs/superpowers/specs/).
 

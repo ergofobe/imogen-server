@@ -1,5 +1,9 @@
 node_modules
 **/node_modules
+**/target
+**/.build
+**/.gradle
+**/.venv
 **/dist
 **/dev-dist
 data
