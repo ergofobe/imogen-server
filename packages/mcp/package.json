@@ -17,6 +17,6 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@imogen/sdk": "workspace:*"
+    "@imogen/sdk": "^0.1.0"
   }
 }

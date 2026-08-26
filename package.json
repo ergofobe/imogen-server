@@ -19,7 +19,7 @@
     "lint:fix": "biome check --write .",
     "db:generate": "bun run --filter '@imogen/server' db:generate",
     "db:migrate": "bun run --filter '@imogen/server' db:migrate",
-    "typecheck:packages": "tsc -p packages/shared && tsc -p packages/sdk && tsc -p packages/server && tsc -p packages/mcp && tsc -p packages/web",
+    "typecheck:packages": "tsc -p packages/server && tsc -p packages/mcp && tsc -p packages/web",
     "verify": "bun run lint && bun run typecheck && bun test"
   },
   "devDependencies": {
@@ -29,5 +29,9 @@
   },
   "trustedDependencies": [
     "onnxruntime-node"
-  ]
+  ],
+  "overrides": {
+    "@imogen/shared": "file:../imogen-sdk/typescript/packages/shared",
+    "@imogen/sdk": "file:../imogen-sdk/typescript/packages/sdk"
+  }
 }

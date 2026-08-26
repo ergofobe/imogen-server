@@ -1,17 +1,10 @@
 import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
+import { type FetchLike, ImogenClient, ImogenError, OAuthClient } from '@imogen/sdk'
 import { sql } from 'drizzle-orm'
 import sharp from 'sharp'
-import { createApp } from '../../server/src/app.ts'
-import { createServices } from '../../server/src/services.ts'
-import {
-  createTestConfig,
-  createTestDatabase,
-  removeTestConfig,
-} from '../../server/src/test/harness.ts'
-import { ImogenClient } from './client.ts'
-import { ImogenError } from './errors.ts'
-import type { FetchLike } from './http.ts'
-import { OAuthClient } from './oauth.ts'
+import { createApp } from '../app.ts'
+import { createServices } from '../services.ts'
+import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
 
 process.env.NODE_ENV = 'test'
 
@@ -21,8 +14,12 @@ const services = createServices(config, harness.db)
 const app = createApp({ services })
 
 /**
- * The SDK is exercised against the real server rather than a mock. A mocked transport
- * would prove the SDK agrees with itself; this proves it agrees with the API.
+ * The published client, exercised against the real server.
+ *
+ * This test used to live in the SDK, and moved here when the SDK moved out. It belongs on
+ * this side of the split: the conformance suite in imogen-sdk pins down what the client
+ * sends, and nothing there can prove the server answers it. That is this file's job, and
+ * it needs a server to do it.
  */
 const cookieJar: string[] = []
 const testFetch: FetchLike = async (input, init) => {
