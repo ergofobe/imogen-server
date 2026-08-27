@@ -73,8 +73,14 @@ export function createFaceRoutes() {
 
       if (enabled) {
         // Downloading is slow and the models are large, so it happens in the background.
-        const job = (await services.models.isReady()) ? FACE_BACKFILL_JOB : FACE_MODELS_JOB
-        await services.queue.enqueue(job, {})
+        const ready = await services.models.isReady()
+        // 190 MB over a home connection deserves more than the default handful of
+        // attempts: giving up leaves the server permanently unable to scan anything.
+        await services.queue.enqueue(
+          ready ? FACE_BACKFILL_JOB : FACE_MODELS_JOB,
+          {},
+          ready ? {} : { maxAttempts: 10 },
+        )
       }
       return c.body(null, 204)
     },

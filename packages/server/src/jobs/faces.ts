@@ -12,6 +12,11 @@ export const FACE_MODELS_JOB = 'faces.downloadModels'
 /** How many photos one backfill pass queues before scheduling the next. */
 const BACKFILL_BATCH = 200
 
+/** How long a photo waits between checks while the models are still downloading. */
+const MODEL_WAIT_SECONDS = 30
+/** About half an hour of waiting before a photo stops expecting the download to finish. */
+const MODEL_WAIT_ATTEMPTS = 60
+
 export type FaceJobDeps = {
   db: Database
   faces: FaceService
@@ -23,6 +28,25 @@ export function registerFaceJobs(queue: JobQueue, deps: FaceJobDeps): void {
   queue.register(FACE_DETECT_JOB, async (payload) => {
     const assetId = payload.assetId
     if (typeof assetId !== 'string') throw new Error('face detection needs an assetId')
+
+    // The models are fetched in the background when face grouping is switched on, so a
+    // photo uploaded during that window reaches this job before they exist. It waits for
+    // them rather than burning its attempts against a file that is still downloading.
+    if (!(await deps.faces.modelsReady())) {
+      const waited = typeof payload.waited === 'number' ? payload.waited : 0
+      if (waited >= MODEL_WAIT_ATTEMPTS) {
+        throw new Error(
+          `face models are still missing after waiting; check the ${FACE_MODELS_JOB} job`,
+        )
+      }
+      await queue.enqueue(
+        FACE_DETECT_JOB,
+        { assetId, waited: waited + 1 },
+        { runAt: new Date(Date.now() + MODEL_WAIT_SECONDS * 1000) },
+      )
+      return
+    }
+
     await deps.faces.processAsset(assetId)
   })
 

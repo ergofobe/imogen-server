@@ -64,6 +64,11 @@ export class FaceService {
     if (!enabled) this.sessions = null
   }
 
+  /** Whether the weights are on disk. Nothing can be scanned until they are. */
+  async modelsReady(): Promise<boolean> {
+    return this.models.isReady()
+  }
+
   /** Loaded once and kept: creating a session costs far more than running one. */
   private async ready() {
     if (!this.sessions) this.sessions = await this.models.open()
