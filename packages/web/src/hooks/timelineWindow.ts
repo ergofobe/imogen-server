@@ -189,15 +189,29 @@ export function neighbouringPeriod(
  * Switch to Favourites while a reload is queued and non-favourites arrive; nothing corrects it,
  * because the spine does not change again.
  *
- * `askedUnder` is the question THIS fetch was made under, captured with the fetch rather than
- * read from anywhere, so the comparison is exact no matter when or how often it runs. What it
- * guarantees is precisely that: an answer reaches `deliver` only while the question that
- * produced it is still the current one. It says nothing about the answer being fresh — a
+ * `askedUnder` is the question THIS fetch was made under, carried with the fetch rather than
+ * read from anywhere, so the comparison means the same thing no matter when or how often it
+ * runs.
+ *
+ * It is a string, and deliberately not a generic: the question has to be the filter's CONTENT,
+ * not the object holding it. A caller that mutates its filter in place rather than replacing
+ * it changes what the fetch means while leaving every object identity alone, and an identity
+ * comparison would see nothing at all and deliver the old filter's tiles into the new filter's
+ * map — the same bug this guard exists to prevent, arriving through a different door. Typing
+ * it as a string is what stops a caller passing the object by accident: doing so does not
+ * compile.
+ *
+ * What it guarantees, exactly: an answer reaches `deliver` only while the filter content that
+ * produced it is still the content being asked about. Two filters that serialise the same are
+ * the same question, so a fetch that outlives a detour to another filter and back is still
+ * delivered — its tiles are the ones the current filter wants. Two that serialise differently
+ * are different questions even when they would select the same photographs, which
+ * over-discards and never under-discards. It says nothing about the answer being fresh: a
  * mutation during the flight is the loader's problem, not this one's.
  */
-export function createGuardedPeriodFetch<Question>(options: {
-  askedUnder: Question
-  currentQuestion: () => Question
+export function createGuardedPeriodFetch(options: {
+  askedUnder: string
+  currentQuestion: () => string
   fetchPeriod: (period: string) => Promise<TimelineTile[]>
   deliver: (period: string, tiles: TimelineTile[]) => void
 }): (period: string) => Promise<void> {

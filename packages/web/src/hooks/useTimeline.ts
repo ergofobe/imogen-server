@@ -103,8 +103,13 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
 
   const pinned = useRef<string[]>([])
   const loadedNow = useRef<LoadedTiles>(NOTHING_LOADED)
-  /** The filter on screen. A reply to any other one is dropped rather than absorbed. */
-  const currentQuery = useRef(query)
+  /**
+   * The filter on screen, as its content rather than as the object carrying it. A reply to any
+   * other one is dropped rather than absorbed — and content, because a caller that mutated its
+   * filter in place would leave every object identity untouched while changing what a fetch in
+   * the air means.
+   */
+  const currentQuestion = useRef(filterKey)
 
   useLayoutEffect(() => {
     pinned.current = visiblePeriods
@@ -117,8 +122,8 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
   // On commit rather than during render: a render React abandons must not be able to declare
   // a filter current that never reached the screen, which would discard the real one's replies.
   useLayoutEffect(() => {
-    currentQuery.current = query
-  }, [query])
+    currentQuestion.current = filterKey
+  }, [filterKey])
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: a filter change is the one thing that invalidates everything held
   useEffect(() => {
@@ -126,11 +131,14 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
     setLoaded(NOTHING_LOADED)
   }, [filterKey])
 
+  // Keyed on `filterKey` as well as on `query`, because those two can part company: a filter
+  // mutated in place changes its content while leaving the object it lives in alone, and this
+  // has to be rebuilt to carry the new question when that happens.
   const fetchPeriod = useMemo(
     () =>
       createGuardedPeriodFetch({
-        askedUnder: query,
-        currentQuestion: () => currentQuery.current,
+        askedUnder: filterKey,
+        currentQuestion: () => currentQuestion.current,
         // The endpoint pages at 5000 and a heavy month runs well past that; `collectPeriod`
         // follows the cursor to the end before any of it lands.
         fetchPeriod: (period) =>
@@ -140,7 +148,7 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
         deliver: (period, tiles) =>
           setLoaded((current) => absorb(current, period, tiles, pinned.current)),
       }),
-    [query],
+    [filterKey, query],
   )
 
   // Rebuilt when the filter changes, which discards what the old one was tracking. Anything

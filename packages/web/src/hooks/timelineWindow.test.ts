@@ -722,3 +722,93 @@ describe('createPeriodLoader when a fetch fails', () => {
     await expect(inFlight).rejects.toThrow('offline 2')
   })
 })
+
+describe('createGuardedPeriodFetch keys on what the filter says, not on the object saying it', () => {
+  const tile = (id: string): TimelineTile => ({
+    id,
+    capturedAt: '2011-08-14T09:00:00.000Z',
+    width: 4032,
+    height: 3024,
+    type: 'image',
+    status: 'ready',
+    favorite: false,
+    duration: null,
+    placeholderColor: null,
+    livePhotoVideoId: null,
+  })
+
+  /**
+   * The hook derives its question exactly this way, and the two derivations below are the
+   * whole point of the round: one sees a filter mutated in place, the other cannot.
+   */
+  const byContent = (filter: object) => JSON.stringify(filter)
+  const byIdentity = (filter: object) => filter as unknown as string
+
+  const fetchUnder = (filter: object, questionOf: (f: object) => string) => {
+    const delivered: string[][] = []
+    let land: (tiles: TimelineTile[]) => void = () => {}
+    const run = createGuardedPeriodFetch({
+      askedUnder: questionOf(filter),
+      currentQuestion: () => questionOf(filter),
+      fetchPeriod: () =>
+        new Promise<TimelineTile[]>((resolve) => {
+          land = resolve
+        }),
+      deliver: (_period, tiles) => delivered.push(tiles.map((t) => t.id)),
+    })
+    return { delivered, run, land: (ids: string[]) => land(ids.map(tile)) }
+  }
+
+  /*
+   * Nothing does this today — the three filters are inline literals, fresh every render — but
+   * a caller that holds one filter object and edits it is the ordinary way to write this, and
+   * the tiles in the air when it happens belong to the question as it was. Comparing the object
+   * sees no change whatsoever, because there is no change to the object.
+   */
+  test('a filter mutated in place changes the question, and the old answer is refused', async () => {
+    const filter: { favorite?: boolean } = { favorite: true }
+    const { delivered, run, land } = fetchUnder(filter, byContent)
+    const inFlight = run('2011-08')
+    filter.favorite = false
+    land(['a', 'b'])
+    await inFlight
+    expect(delivered).toEqual([])
+  })
+
+  test('and comparing the object instead would have delivered it', async () => {
+    const filter: { favorite?: boolean } = { favorite: true }
+    const { delivered, run, land } = fetchUnder(filter, byIdentity)
+    const inFlight = run('2011-08')
+    filter.favorite = false
+    land(['a', 'b'])
+    await inFlight
+    expect(delivered).toEqual([['a', 'b']])
+  })
+
+  /*
+   * The other side of keying on content: Photos, away to Favourites, and back to Photos gives
+   * a fresh filter object but the same question, so a fetch that outlived the detour carries
+   * exactly the tiles the timeline is now asking for and there is no reason to throw it away.
+   */
+  test('the same filter written twice is the same question, so a fetch that outlived a detour lands', async () => {
+    const delivered: string[][] = []
+    let land: (tiles: TimelineTile[]) => void = () => {}
+    const onScreen = { current: JSON.stringify({}) }
+    const run = createGuardedPeriodFetch({
+      askedUnder: JSON.stringify({}),
+      currentQuestion: () => onScreen.current,
+      fetchPeriod: () =>
+        new Promise<TimelineTile[]>((resolve) => {
+          land = resolve
+        }),
+      deliver: (_period, tiles) => delivered.push(tiles.map((t) => t.id)),
+    })
+
+    const inFlight = run('2011-08')
+    onScreen.current = JSON.stringify({ favorite: true })
+    onScreen.current = JSON.stringify({})
+    land([tile('a')])
+    await inFlight
+    expect(delivered).toEqual([['a']])
+  })
+})
