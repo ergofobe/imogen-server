@@ -201,11 +201,15 @@ export function createAuthRoutes() {
     },
   )
 
-  app.route('/', authed)
-
   // --- OIDC single sign-on ---
   // These redirect a browser rather than returning JSON, so they stay out of the
   // OpenAPI document that describes the machine-readable API.
+  //
+  // They MUST be registered before `app.route('/', authed)` below. That sub-app
+  // carries `use('*', requireAuth())`, and Hono runs middleware in registration
+  // order, so mounting it first makes it swallow these two routes — nobody could
+  // ever begin a sign-in, and the provider's callback would be rejected as
+  // unauthenticated. Signing in is precisely the request that has no session yet.
 
   app.get('/oidc/start', async (c) => {
     const { oidc } = c.get('services')
@@ -233,6 +237,9 @@ export function createAuthRoutes() {
       return c.redirect(`/login?error=${encodeURIComponent(message)}`)
     }
   })
+
+  // Everything below here requires a session. Keep it last: see the note above.
+  app.route('/', authed)
 
   return app
 }

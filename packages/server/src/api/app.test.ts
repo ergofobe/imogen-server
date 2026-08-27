@@ -947,3 +947,26 @@ describe('sharing a single photograph', () => {
     expect(response.status).toBe(404)
   })
 })
+
+describe('OIDC routes are reachable without a session', () => {
+  // Regression: `authed` carries `use('*', requireAuth())` and used to be mounted at
+  // '/' before these two routes were registered, so Hono ran requireAuth() first and
+  // answered both with 401. That made single sign-on impossible to start and the
+  // provider's callback impossible to complete. Signing in is by definition the one
+  // request that has no session yet, so these must sit outside the authed sub-app.
+  //
+  // This server has no OIDC provider configured, so the correct answer is 400 ("not
+  // configured"). The point is what it is NOT: a 401. A 401 means requireAuth() ran,
+  // which means the ordering has regressed.
+  test('/auth/oidc/start is not gated by requireAuth', async () => {
+    const response = await request('/api/v1/auth/oidc/start')
+    expect(response.status).not.toBe(401)
+    expect(response.status).toBe(400)
+  })
+
+  test('/auth/oidc/callback is not gated by requireAuth', async () => {
+    const response = await request('/api/v1/auth/oidc/callback?code=irrelevant')
+    expect(response.status).not.toBe(401)
+    expect(response.status).toBe(400)
+  })
+})
