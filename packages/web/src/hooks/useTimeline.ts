@@ -178,9 +178,36 @@ export function useTimeline(
    */
   const currentQuestion = useRef(filterKey)
 
+  /**
+   * The months that may be asked for: the visible ones and one either side.
+   *
+   * Computed before the pin below rather than beside the effect that uses it, because the
+   * two have to be the same list. See the pin.
+   */
+  const wanted = useMemo(
+    () => periodsToFetch(visiblePeriods, allPeriods),
+    [visiblePeriods, allPeriods],
+  )
+
+  /**
+   * What survives eviction is what may be REQUESTED, not merely what is on screen.
+   *
+   * These were two different sets, and the gap between them was a loop. `periodsToFetch`
+   * asks for the visible months plus one either side; the pin held only the visible ones,
+   * and everything unpinned was subject to `MAX_LOADED_PERIODS`. So with seven or more
+   * months on screen — a sparse library on a tall viewport, a few photographs a month —
+   * a neighbour was evicted by `absorb` the moment it landed. `loaded.periods` changed
+   * identity, the fetch effect re-ran, found the month missing and asked again, forever.
+   *
+   * Pinning the request set closes it by construction rather than by picking a bigger cap
+   * and hoping: nothing can be asked for that cannot then be kept. `evictPeriods` already
+   * lets a pin beat the cap without exception, so the ceiling on what is held becomes
+   * `max(MAX_LOADED_PERIODS, visible + 2)` — bounded by the viewport rather than by the
+   * library, which is the same thing the pin already promised for the visible months.
+   */
   useLayoutEffect(() => {
-    pinned.current = visiblePeriods
-  }, [visiblePeriods])
+    pinned.current = wanted
+  }, [wanted])
 
   useLayoutEffect(() => {
     loadedNow.current = loaded
@@ -222,11 +249,6 @@ export function useTimeline(
   // still in the air from it — including a reload it had queued — is dropped on arrival,
   // because the fetch carries the filter it was made under and compares that, not a counter.
   const periods = useMemo(() => createPeriodLoader(fetchPeriod), [fetchPeriod])
-
-  const wanted = useMemo(
-    () => periodsToFetch(visiblePeriods, allPeriods),
-    [visiblePeriods, allPeriods],
-  )
 
   useEffect(() => {
     if (suspended || !enabled) return

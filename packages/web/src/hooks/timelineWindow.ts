@@ -12,6 +12,11 @@ import { groupTilesByDay, periodOf, type SegmentTable, scrollDelta } from '../li
  * Eight months of tiles. A month of heavy shooting is a few thousand tiles at roughly 200
  * bytes each, so eight is a handful of megabytes — enough that a reader can wander up and
  * down a season without refetching, and far short of the whole library.
+ *
+ * A floor rather than a ceiling: `evictPeriods` lets the pinned set through whatever this
+ * says, and the pinned set is what `periodsToFetch` asked for. A viewport spanning more
+ * months than this holds all of them, because a month that can be requested and cannot be
+ * kept is a month that is fetched, evicted and fetched again for as long as it is on screen.
  */
 export const MAX_LOADED_PERIODS = 8
 
@@ -22,6 +27,9 @@ export const MAX_LOADED_PERIODS = 8
  * Neighbours come from the spine's own list rather than from arithmetic on the month, so a
  * library with a gap in it reaches across the gap to a month that actually exists instead
  * of asking for an empty one.
+ *
+ * This is also what gets pinned against eviction. The two must be the same list: a month
+ * this asks for that eviction is free to take is refetched the moment it lands.
  */
 export function periodsToFetch(visiblePeriods: string[], allPeriods: string[]): string[] {
   const wanted = new Set<string>()
@@ -37,12 +45,14 @@ export function periodsToFetch(visiblePeriods: string[], allPeriods: string[]): 
 }
 
 /**
- * Which loaded months survive, given what is on screen.
+ * Which loaded months survive, given what may be asked for.
  *
- * `pinned` wins over the cap without exception: a drag across a year can put more months in
- * the viewport than the budget allows, and evicting one of those to honour a number would
- * blank the very rows the reader is looking at. The cap exists to stop a long scroll
- * accumulating a library's worth of tiles, not to be defended against the reader.
+ * `pinned` is `periodsToFetch`'s answer, not the bare visible list, and it wins over the cap
+ * without exception. A drag across a year can put more months in the viewport than the
+ * budget allows, and evicting one of those to honour a number would blank the very rows the
+ * reader is looking at — or worse, would evict a month the fetcher is about to ask for
+ * again, which is a round trip per lap rather than a blank. The cap exists to stop a long
+ * scroll accumulating a library's worth of tiles, not to be defended against the reader.
  */
 export function evictPeriods(usedInOrder: string[], pinned: string[]): string[] {
   const keep = new Set(pinned)
