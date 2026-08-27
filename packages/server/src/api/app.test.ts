@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
 import { createHash, randomBytes } from 'node:crypto'
 import { sql } from 'drizzle-orm'
 import sharp from 'sharp'
+import manifest from '../../package.json'
 import { createApp } from '../app.ts'
 import { createServices } from '../services.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
@@ -77,6 +78,13 @@ describe('health and docs', () => {
 
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ status: 'ok' })
+  })
+
+  test('health check reports the version this build was cut at', async () => {
+    const response = await request('/api/v1/health')
+
+    const { version } = (await response.json()) as { version: string }
+    expect(version).toBe(manifest.version)
   })
 
   test('publishes an OpenAPI document describing the API', async () => {

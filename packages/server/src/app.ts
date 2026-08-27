@@ -6,6 +6,7 @@ import { Scalar } from '@scalar/hono-api-reference'
 import type { Hono } from 'hono'
 import { logger } from 'hono/logger'
 import { secureHeaders } from 'hono/secure-headers'
+import manifest from '../package.json'
 import { createAdminRoutes } from './api/admin.ts'
 import { createAlbumRoutes } from './api/albums.ts'
 import { createAssetRoutes } from './api/assets.ts'
@@ -186,7 +187,14 @@ export function createApp({ services, webRoot }: AppOptions) {
   return app
 }
 
-export const VERSION = '0.1.0'
+/**
+ * What /api/v1/health and the OpenAPI document report.
+ *
+ * Read from the manifest rather than written out again here: cutting a release bumps
+ * package.json, and a second copy of the number is a copy that gets forgotten — the
+ * health check went on claiming 0.1.0 through three tagged releases.
+ */
+export const VERSION: string = manifest.version
 
 /**
  * Serves the built single-page app: hashed assets cached forever, everything else
