@@ -643,6 +643,12 @@ describe('timeline buckets', () => {
     ['2011-04-31', new Date('2011-05-01T09:00:00Z')],
     ['2011-08-00', new Date('2011-07-31T09:00:00Z')],
     ['2023-02-29', new Date('2023-03-01T09:00:00Z')],
+    // Reached through the year rather than the month or the day, and the same silent
+    // rollover: `Date.UTC` maps a year of 0 to 99 into 1900 to 1999, so a two-digit year
+    // padded to four digits answers 200 with somebody's photographs from the last century.
+    ['0011-08', new Date('1911-08-14T09:00:00Z')],
+    ['0099-12', new Date('1999-12-05T09:00:00Z')],
+    ['0000-01', new Date('1900-01-09T09:00:00Z')],
   ] as const
 
   for (const [period, wouldHaveRolledInto] of impossiblePeriods) {

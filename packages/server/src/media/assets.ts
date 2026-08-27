@@ -488,6 +488,14 @@ function periodBounds(period: string): { start: Date; end: Date } {
   const [year, month, day] = period.split('-').map(Number)
   const inRange =
     Number.isInteger(year) &&
+    // `Date.UTC` reads a year of 0 to 99 as 1900 to 1999, so '0011-08' would quietly become
+    // August 1911 and answer 200 with a stranger's decade. The same silent rollover the
+    // month and day checks below exist to prevent, reached through the year instead. The
+    // upper bound matches the four digits the schema accepts, so nothing that gets this far
+    // can exceed it — but it is stated rather than assumed, because the day this is derived
+    // from a looser shape is the day it starts mapping into years `Date` cannot hold.
+    year! >= 100 &&
+    year! <= 9999 &&
     Number.isInteger(month) &&
     month! >= 1 &&
     month! <= 12 &&
