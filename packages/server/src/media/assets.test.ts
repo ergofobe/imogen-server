@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import { sql } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { albumAssets, albums, assets, faces, people, users } from '../db/schema.ts'
 import { createTestDatabase } from '../test/harness.ts'
@@ -448,6 +448,34 @@ describe('selections by query', () => {
     await seed(ownerId, [{ capturedAt: new Date('2011-08-14T09:00:00Z') }])
     const [only] = (await listAll()).items
     expect(await service.trashSelection(ownerId, { assetIds: [only!.id] })).toBe(1)
+  })
+
+  /**
+   * `never reaches the vault`, above, goes through the QUERY branch and re-proves Task
+   * 8's `buildFilters` guard — it says nothing about the id branch's own
+   * `isNull(assets.vaultedAt)`. This drives the same asset id straight in.
+   */
+  test('the id form never reaches the vault either', async () => {
+    const [vaulted] = await seed(ownerId, [
+      { capturedAt: new Date('2011-08-14T09:00:00Z'), vaultedAt: new Date() },
+    ])
+    expect(await service.trashSelection(ownerId, { assetIds: [vaulted!.id] })).toBe(0)
+    const [row] = await db.select().from(assets).where(eq(assets.id, vaulted!.id))
+    expect(row!.vaultedAt).not.toBeNull()
+    expect(row!.deletedAt).toBeNull()
+  })
+
+  /**
+   * `the id form still works exactly as it did`, above, only ever trashes the caller's
+   * own asset — it would pass even without `eq(assets.ownerId, ownerId)` in the id
+   * branch. This is the id-form counterpart of `never reaches another owner`.
+   */
+  test('the id form never reaches another owner either', async () => {
+    const stranger = await seedOwner()
+    const [theirs] = await seed(stranger, [{ capturedAt: new Date('2011-08-14T09:00:00Z') }])
+    expect(await service.trashSelection(ownerId, { assetIds: [theirs!.id] })).toBe(0)
+    const [row] = await db.select().from(assets).where(eq(assets.id, theirs!.id))
+    expect(row!.deletedAt).toBeNull()
   })
 
   test('restores by query, from the trash', async () => {

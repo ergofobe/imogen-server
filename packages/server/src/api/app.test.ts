@@ -100,6 +100,38 @@ describe('health and docs', () => {
     expect(Object.keys(doc.paths)).toContain('/api/v1/assets')
     expect(Object.keys(doc.components.securitySchemes)).toContain('oauth2')
   })
+
+  /**
+   * `AssetSelection` carries a `.refine`, which makes it a `ZodEffects` rather than a
+   * plain `ZodObject` — a shape `@hono/zod-openapi` could plausibly flatten to a
+   * degenerate `{}` request body instead of expanding it. It does not: this pins the
+   * generated schema to something a client could actually generate types from.
+   */
+  test('the selection body for a bulk mutation route is not a degenerate schema', async () => {
+    const response = await request('/api/v1/openapi.json')
+    const doc = (await response.json()) as {
+      paths: Record<
+        string,
+        { post: { requestBody: { content: { 'application/json': { schema: unknown } } } } }
+      >
+    }
+
+    const schema = doc.paths['/api/v1/assets/trash']!.post.requestBody.content['application/json']
+      .schema as {
+      type: string
+      properties: {
+        assetIds?: { type: string; items: { format: string } }
+        query?: { properties: Record<string, unknown> }
+        except?: { type: string; maxItems: number }
+      }
+    }
+
+    expect(schema.type).toBe('object')
+    expect(schema.properties.assetIds?.items.format).toBe('uuid')
+    expect(schema.properties.except?.maxItems).toBe(10_000)
+    // The nested AssetFilter shape survived too, not just the outer envelope.
+    expect(Object.keys(schema.properties.query?.properties ?? {})).toContain('favorite')
+  })
 })
 
 describe('account lifecycle', () => {

@@ -265,6 +265,13 @@ export class AssetService {
     return rows.length
   }
 
+  /**
+   * The weaker sibling of the vault move-out gap: a `query`-form selection here with no
+   * `trashed: true` inherits `isNull(assets.deletedAt)` from `buildFilters`'s untrashed
+   * default, so it matches nothing and restores nothing — a silent no-op rather than a
+   * rejected request. Left as-is: unlike vault move-out, `trashed: true` gives a query a
+   * real, correct way to mean "the trash", so there is no case that can only ever fail.
+   */
   async restoreSelection(ownerId: string, selection: AssetSelection): Promise<number> {
     const rows = await this.db
       .update(assets)

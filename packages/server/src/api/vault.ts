@@ -4,7 +4,7 @@ import type { Context } from 'hono'
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie'
 import { type AppEnv, requireAuth } from '../auth/middleware.ts'
 import { FACE_DETECT_JOB } from '../jobs/faces.ts'
-import { forbidden } from '../lib/errors.ts'
+import { badRequest, forbidden } from '../lib/errors.ts'
 import type { Services } from '../services.ts'
 import { asHttpError } from '../vault/vault.ts'
 import { ERROR_RESPONSES, NO_CONTENT, ok, security } from './openapi.ts'
@@ -194,13 +194,15 @@ export function createVaultRoutes() {
       const services = c.get('services')
       const ownerId = c.get('principal').user.id
       const assetIds = await services.assets.resolveSelection(ownerId, c.req.valid('json'))
-      const moved = await services.vault.moveIn(ownerId, assetIds)
+      const movedIds = await services.vault.moveIn(ownerId, assetIds)
 
       // Faces found in a vaulted photo stop existing. Leaving them would let a vaulted
       // photo keep contributing to a named person's thumbnail and count. One call, not
-      // one per photo — a selection can run to tens of thousands.
-      await services.faces.forgetAssets(assetIds, ownerId)
-      return c.json({ moved }, 200)
+      // one per photo — a selection can run to tens of thousands. Scoped to what actually
+      // moved, not what was requested: an id that failed its ownership or vault check
+      // inside `moveIn` should not have its faces forgotten either.
+      await services.faces.forgetAssets(movedIds, ownerId)
+      return c.json({ moved: movedIds.length }, 200)
     },
   )
 
@@ -210,6 +212,8 @@ export function createVaultRoutes() {
       path: '/assets',
       tags: ['Vault'],
       summary: 'Move photos back into the library',
+      description:
+        'Takes an explicit id list only. A filter cannot select photos still in the vault.',
       security: security(),
       request: { body: { content: { 'application/json': { schema: AssetSelection } } } },
       responses: {
@@ -220,7 +224,16 @@ export function createVaultRoutes() {
     async (c) => {
       const services = c.get('services')
       const ownerId = c.get('principal').user.id
-      const assetIds = await services.assets.resolveSelection(ownerId, c.req.valid('json'))
+      const selection = c.req.valid('json')
+      // A filter can never see into the vault — that is the invariant the vault depends
+      // on — so a query-form selection here could only ever resolve to zero, which would
+      // read as a silent, successful no-op rather than the error it actually is. Moving
+      // photographs out needs the ids of what is already vaulted, which only the vault's
+      // own listing can supply.
+      if (!selection.assetIds) {
+        throw badRequest('Moving photographs out of the vault needs an explicit list of ids')
+      }
+      const assetIds = await services.assets.resolveSelection(ownerId, selection)
       const moved = await services.vault.moveOut(ownerId, assetIds)
 
       // Out of the vault, a photo rejoins the library and is scanned again.

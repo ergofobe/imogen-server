@@ -251,13 +251,7 @@ export class FaceService {
     await this.refreshCounts(ownerId)
   }
 
-  /** Called when a photo is vaulted: its faces stop existing. */
-  async forgetAsset(assetId: string, ownerId: string): Promise<void> {
-    await this.db.delete(faces).where(eq(faces.assetId, assetId))
-    await this.refreshCounts(ownerId)
-  }
-
-  /** The same as forgetting one, for a selection that may run to tens of thousands. */
+  /** Called when a photo is vaulted: its faces stop existing. Also used for a set of many. */
   async forgetAssets(assetIds: string[], ownerId: string): Promise<void> {
     if (assetIds.length === 0) return
     await this.db

@@ -10,6 +10,7 @@ import type {
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { type AlbumRow, albumAssets, albums, assets, shareLinks } from '../db/schema.ts'
+import { BULK_BATCH_SIZE, chunk } from '../lib/batch.ts'
 import { forbidden, notFound } from '../lib/errors.ts'
 import { generateToken } from '../lib/tokens.ts'
 import { toAsset } from './serialize.ts'
@@ -73,7 +74,11 @@ const coverAssetId = sql<string | null>`coalesce(
 )`
 
 export class AlbumService {
-  constructor(private readonly db: Database) {}
+  /** Overridable so a test can cross the batch boundary without seeding thousands of rows. */
+  constructor(
+    private readonly db: Database,
+    private readonly batchSize: number = BULK_BATCH_SIZE,
+  ) {}
 
   async list(ownerId: string): Promise<Album[]> {
     const rows = await this.db
@@ -174,6 +179,13 @@ export class AlbumService {
     await this.db.delete(albums).where(eq(albums.id, albumId))
   }
 
+  /**
+   * Batched: a query-resolved selection can run to tens of thousands of ids, and both
+   * the owned-assets lookup and the membership insert bind one parameter per id (the
+   * insert binds three — album id, asset id, position — so it is the tighter limit).
+   * Postgres refuses a statement bound past 65,535 parameters; `this.batchSize` stays
+   * comfortably under that for every shape here.
+   */
   async addAssets(
     ownerId: string,
     albumId: string,
@@ -181,31 +193,34 @@ export class AlbumService {
   ): Promise<AlbumAssetsResult> {
     await this.get(ownerId, albumId)
 
-    // Only the caller's own assets, so an album cannot be used to reach someone else's.
-    const owned = await this.db
-      .select({ id: assets.id })
-      .from(assets)
-      .where(
-        and(eq(assets.ownerId, ownerId), inArray(assets.id, assetIds), isNull(assets.vaultedAt)),
-      )
-      // Nothing displays `position` today, but a column that decides an order should
-      // not be filled from whatever order the rows came back in.
-      .orderBy(desc(assets.capturedAt), desc(assets.id))
-    const ownedIds = owned.map((a) => a.id)
-
     const [maxPosition] = await this.db
       .select({ max: sql<number>`coalesce(max(${albumAssets.position}), -1)::int` })
       .from(albumAssets)
       .where(eq(albumAssets.albumId, albumId))
     let position = Number(maxPosition?.max ?? -1)
 
-    const inserted = ownedIds.length
-      ? await this.db
-          .insert(albumAssets)
-          .values(ownedIds.map((assetId) => ({ albumId, assetId, position: ++position })))
-          .onConflictDoNothing()
-          .returning({ assetId: albumAssets.assetId })
-      : []
+    let added = 0
+    for (const batch of chunk(assetIds, this.batchSize)) {
+      // Only the caller's own assets, so an album cannot be used to reach someone else's.
+      const owned = await this.db
+        .select({ id: assets.id })
+        .from(assets)
+        .where(
+          and(eq(assets.ownerId, ownerId), inArray(assets.id, batch), isNull(assets.vaultedAt)),
+        )
+        // Nothing displays `position` today, but a column that decides an order should
+        // not be filled from whatever order the rows came back in.
+        .orderBy(desc(assets.capturedAt), desc(assets.id))
+      const ownedIds = owned.map((a) => a.id)
+      if (ownedIds.length === 0) continue
+
+      const inserted = await this.db
+        .insert(albumAssets)
+        .values(ownedIds.map((assetId) => ({ albumId, assetId, position: ++position })))
+        .onConflictDoNothing()
+        .returning({ assetId: albumAssets.assetId })
+      added += inserted.length
+    }
 
     await this.db.update(albums).set({ updatedAt: new Date() }).where(eq(albums.id, albumId))
 
@@ -215,20 +230,25 @@ export class AlbumService {
       .where(eq(albumAssets.albumId, albumId))
 
     return {
-      added: inserted.length,
-      skipped: assetIds.length - inserted.length,
+      added,
+      skipped: assetIds.length - added,
       assetCount: Number(counted?.count ?? 0),
     }
   }
 
+  /** Batched for the same reason `addAssets` is: a selection's ids can outrun the bind limit. */
   async removeAssets(ownerId: string, albumId: string, assetIds: string[]): Promise<number> {
     await this.get(ownerId, albumId)
-    const removed = await this.db
-      .delete(albumAssets)
-      .where(and(eq(albumAssets.albumId, albumId), inArray(albumAssets.assetId, assetIds)))
-      .returning({ assetId: albumAssets.assetId })
+    let removed = 0
+    for (const batch of chunk(assetIds, this.batchSize)) {
+      const rows = await this.db
+        .delete(albumAssets)
+        .where(and(eq(albumAssets.albumId, albumId), inArray(albumAssets.assetId, batch)))
+        .returning({ assetId: albumAssets.assetId })
+      removed += rows.length
+    }
     await this.db.update(albums).set({ updatedAt: new Date() }).where(eq(albums.id, albumId))
-    return removed.length
+    return removed
   }
 
   // --- Sharing ---

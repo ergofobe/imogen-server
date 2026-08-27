@@ -1,4 +1,5 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
+import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -119,10 +120,10 @@ async function addBareAsset(overrides: Partial<typeof assets.$inferInsert> = {})
   return row!
 }
 
-async function addFace(assetId: string, personId: string) {
+async function addFace(assetId: string, personId: string, faceOwnerId = ownerId) {
   await db.insert(faces).values({
     assetId,
-    ownerId,
+    ownerId: faceOwnerId,
     personId,
     x: 0,
     y: 0,
@@ -133,38 +134,70 @@ async function addFace(assetId: string, personId: string) {
   })
 }
 
+async function seedOwner(): Promise<string> {
+  const [row] = await db
+    .insert(users)
+    .values({ email: `stranger-${randomUUID()}@example.com`, name: 'Stranger' })
+    .returning()
+  return row!.id
+}
+
 describe('forgetting a set of assets', () => {
-  test('deletes every face for the listed assets and recounts once', async () => {
+  test('deletes every face for the listed assets, recounting exactly once', async () => {
     const [person] = await db.insert(people).values({ ownerId, name: 'Group' }).returning()
     const a = await addBareAsset()
     const b = await addBareAsset()
     await addFace(a.id, person!.id)
     await addFace(b.id, person!.id)
+    const recounts = spyOn(service, 'refreshCounts')
 
     await service.forgetAssets([a.id, b.id], ownerId)
 
     expect(await db.select().from(faces)).toBeEmpty()
     // The person existed only in those photos, so recounting removes them too.
     expect(await db.select().from(people)).toBeEmpty()
+    // Not once per asset — a selection can run to tens of thousands of them.
+    expect(recounts).toHaveBeenCalledTimes(1)
   })
 
-  test('leaves another person’s faces alone', async () => {
-    const [kept] = await db.insert(people).values({ ownerId, name: 'Kept' }).returning()
-    const [forgotten] = await db.insert(people).values({ ownerId, name: 'Forgotten' }).returning()
-    const keptAsset = await addBareAsset()
-    const forgottenAsset = await addBareAsset()
-    await addFace(keptAsset.id, kept!.id)
-    await addFace(forgottenAsset.id, forgotten!.id)
+  /**
+   * Two PEOPLE alone would only prove `inArray(assetId, …)`. What actually closes the
+   * pre-existing cross-tenant hole (the old `forgetAsset` deleted by asset id with no
+   * owner scope at all) is `eq(faces.ownerId, ownerId)` — so this asks `forgetAssets` to
+   * forget a stranger's asset id under the caller's own ownerId, and expects it to fail.
+   */
+  test('cannot forget another owner’s faces even when their asset id is named', async () => {
+    const stranger = await seedOwner()
+    const [strangerPerson] = await db
+      .insert(people)
+      .values({ ownerId: stranger, name: 'Stranger' })
+      .returning()
+    const strangerAsset = await addBareAsset({ ownerId: stranger })
+    await addFace(strangerAsset.id, strangerPerson!.id, stranger)
 
-    await service.forgetAssets([forgottenAsset.id], ownerId)
+    const [ownPerson] = await db.insert(people).values({ ownerId, name: 'Forgotten' }).returning()
+    const ownAsset = await addBareAsset()
+    await addFace(ownAsset.id, ownPerson!.id)
+
+    await service.forgetAssets([ownAsset.id, strangerAsset.id], ownerId)
 
     const remaining = await db.select().from(faces)
     expect(remaining).toHaveLength(1)
-    expect(remaining[0]!.assetId).toBe(keptAsset.id)
+    expect(remaining[0]!.assetId).toBe(strangerAsset.id)
   })
 
-  test('does nothing for an empty list', async () => {
-    await expect(service.forgetAssets([], ownerId)).resolves.toBeUndefined()
+  /**
+   * `inArray(col, [])` renders as `false`, so the delete already matches nothing with or
+   * without the early return — that alone would not catch its removal. An orphaned
+   * person (zero faces, so `refreshCounts`'s cleanup step would delete them did it run)
+   * survives only if the early return actually skipped calling it.
+   */
+  test('skips the database entirely for an empty list', async () => {
+    const [orphan] = await db.insert(people).values({ ownerId, name: 'Orphan' }).returning()
+
+    await service.forgetAssets([], ownerId)
+
+    expect(await db.select().from(people).where(eq(people.id, orphan!.id))).toHaveLength(1)
   })
 })
 
@@ -496,7 +529,7 @@ describe.skipIf(!canRun)('photos with several people in them', () => {
     await service.processAsset(photo.id)
 
     await db.update(assets).set({ vaultedAt: new Date() }).where(eq(assets.id, photo.id))
-    await service.forgetAsset(photo.id, ownerId)
+    await service.forgetAssets([photo.id], ownerId)
 
     // Anna keeps her own portrait; her companion, seen only there, is gone.
     const after = await service.listPeople(ownerId)
@@ -564,7 +597,7 @@ describe.skipIf(!canRun)('the vault is out of reach', () => {
     expect(await db.select().from(faces)).toHaveLength(1)
 
     await db.update(assets).set({ vaultedAt: new Date() }).where(eq(assets.id, asset.id))
-    await service.forgetAsset(asset.id, ownerId)
+    await service.forgetAssets([asset.id], ownerId)
 
     expect(await db.select().from(faces)).toBeEmpty()
     expect(await service.listPeople(ownerId)).toBeEmpty()
@@ -588,7 +621,7 @@ describe.skipIf(!canRun)('the vault is out of reach', () => {
     await service.processAsset(asset.id)
 
     await db.update(assets).set({ vaultedAt: new Date() }).where(eq(assets.id, asset.id))
-    await service.forgetAsset(asset.id, ownerId)
+    await service.forgetAssets([asset.id], ownerId)
 
     expect(await db.select().from(people)).toBeEmpty()
   })

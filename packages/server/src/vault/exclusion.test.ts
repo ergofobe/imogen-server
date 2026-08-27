@@ -404,3 +404,37 @@ describe('locking', () => {
     expect(status.count).toBeUndefined()
   })
 })
+
+describe('moving photos back out of the vault', () => {
+  test('moves a photo out by an explicit id list', async () => {
+    const { cookie, bothCookies, secretId } = await setup()
+
+    const response = await json(
+      '/api/v1/vault/assets',
+      'DELETE',
+      { assetIds: [secretId] },
+      bothCookies,
+    )
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ moved: 1 })
+
+    // Back in the ordinary library, reachable through the plain session cookie.
+    const page = (await (
+      await request('/api/v1/assets', { headers: { Cookie: cookie } })
+    ).json()) as { items: Array<{ id: string }> }
+    expect(page.items.map((i) => i.id)).toContain(secretId)
+  })
+
+  /**
+   * `AssetFilter` cannot see into the vault by design, so a query-form selection here
+   * could only ever resolve to zero ids — a silent, successful no-op a client could not
+   * tell apart from "nothing matched". Rejected instead of accepted and ignored.
+   */
+  test('rejects a query-form selection instead of silently moving nothing', async () => {
+    const { bothCookies } = await setup()
+
+    const response = await json('/api/v1/vault/assets', 'DELETE', { query: {} }, bothCookies)
+
+    expect(response.status).toBe(400)
+  })
+})

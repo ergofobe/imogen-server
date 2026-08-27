@@ -156,12 +156,29 @@ describe('moving assets in and out', () => {
     await vault.setPassphrase(userId, 'a-strong-vault-passphrase')
   })
 
+  test('moves every asset in a selection larger than one batch', async () => {
+    // A batch size of 3 against 7 assets forces the loop to run three times, proving
+    // the batching itself rather than just the single-statement case.
+    const batched = new VaultService(db, { secret: SECRET, batchSize: 3 })
+    const seeded = await Promise.all(Array.from({ length: 7 }, () => addAsset()))
+
+    const moved = await batched.moveIn(
+      userId,
+      seeded.map((a) => a.id),
+    )
+
+    expect(moved).toHaveLength(7)
+    expect(new Set(moved)).toEqual(new Set(seeded.map((a) => a.id)))
+    const rows = await db.select().from(assets)
+    expect(rows.every((r) => r.vaultedAt !== null)).toBe(true)
+  })
+
   test('moves an asset into the vault', async () => {
     const asset = await addAsset()
 
     const moved = await vault.moveIn(userId, [asset.id])
 
-    expect(moved).toBe(1)
+    expect(moved).toEqual([asset.id])
     const [row] = await db.select().from(assets).where(eq(assets.id, asset.id))
     expect(row!.vaultedAt).not.toBeNull()
   })
@@ -181,7 +198,7 @@ describe('moving assets in and out', () => {
 
     const moved = await vault.moveIn(userId, [theirs.id])
 
-    expect(moved).toBe(0)
+    expect(moved).toEqual([])
     const [row] = await db.select().from(assets).where(eq(assets.id, theirs.id))
     expect(row!.vaultedAt).toBeNull()
   })
