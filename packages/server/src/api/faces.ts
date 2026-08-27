@@ -12,7 +12,7 @@ import { eq } from 'drizzle-orm'
 import sharp from 'sharp'
 import { type AppEnv, requireAdmin, requireAuth, requireScope } from '../auth/middleware.ts'
 import { faces as facesTable } from '../db/schema.ts'
-import { countUnscanned, FACE_BACKFILL_JOB, FACE_MODELS_JOB } from '../jobs/faces.ts'
+import { countUnscanned } from '../jobs/faces.ts'
 import { notFound } from '../lib/errors.ts'
 import { toAsset } from '../media/serialize.ts'
 import { ERROR_RESPONSES, NO_CONTENT, ok, security } from './openapi.ts'
@@ -69,13 +69,8 @@ export function createFaceRoutes() {
     async (c) => {
       const services = c.get('services')
       const { enabled } = c.req.valid('json')
+      // Enabling downloads the models and scans the library; FaceService schedules both.
       await services.faces.setEnabled(enabled)
-
-      if (enabled) {
-        // Downloading is slow and the models are large, so it happens in the background.
-        const job = (await services.models.isReady()) ? FACE_BACKFILL_JOB : FACE_MODELS_JOB
-        await services.queue.enqueue(job, {})
-      }
       return c.body(null, 204)
     },
   )

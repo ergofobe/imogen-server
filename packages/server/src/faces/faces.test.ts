@@ -33,7 +33,15 @@ const facesPresent = existsSync(join(FACE_FIXTURES, 'person-a.png'))
 
 const canRun = modelsPresent && facesPresent
 
-const service = new FaceService(db, store, (p) => join(config.libraryDir, p))
+const queued: string[] = []
+const service = new FaceService(
+  db,
+  store,
+  (p) => join(config.libraryDir, p),
+  async (name) => {
+    queued.push(name)
+  },
+)
 
 afterAll(async () => {
   await harness.close()

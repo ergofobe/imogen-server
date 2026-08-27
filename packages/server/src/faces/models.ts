@@ -97,6 +97,15 @@ export class ModelStore {
 
   /** Loads both sessions. Cheap to hold open; expensive to create per request. */
   async open(): Promise<{ detection: ort.InferenceSession; recognition: ort.InferenceSession }> {
+    // onnxruntime reports a missing file as a load failure, which reads like a corrupt
+    // model rather than one that has not been downloaded yet.
+    const missing = (await this.status()).filter((m) => !m.present)
+    if (missing.length > 0) {
+      throw new Error(
+        `Face models have not been downloaded yet: ${missing.map((m) => MODELS[m.name].file).join(', ')}`,
+      )
+    }
+
     const [detection, recognition] = await Promise.all([
       ort.InferenceSession.create(this.pathFor('detection')),
       ort.InferenceSession.create(this.pathFor('recognition')),

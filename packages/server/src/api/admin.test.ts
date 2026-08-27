@@ -1,6 +1,8 @@
 import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
 import { sql } from 'drizzle-orm'
 import { createApp } from '../app.ts'
+import { jobs } from '../db/schema.ts'
+import { FACE_MODELS_JOB } from '../jobs/faces.ts'
 import { createServices } from '../services.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
 
@@ -667,6 +669,22 @@ describe('server settings', () => {
     const body = (await response.json()) as { allowSignup: boolean }
 
     expect(body.allowSignup).toBe(false)
+  })
+
+  /**
+   * The people page has its own switch, and for a while only that one scheduled the
+   * download — a server enabled from here reported face grouping as on with no models
+   * on disk and no job that would ever fetch them.
+   */
+  test('switching face grouping on from here queues the model download', async () => {
+    const admin = await signUp('first@example.com')
+
+    await asAdmin('/api/v1/admin/settings', 'PATCH', { facesEnabled: true }, admin.cookie)
+
+    const queued = await harness.db.select().from(jobs)
+    expect(queued.map((job) => job.name)).toEqual([FACE_MODELS_JOB])
+
+    await asAdmin('/api/v1/admin/settings', 'PATCH', { facesEnabled: false }, admin.cookie)
   })
 
   test('settings are not readable by an ordinary account', async () => {
