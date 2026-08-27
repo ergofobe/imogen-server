@@ -27,7 +27,12 @@ const bucket = (date: string, count: number): TimelineBucket => ({
   coverAssetId: null,
 })
 
-const tile = (id: string, capturedAt: string, width = 4032, height = 3024): TimelineTile => ({
+const tile = (
+  id: string,
+  capturedAt: string,
+  width: number | null = 4032,
+  height: number | null = 3024,
+): TimelineTile => ({
   id,
   capturedAt,
   width,
@@ -40,7 +45,7 @@ const tile = (id: string, capturedAt: string, width = 4032, height = 3024): Time
   livePhotoVideoId: null,
 })
 
-const photographs = (date: string, count: number, width?: number, height?: number) =>
+const photographs = (date: string, count: number, width?: number | null, height?: number | null) =>
   Array.from({ length: count }, (_, i) =>
     tile(`${date}-${i}`, `${date}T09:00:00.000Z`, width, height),
   )
@@ -51,6 +56,9 @@ const photographs = (date: string, count: number, width?: number, height?: numbe
  * to absorb, produced the way production produces it rather than by seeding a height.
  */
 const panoramas = (date: string, count: number) => photographs(date, count, 6000, 1000)
+
+/** Uploaded, not yet processed: the worker has not read their dimensions off the file. */
+const stillProcessing = (date: string, count: number) => photographs(date, count, null, null)
 
 const DAY_IN_MILLISECONDS = 86_400_000
 
@@ -225,6 +233,69 @@ describe('measuring a day', () => {
     )
   })
 
+  test('a day still being processed is measured for now but never remembered', () => {
+    const measured = new Map<string, number>()
+    const guessed = buildSegments(
+      [bucket('2011-08-14', 10)],
+      new Map([['2011-08-14', stillProcessing('2011-08-14', 10)]]),
+      OPTIONS,
+      measured,
+    )
+    // The tiles that do have dimensions still lay out correctly, and the section is drawn
+    // from this very justify pass, so the height is right for this frame.
+    expect(guessed.byDate.get('2011-08-14')!.measured).toBe(true)
+    // But nothing is recorded: the signature will be identical once the worker finishes.
+    expect(measured.size).toBe(0)
+
+    const ready = buildSegments(
+      [bucket('2011-08-14', 10)],
+      new Map([['2011-08-14', panoramas('2011-08-14', 10)]]),
+      OPTIONS,
+      measured,
+    )
+    expect(ready.byDate.get('2011-08-14')!.height).not.toBe(
+      guessed.byDate.get('2011-08-14')!.height,
+    )
+    expect(measured.size).toBe(1)
+  })
+
+  test('one photograph still processing is enough to withhold the whole day', () => {
+    const measured = new Map<string, number>()
+    const mixed = [...photographs('2011-08-14', 9), ...stillProcessing('2011-08-14', 1)]
+    buildSegments([bucket('2011-08-14', 10)], new Map([['2011-08-14', mixed]]), OPTIONS, measured)
+    expect(measured.size).toBe(0)
+  })
+
+  test('a day is measured afresh when the section gap changes', () => {
+    const measured = new Map<string, number>()
+    const loaded = new Map([['2011-08-14', photographs('2011-08-14', 12)]])
+    const tight = buildSegments([bucket('2011-08-14', 12)], loaded, OPTIONS, measured)
+    const loose = buildSegments(
+      [bucket('2011-08-14', 12)],
+      loaded,
+      { ...OPTIONS, sectionGap: 80 },
+      measured,
+    )
+    expect(loose.byDate.get('2011-08-14')!.height).toBe(
+      tight.byDate.get('2011-08-14')!.height + (80 - OPTIONS.sectionGap),
+    )
+  })
+
+  test('a day is measured afresh when the header height changes', () => {
+    const measured = new Map<string, number>()
+    const loaded = new Map([['2011-08-14', photographs('2011-08-14', 12)]])
+    const short = buildSegments([bucket('2011-08-14', 12)], loaded, OPTIONS, measured)
+    const tall = buildSegments(
+      [bucket('2011-08-14', 12)],
+      loaded,
+      { ...OPTIONS, headerHeight: 72 },
+      measured,
+    )
+    expect(tall.byDate.get('2011-08-14')!.height).toBe(
+      short.byDate.get('2011-08-14')!.height + (72 - OPTIONS.headerHeight),
+    )
+  })
+
   test('a resize re-derives rather than serving a height learned at another width', () => {
     const measured = new Map<string, number>()
     const loaded = new Map([['2011-08-14', photographs('2011-08-14', 12)]])
@@ -376,6 +447,40 @@ describe('scrollDelta keeps the same photograph under the reader', () => {
     )
     const grew = after.byDate.get('2011-08-15')!.height - estimated
     expect(scrollDelta(before, after, estimated)).toBe(grew)
+  })
+
+  // The reader is past the end of the whole timeline, so the anchor is the fallback one
+  // above them and their fraction of it is greater than one. Unclamped, that fraction
+  // multiplies the anchor's own growth and the view is thrown thousands of pixels.
+  test('a reader past the end moves by the growth below them, not a multiple of it', () => {
+    const before = buildSegments(twoDaysStraddle, new Map(), OPTIONS, new Map())
+    const after = buildSegments(
+      twoDaysStraddle,
+      new Map([['2011-08-14', panoramas('2011-08-14', 10)]]),
+      OPTIONS,
+      new Map(),
+    )
+    const grew = after.byDate.get('2011-08-14')!.height - before.byDate.get('2011-08-14')!.height
+    expect(grew).toBeGreaterThan(0)
+    // Everything in the library is above them, so the whole growth moves them and no more.
+    expect(scrollDelta(before, after, 5000)).toBe(grew)
+  })
+
+  // The day the reader was inside has been trashed, so the anchor is the next one down,
+  // which starts *below* them: their fraction of it is negative. Unclamped, that subtracts
+  // a share of a growth that is entirely beneath their eye.
+  test('a reader above the anchor takes no share of its change in height', () => {
+    const before = buildSegments(threeDays, new Map(), OPTIONS, new Map())
+    const after = buildSegments(
+      threeDays.slice(1),
+      new Map([['2011-08-14', panoramas('2011-08-14', 10)]]),
+      OPTIONS,
+      new Map(),
+    )
+    expect(after.byDate.get('2011-08-14')!.height).not.toBe(before.byDate.get('2011-08-14')!.height)
+    expect(scrollDelta(before, after, 10)).toBe(
+      after.byDate.get('2011-08-14')!.top - before.byDate.get('2011-08-14')!.top,
+    )
   })
 
   // Each inserted day's position in the new table already includes the ones before it, so

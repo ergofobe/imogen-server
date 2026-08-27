@@ -102,11 +102,21 @@ function resolveDayHeight(
   // then would leave the day overlapping its neighbour.
   if (tiles && tiles.length >= bucket.count) {
     const height = measureDayHeight(tiles, options)
-    measured.set(key, height)
+    // Measured for this frame, but only remembered once every photograph's real dimensions
+    // are in. A still-processing upload has no width or height yet and `aspectOf` lays it
+    // out at a fallback aspect; when the worker finishes, the true dimensions arrive under
+    // an identical signature — same date, same count, same layout — so a guess recorded now
+    // would outlive the thing it was guessing about, with no path back.
+    if (tiles.every(hasKnownDimensions)) measured.set(key, height)
     return { height, measured: true }
   }
 
   return { height: estimateDayHeight(bucket.count, options), measured: false }
+}
+
+/** The same test `aspectOf` applies before falling back: a processing upload fails it. */
+function hasKnownDimensions(tile: TimelineTile): boolean {
+  return Boolean(tile.width && tile.height)
 }
 
 /**
