@@ -30,6 +30,18 @@ export type RailTick = {
   label: string
   y: number
   kind: 'year' | 'month'
+  /**
+   * Whether there is room to print the label, or only to draw the boundary.
+   *
+   * A rail proportional to density puts a thin year a few pixels below a dense one, and
+   * two labels cannot share those pixels. The loser is demoted rather than discarded: the
+   * boundary still shows, so the rail never implies a year holds nothing merely because it
+   * had no room to say its name. The rail is allowed to be this incomplete precisely
+   * because the overview is not — it lists every year with an exact count and no space
+   * pressure at all, which is what the rail hands off to when a reader wants the whole
+   * shape rather than a place to aim.
+   */
+  labelled: boolean
 }
 
 /**
@@ -78,7 +90,7 @@ export function railTicks(table: SegmentTable, railHeight: number): RailTick[] {
     // at which the reader crosses into that year on the way down.
     const top = segments[start]!.top * scale
     const bottom = (end < segments.length ? segments[end]!.top : totalHeight) * scale
-    ticks.push({ label: year, y: top, kind: 'year', span: bottom - top })
+    ticks.push({ label: year, y: top, kind: 'year', span: bottom - top, labelled: true })
 
     if (bottom - top >= MONTH_TICK_MIN_YEAR_SPAN) {
       // Seeded with the year tick, so the newest month — which shares its position — is
@@ -90,44 +102,73 @@ export function railTicks(table: SegmentTable, railHeight: number): RailTick[] {
         const y = segments[i]!.top * scale
         if (y - lastY < MIN_TICK_SPACING) continue
         lastY = y
-        ticks.push({ label: month, y, kind: 'month', span: 0 })
+        ticks.push({ label: month, y, kind: 'month', span: 0, labelled: false })
       }
     }
 
     start = end
   }
 
-  return thinCollisions(ticks)
+  return resolveLabels(ticks)
 }
 
 /** A tick plus how much rail its period owns, which is how collisions are settled. */
 type Candidate = RailTick & { span: number }
 
 /**
- * Drops whatever will not fit. The ticks arrive in ascending `y`, so one pass with a
- * memory of the last one kept is enough.
+ * Decides which ticks get to print their label. The ticks arrive in ascending `y`, so one
+ * pass with a memory of the last label placed is enough.
  *
- * Two rules settle a collision. A year always beats a month, because the month is a
- * subdivision of a year that is already marked and the year boundary is the more useful
- * of the two. Between two years, the one that owns more rail wins — a stretch where
- * almost nothing was photographed cannot name every year in it, and the year worth
- * finding is the one there is something to find in. Taking the newer one instead put the
- * label on a lockdown year of two hundred frames and left the four thousand under it
+ * Only labels compete — a bare mark is a line at the right edge and two of them on one
+ * pixel are indistinguishable from one, so nothing is dropped for want of room except the
+ * text. Between two years that cannot both be named, the one owning more rail wins: the
+ * year worth finding, rather than the one that happens to be newer. Taking the newer put
+ * the label on a lockdown year of two hundred frames and left the four thousand under it
  * blank.
  */
-function thinCollisions(ticks: Candidate[]): RailTick[] {
-  const kept: Candidate[] = []
+function resolveLabels(ticks: Candidate[]): RailTick[] {
+  const out: Candidate[] = []
+  let lastLabelledY = Number.NEGATIVE_INFINITY
+  let lastLabelled = -1
+
+  const place = (tick: Candidate) => {
+    out.push({ ...tick, labelled: true })
+    lastLabelledY = tick.y
+    lastLabelled = out.length - 1
+  }
+
   for (const tick of ticks) {
-    const previous = kept.at(-1)
-    if (!previous || tick.y - previous.y >= MIN_TICK_SPACING) {
-      kept.push(tick)
+    if (tick.kind === 'month') {
+      // A month mark is a subdivision of a year that is already named. One drawn this
+      // close would sit behind that year's text, which is noise rather than information.
+      if (tick.y - lastLabelledY < MIN_TICK_SPACING) continue
+      out.push({ ...tick, labelled: false })
       continue
     }
-    if (tick.kind === 'year' && (previous.kind === 'month' || tick.span > previous.span)) {
-      kept[kept.length - 1] = tick
+
+    if (tick.y - lastLabelledY >= MIN_TICK_SPACING) {
+      // A year always outranks a month mark it lands on, so take back the room.
+      while (
+        out.length > 0 &&
+        out.at(-1)!.kind === 'month' &&
+        tick.y - out.at(-1)!.y < MIN_TICK_SPACING
+      ) {
+        out.pop()
+      }
+      place(tick)
+      continue
     }
+
+    const holder = lastLabelled >= 0 ? out[lastLabelled] : undefined
+    if (holder && holder.kind === 'year' && tick.span > holder.span) {
+      holder.labelled = false
+      place(tick)
+      continue
+    }
+    out.push({ ...tick, labelled: false })
   }
-  return kept.map(({ label, y, kind }) => ({ label, y, kind }))
+
+  return out.map(({ label, y, kind, labelled }) => ({ label, y, kind, labelled }))
 }
 
 type Props = {
@@ -147,19 +188,24 @@ type Props = {
  *
  * `PhotoGrid` writes it in a layout effect whenever a day's estimated height is replaced
  * by a measured one, to keep the photograph under the reader's eye where it was. The rail
- * writes it while a pointer is down on it. Those look like they must fight, and they do
- * not, for two reasons worth writing down.
+ * writes it while a pointer is down on it. They look like they must fight, and they do not
+ * — but not for the reason it is tempting to give.
  *
- * The first is that a drag suspends fetching, and fetching is what changes the table:
- * with no month arriving, no day resolves, and `PhotoGrid`'s compensation has nothing to
- * compensate for. It also stops the poll that watches a still-processing upload. So for
- * the length of a drag the geometry is frozen by construction, not by agreement.
+ * The tempting reason is that a drag suspends fetching, so nothing arrives, so no day
+ * resolves and there is nothing to compensate for. That is not true, and it is worth
+ * saying why rather than quietly relying on it. Suspension gates `periods.load` and the
+ * settling interval, but `useTimeline`'s reconciliation effect — the one that refetches a
+ * month the spine now disagrees with — is keyed on the buckets alone and has no such
+ * guard. A spine request already in the air at pointerdown can land mid-drag, and bucket
+ * requests can follow it. The table can change under a suspended drag.
  *
- * The second covers what the first cannot — a fetch already in the air when the drag
- * began. When that lands, `PhotoGrid` moves the scroll position to keep the reader's day
- * under their eye. Their day is the day the rail just put there, so the compensation
- * preserves the rail's own intent rather than undoing it; and the next pointer move
- * re-asserts the pointer's position regardless. At worst one frame is a pixel or two out.
+ * The reason it does not matter is in what the compensation actually computes. It anchors
+ * on the first day at or after the current scroll position — which, mid-drag, is the day
+ * the rail itself wrote a moment ago — and moves the scroll position to keep that day
+ * under the reader. So it preserves the date the reader is aiming at and adjusts only the
+ * pixel it lives at. It cannot move the rail off the reader's target, because the target
+ * is what it is holding on to. And the next pointer move re-asserts the pointer's position
+ * regardless.
  *
  * So the rail does not suppress the compensation and does not need to know about it. It
  * simply writes last, sixty times a second, for as long as the reader is holding on.
@@ -347,7 +393,7 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
               className="pointer-events-none absolute right-0"
               style={{ top: tick.y }}
             >
-              {tick.kind === 'year' ? (
+              {tick.labelled ? (
                 <span className="label-micro -translate-y-1/2 block pr-1.5 text-muted">
                   {tick.label}
                 </span>
@@ -380,8 +426,13 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
   )
 }
 
-/** A UTC day key as a day number, which is what `aria-valuenow` needs it to be. */
-function dayNumber(day: string): number {
+/**
+ * A UTC day key as a day number, which is what `aria-valuenow` needs it to be.
+ *
+ * Exported for the same reason `railTicks` is: it is arithmetic over dates, and this repo
+ * tests arithmetic without a DOM.
+ */
+export function dayNumber(day: string): number {
   return Math.round(Date.parse(`${day}T00:00:00.000Z`) / DAY_MS)
 }
 
@@ -389,32 +440,48 @@ function dayNumber(day: string): number {
  * One month up or down the timeline, in grid coordinates. `step` is +1 for later — which
  * is up the page, since the timeline runs newest first.
  *
- * It keeps going until the position actually changes rather than stepping once. A
- * twenty-year library is full of months with nothing in them, and a single step into one
- * of those is an arrow key that visibly does nothing — which reads as a broken control
- * rather than as an empty April.
+ * "One month" means the next month that *exists*, found by asking the sorted table rather
+ * than by counting calendar months and hoping one of them is occupied. An earlier version
+ * walked the calendar and gave up after twenty-four misses, falling back to either end of
+ * the library — so at the edge of any gap longer than two years, and a twenty-year library
+ * is full of them, one arrow keypress teleported the reader to 2026 or to their oldest
+ * photograph. The opposite of aiming, in the one control built for aiming.
+ *
+ * Both directions are two binary searches and no iteration, so a gap of one month and a
+ * gap of eleven years cost exactly the same.
  */
-function stepMonth(table: SegmentTable, from: number, step: 1 | -1): number {
+export function stepMonth(table: SegmentTable, from: number, step: 1 | -1): number {
   const date = dateAtOffset(table, from)
   if (!date) return from
+  const month = periodOf(date)
+  const top = monthTop(table, month)
 
-  let month = periodOf(date)
-  for (let attempt = 0; attempt < 24; attempt++) {
-    month = shiftMonth(month, step)
-    // `-31` is a comparison sentinel, not a date: `offsetForDate` finds the newest day at
-    // or before what it is given, and every real day of a month sorts before its 31st. So
-    // this lands on the top of that month whatever days it actually holds.
-    const next = offsetForDate(table, `${month}-31`)
-    if (step > 0 ? next < from : next > from) return next
+  if (step < 0) {
+    /*
+     * `-00` is a comparison sentinel, not a date. It sorts after every real day of the
+     * month before this one and before every day of this one, so "the newest day at or
+     * before it" is the newest day of the next month that holds anything — however many
+     * empty years lie between.
+     */
+    const older = offsetForDate(table, `${month}-00`)
+    const olderDate = dateAtOffset(table, older)
+    // Nothing older: the sentinel fell off the end and came back with a day of this same
+    // month. There is no month below this one, so the key does nothing rather than leaping.
+    return olderDate && periodOf(olderDate) !== month ? older : from
   }
 
-  // Two years of empty months in a row means there is nothing further in that direction.
-  return step > 0 ? 0 : table.segments.at(-1)!.top
+  // Already in the newest month there is; the most that can be asked for is its top.
+  if (top <= 0) return 0
+  // One pixel above this month's top belongs to the last day of the month above it.
+  const newer = dateAtOffset(table, top - 1)
+  return newer ? monthTop(table, periodOf(newer)) : 0
 }
 
-function shiftMonth(month: string, step: number): string {
-  const year = Number(month.slice(0, 4))
-  const index = Number(month.slice(5, 7)) - 1 + step
-  const shifted = ((index % 12) + 12) % 12
-  return `${year + Math.floor(index / 12)}-${String(shifted + 1).padStart(2, '0')}`
+/**
+ * Where a month begins. `-31` is the mirror of the sentinel above: every real day of a
+ * month sorts before its thirty-first, so this finds that month's newest day whatever
+ * days it actually holds.
+ */
+function monthTop(table: SegmentTable, month: string): number {
+  return offsetForDate(table, `${month}-31`)
 }

@@ -28,25 +28,45 @@ export function gridOffsetWithin(container: HTMLElement, scroller: Element): num
   return container.getBoundingClientRect().top - scrollerTop + scroller.scrollTop
 }
 
+/** As much of a scroller as the arithmetic below needs, so it can be given a stub. */
+export type ScrollerMetrics = { scrollTop: number; scrollHeight: number; clientHeight: number }
+
 /**
- * Puts the reader at a position in *grid* coordinates — the coordinates the segment table
- * speaks — rather than in the scroller's.
+ * Where `scrollTop` has to go to bring grid position `gridTop` to the top of the viewport.
  *
  * Clamped here rather than left to the browser. A browser silently clamps an out-of-range
  * assignment, so a rail dragged to the very bottom would read back somewhere other than
- * where it wrote and jitter against its own thumb for the rest of the drag.
+ * where it wrote and jitter against its own thumb for the rest of the drag. Separated from
+ * the element it will be written to because a clamp is exactly the kind of thing that is
+ * right in the middle and wrong at both ends, and this way both ends can be tested.
+ */
+export function scrollTargetFor(
+  metrics: Omit<ScrollerMetrics, 'scrollTop'>,
+  gridOffset: number,
+  gridTop: number,
+): number {
+  const limit = Math.max(0, metrics.scrollHeight - metrics.clientHeight)
+  return Math.min(limit, Math.max(0, gridOffset + gridTop))
+}
+
+/** Where the reader is, in grid coordinates. The inverse, and unclamped: it is a reading. */
+export function gridTopFrom(scrollTop: number, gridOffset: number): number {
+  return scrollTop - gridOffset
+}
+
+/**
+ * Puts the reader at a position in *grid* coordinates — the coordinates the segment table
+ * speaks — rather than in the scroller's.
  */
 export function scrollGridTo(container: HTMLElement, gridTop: number): void {
   const scroller = scrollingAncestorOf(container)
-  const target = gridOffsetWithin(container, scroller) + gridTop
-  const limit = Math.max(0, scroller.scrollHeight - scroller.clientHeight)
-  scroller.scrollTop = Math.min(limit, Math.max(0, target))
+  scroller.scrollTop = scrollTargetFor(scroller, gridOffsetWithin(container, scroller), gridTop)
 }
 
 /** Where the reader is, in grid coordinates. The inverse of `scrollGridTo`. */
 export function gridTopOf(container: HTMLElement): number {
   const scroller = scrollingAncestorOf(container)
-  return scroller.scrollTop - gridOffsetWithin(container, scroller)
+  return gridTopFrom(scroller.scrollTop, gridOffsetWithin(container, scroller))
 }
 
 /**

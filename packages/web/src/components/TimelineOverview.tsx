@@ -1,6 +1,6 @@
 import type { AssetFilter } from '@imogen/shared'
 import { useQuery } from '@tanstack/react-query'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAssetUrls } from '../lib/assetUrls.tsx'
 import { imogen } from '../lib/client.ts'
 import { formatMonthKey } from '../lib/format.ts'
@@ -38,8 +38,8 @@ type Props = {
  * of a 250KB spine, more than doubling the request that has to land before the timeline
  * can be laid out at all. The timeline never reads those uuids. So the overview fetches
  * its own copy, and only when it is first opened: a reader who never opens it pays
- * nothing, and one who does pays once, since the answer is cached under the same
- * `['timeline']` prefix everything else invalidates through.
+ * nothing, and one who does pays once. Which cache key that copy lives under turned out
+ * to matter a great deal — see the query below.
  *
  * The alternative — one spine with covers, shared — was rejected for making every cold
  * load, on every device, carry a payload for a panel most loads never open. Deferring the
@@ -48,6 +48,15 @@ type Props = {
 export function TimelineOverview({ table, filter, grid, onClose }: Props) {
   const { url } = useAssetUrls()
   const [year, setYear] = useState<string | null>(null)
+  const closeButton = useRef<HTMLButtonElement>(null)
+
+  /*
+   * Once, on open. An inline `ref={(node) => node?.focus()}` looks equivalent and is not:
+   * React detaches and reattaches an inline ref on every render, so it re-focused when the
+   * covers query resolved and again on every drill-in — snatching focus back to Close from
+   * whichever card a keyboard reader had tabbed to.
+   */
+  useEffect(() => closeButton.current?.focus(), [])
 
   /*
    * Keyed outside the `['timeline']` prefix, on purpose, and it cost a browser to find out
@@ -133,8 +142,8 @@ export function TimelineOverview({ table, filter, grid, onClose }: Props) {
 
           <button
             type="button"
+            ref={closeButton}
             onClick={onClose}
-            ref={(node) => node?.focus()}
             className="rounded-lg border border-line px-3 py-1.5 text-sm transition hover:bg-sunken"
           >
             Close
