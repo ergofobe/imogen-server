@@ -255,3 +255,43 @@ describe('a shared link never reaches an authenticated endpoint', () => {
     for (const url of asked) expect(url.startsWith('/api/v1/share/abc123/')).toBe(true)
   })
 })
+
+/*
+ * The share is the one a stranger sees, and it is the reason the empty-state guard exists.
+ * A recipient opening a link to fifteen hundred photographs used to be told, for as long as
+ * the spine took to arrive, that the album had no photos in it.
+ *
+ * This holds the spine open rather than settling and looking afterwards: the wrong state was
+ * transient, and `settle` runs fifteen ticks before every other assertion in this file, so a
+ * transient state is invisible from there by construction.
+ */
+describe('a shared album while its spine is still in the air', () => {
+  test('does not greet a visitor by saying the album is empty', async () => {
+    const original = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/timeline')) return new Promise<Response>(() => {}) // never answers
+      return new Response(
+        JSON.stringify({
+          locked: false,
+          kind: 'album',
+          album: { id: ALBUM_ID, name: 'Corfu', assetCount: 1500, assets: [], shareSlug: 'abc' },
+          allowDownload: true,
+        }),
+        { headers: { 'Content-Type': 'application/json' } },
+      )
+    }) as typeof fetch
+
+    try {
+      const { SharedAlbum } = await import('./SharedAlbum.tsx')
+      const container = await mount('/share/abc123', '/share/:slug', <SharedAlbum />)
+
+      expect(container.textContent).not.toContain('This album has no photos in it')
+      expect(container.textContent).not.toContain('Nothing here yet')
+      // The album's name is already known, so the page is recognisably the right page.
+      expect(container.textContent).toContain('Corfu')
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+})

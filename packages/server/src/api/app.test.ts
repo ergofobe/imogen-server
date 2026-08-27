@@ -412,6 +412,68 @@ describe('albums and sharing', () => {
     expect(body.album.assets).toHaveLength(1)
   })
 
+  /**
+   * Archiving now takes a photograph out of a live share.
+   *
+   * This is a deliberate change of behaviour and worth stating plainly, because it happens
+   * to somebody else's page without them doing anything. Album membership is defined once,
+   * in `inAlbum`, in exactly the terms the timeline selects an `albumId` under — and the
+   * timeline excludes archived photographs. Before that was unified, `openShare` and the
+   * file guard used their own predicate, which did not, so an archived photograph stayed in
+   * a share's cover sample and stayed downloadable while the share's own timeline endpoints
+   * had already stopped listing it: a tile the page could not draw and bytes it could still
+   * fetch.
+   *
+   * Archiving is the closest thing the library has to "put this away", so the side that
+   * removes it from the share is the right side of the trade. But the effect is that
+   * archiving a photograph revokes it from a link somebody else is holding, which is a thing
+   * a reader of this file should not have to infer from a helper's name.
+   */
+  test('archiving a photo removes it from a live share, and its bytes with it', async () => {
+    const { cookie, albumId, assetId } = await setup()
+    const link = (await (
+      await jsonRequest(`/api/v1/albums/${albumId}/share`, 'POST', { allowDownload: true }, cookie)
+    ).json()) as { slug: string }
+
+    const before = (await (await request(`/api/v1/share/${link.slug}`)).json()) as {
+      album: { assets: unknown[]; assetCount: number }
+    }
+    expect(before.album.assets).toHaveLength(1)
+    expect(before.album.assetCount).toBe(1)
+    expect((await request(`/api/v1/share/${link.slug}/assets/${assetId}/preview`)).status).toBe(200)
+
+    await jsonRequest(`/api/v1/assets/${assetId}`, 'PATCH', { archived: true }, cookie)
+
+    const after = (await (await request(`/api/v1/share/${link.slug}`)).json()) as {
+      album: { assets: unknown[]; assetCount: number }
+    }
+    expect(after.album.assets).toHaveLength(0)
+    expect(after.album.assetCount).toBe(0)
+    // The guard and the listing have to agree, or the page shows a tile it cannot fill or
+    // hides one whose bytes are still there for anyone who kept the URL.
+    expect((await request(`/api/v1/share/${link.slug}/assets/${assetId}/preview`)).status).toBe(404)
+  })
+
+  test('the share timeline agrees with the share listing about what it holds', async () => {
+    const { cookie, albumId, assetId } = await setup()
+    const link = (await (
+      await jsonRequest(`/api/v1/albums/${albumId}/share`, 'POST', { allowDownload: true }, cookie)
+    ).json()) as { slug: string }
+
+    const countBuckets = async () => {
+      const body = (await (await request(`/api/v1/share/${link.slug}/timeline`)).json()) as {
+        buckets: Array<{ count: number }>
+      }
+      return body.buckets.reduce((sum, bucket) => sum + bucket.count, 0)
+    }
+
+    expect(await countBuckets()).toBe(1)
+
+    await jsonRequest(`/api/v1/assets/${assetId}`, 'PATCH', { archived: true }, cookie)
+
+    expect(await countBuckets()).toBe(0)
+  })
+
   test('a revoked share link stops working', async () => {
     const { cookie, albumId } = await setup()
     const link = (await (

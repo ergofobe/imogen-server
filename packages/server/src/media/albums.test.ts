@@ -176,3 +176,108 @@ describe('the cover sample', () => {
     expect(withAssets.assets[0]!.id).toBe(seeded[0]!.id)
   })
 })
+
+/**
+ * What an album says it holds, against what the timeline will actually select.
+ *
+ * These have to be the same number, and for a while they were not. `assetCount` was a raw
+ * count of `album_assets` rows — trashing a photograph leaves that row behind, archiving
+ * touches nothing at all — while the grid and, worse, a select-all resolve through
+ * `AssetService`'s filters, which exclude both. An album of a hundred with five in the
+ * trash showed "100 photos" over ninety-five tiles and offered to move a hundred of them
+ * to the trash before moving ninety-five.
+ *
+ * A destructive confirmation stating a number it will not honour is the single worst thing
+ * this feature can do, so the agreement is asserted directly rather than inferred: the
+ * album's own count, and `AssetService.timeline` under the same `albumId`, on the same
+ * rows, in the same test.
+ */
+describe('an album counts what the timeline would show', () => {
+  const countFromTimeline = async (albumId: string) => {
+    const buckets = await new AssetService(db).timeline(ownerId, { albumId })
+    return buckets.reduce((sum, bucket) => sum + bucket.count, 0)
+  }
+
+  test('a trashed member leaves the count, not just the grid', async () => {
+    const seeded = await Promise.all(Array.from({ length: 7 }, () => addAsset()))
+    const album = await service.create(ownerId, {
+      name: 'Holiday',
+      assetIds: seeded.map((a) => a.id),
+    })
+    expect((await service.get(ownerId, album.id)).assetCount).toBe(7)
+
+    await db.update(assets).set({ deletedAt: new Date() }).where(eq(assets.id, seeded[0]!.id))
+
+    expect((await service.get(ownerId, album.id)).assetCount).toBe(6)
+    expect(await countFromTimeline(album.id)).toBe(6)
+  })
+
+  test('an archived member leaves it too', async () => {
+    const seeded = await Promise.all(Array.from({ length: 7 }, () => addAsset()))
+    const album = await service.create(ownerId, {
+      name: 'Holiday',
+      assetIds: seeded.map((a) => a.id),
+    })
+
+    await db.update(assets).set({ archived: true }).where(eq(assets.id, seeded[1]!.id))
+
+    expect((await service.get(ownerId, album.id)).assetCount).toBe(6)
+    expect(await countFromTimeline(album.id)).toBe(6)
+  })
+
+  test('and a vaulted one, which is the whole point of the vault', async () => {
+    const seeded = await Promise.all(Array.from({ length: 7 }, () => addAsset()))
+    const album = await service.create(ownerId, {
+      name: 'Holiday',
+      assetIds: seeded.map((a) => a.id),
+    })
+
+    await db.update(assets).set({ vaultedAt: new Date() }).where(eq(assets.id, seeded[2]!.id))
+
+    expect((await service.get(ownerId, album.id)).assetCount).toBe(6)
+    expect(await countFromTimeline(album.id)).toBe(6)
+  })
+
+  /*
+   * All three at once, and the listing as well as the single album. `list` builds its count
+   * as an aggregate over a LEFT join rather than through `inAlbum` directly — it has to, or
+   * an empty album would vanish from the listing — so it is a second copy of the same rule
+   * and the one most likely to drift away from the first.
+   */
+  test('the album listing agrees with the album, and both agree with the timeline', async () => {
+    const seeded = await Promise.all(Array.from({ length: 9 }, () => addAsset()))
+    const album = await service.create(ownerId, {
+      name: 'Holiday',
+      assetIds: seeded.map((a) => a.id),
+    })
+    const empty = await service.create(ownerId, { name: 'Nothing in here' })
+
+    await db.update(assets).set({ deletedAt: new Date() }).where(eq(assets.id, seeded[0]!.id))
+    await db.update(assets).set({ archived: true }).where(eq(assets.id, seeded[1]!.id))
+    await db.update(assets).set({ vaultedAt: new Date() }).where(eq(assets.id, seeded[2]!.id))
+
+    const listed = await service.list(ownerId)
+    const holiday = listed.find((a) => a.id === album.id)
+
+    expect(holiday?.assetCount).toBe(6)
+    expect((await service.get(ownerId, album.id)).assetCount).toBe(6)
+    expect(await countFromTimeline(album.id)).toBe(6)
+    // The LEFT join has to survive an album with no members at all.
+    expect(listed.find((a) => a.id === empty.id)?.assetCount).toBe(0)
+  })
+
+  test('the cover sample is drawn from the same rows the count counts', async () => {
+    const seeded = await Promise.all(Array.from({ length: 5 }, () => addAsset()))
+    const album = await service.create(ownerId, {
+      name: 'Holiday',
+      assetIds: seeded.map((a) => a.id),
+    })
+
+    await db.update(assets).set({ archived: true }).where(eq(assets.id, seeded[0]!.id))
+
+    const withAssets = await service.getWithAssets(ownerId, album.id)
+    expect(withAssets.assets).toHaveLength(4)
+    expect(withAssets.assets.map((a) => a.id)).not.toContain(seeded[0]!.id)
+    expect(withAssets.assetCount).toBe(4)
+  })
+})
