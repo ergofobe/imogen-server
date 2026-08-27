@@ -19,6 +19,20 @@ export type DecodeOptions = {
 const HEIF_EXTENSIONS = new Set(['.heic', '.heif', '.hif', '.avci'])
 
 /**
+ * Opens a stored original. Every read of a file in the library goes through here.
+ *
+ * `failOn: 'none'` because an upload that dies mid-transfer leaves a valid header
+ * followed by a partial scan, and libvips calls that fatal at every other level — a
+ * three-quarters-arrived photograph came back as "VipsJpeg: premature end of JPEG image"
+ * rather than as its first three quarters. Only recoverable damage is tolerated: a file
+ * with no decodable image in it still refuses to open, so the fallback chain below and
+ * every caller's error path stay exactly as they were.
+ */
+export function openOriginal(path: string): Sharp {
+  return sharp(path, { failOn: 'none' })
+}
+
+/**
  * A decode is only acceptable if it produced roughly the pixels the file claims to hold.
  * iPhone HEICs are stored as a grid of 512×512 tiles, and some ffmpeg builds hand back a
  * single tile rather than the assembled image — a silent 3000×2000 → 512×512 downgrade
@@ -46,7 +60,7 @@ function isPlausible(
 export async function decodeImage(path: string, options: DecodeOptions): Promise<Decoded | null> {
   // Metadata usually survives even when the pixels cannot be decoded, so it is the
   // yardstick for judging whether a decode came back complete.
-  const declared = await sharp(path)
+  const declared = await openOriginal(path)
     .metadata()
     .catch(() => ({}) as { width?: number; height?: number })
 
@@ -78,7 +92,7 @@ async function wrap(buffer: Buffer, via: Decoded['via']): Promise<Decoded | null
 
 async function tryNative(path: string): Promise<Decoded | null> {
   try {
-    const source = sharp(path, { failOn: 'error' })
+    const source = openOriginal(path)
     const meta = await source.metadata()
     if (!meta.width || !meta.height) return null
     // Decode one pixel. Cheap, and it proves the codec is actually available.

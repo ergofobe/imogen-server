@@ -14,6 +14,7 @@ import { type AppEnv, requireAdmin, requireAuth, requireScope } from '../auth/mi
 import { faces as facesTable } from '../db/schema.ts'
 import { countUnscanned } from '../jobs/faces.ts'
 import { notFound } from '../lib/errors.ts'
+import { openOriginal } from '../media/decode.ts'
 import { toAsset } from '../media/serialize.ts'
 import { ERROR_RESPONSES, NO_CONTENT, ok, security } from './openapi.ts'
 import { vaultIsOpen } from './vault.ts'
@@ -255,7 +256,7 @@ export function createFaceRoutes() {
     const margin = Math.round(Math.max(face.width, face.height) * 0.25)
     const source = services.library.absolutePath(file.path)
     // Rotated first: the stored coordinates are in the upright frame, as detection saw it.
-    const upright = await sharp(source).rotate().toBuffer({ resolveWithObject: true })
+    const upright = await openOriginal(source).rotate().toBuffer({ resolveWithObject: true })
     const meta = upright.info
     const left = Math.max(0, face.x - margin)
     const top = Math.max(0, face.y - margin)

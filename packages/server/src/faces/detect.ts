@@ -1,5 +1,5 @@
 import ort from 'onnxruntime-node'
-import sharp from 'sharp'
+import { openOriginal } from '../media/decode.ts'
 
 /**
  * SCRFD decoding. The model emits, for each of three strides, a score map, a distance
@@ -29,9 +29,9 @@ export async function detect(
    * coordinates come back in the stored frame, and a box drawn over a rotated photo
    * lands somewhere else entirely.
    */
-  const upright = () => sharp(imagePath).rotate()
+  const upright = () => openOriginal(imagePath).rotate()
 
-  const meta = await sharp(imagePath).metadata()
+  const meta = await openOriginal(imagePath).metadata()
   // Orientations 5 to 8 involve a quarter turn, so the upright image is the stored one
   // transposed. Reading the tag is far cheaper than decoding the pixels to find out.
   const turned = (meta.orientation ?? 1) >= 5
