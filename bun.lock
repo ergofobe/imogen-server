@@ -1818,11 +1818,11 @@
 
     "@esbuild-kit/core-utils/esbuild/@esbuild/win32-x64": ["@esbuild/win32-x64@0.18.20", "", { "os": "win32", "cpu": "x64" }, "sha512-kTdfRcSiDfQca/y9QIkng02avJ+NCaQvrMejlsB3RRv5sE9rRoeBPISaZpKxHELzRxZyLvNts1P27W3wV+8geQ=="],
 
-    "@imogen/mcp/@imogen/sdk/@imogen/shared": ["@imogen/shared@file:../imogen-sdk/typescript/packages/shared", {}],
+    "@imogen/mcp/@imogen/sdk/@imogen/shared": ["@imogen/shared@file:../imogen-sdk/typescript/packages/shared", { "dependencies": { "zod": "^4.1.5" } }],
 
-    "@imogen/server/@imogen/sdk/@imogen/shared": ["@imogen/shared@file:../imogen-sdk/typescript/packages/shared", {}],
+    "@imogen/server/@imogen/sdk/@imogen/shared": ["@imogen/shared@file:../imogen-sdk/typescript/packages/shared", { "dependencies": { "zod": "^4.1.5" } }],
 
-    "@imogen/web/@imogen/sdk/@imogen/shared": ["@imogen/shared@file:../imogen-sdk/typescript/packages/shared", {}],
+    "@imogen/web/@imogen/sdk/@imogen/shared": ["@imogen/shared@file:../imogen-sdk/typescript/packages/shared", { "dependencies": { "zod": "^4.1.5" } }],
 
     "@scalar/core/@scalar/types/@scalar/helpers": ["@scalar/helpers@0.2.18", "", {}, "sha512-w1d4tpNEVZ293oB2BAgLrS0kVPUtG3eByNmOCJA5eK9vcT4D3cmsGtWjUaaqit0BQCsBFHK51rasGvSWnApYTw=="],
 

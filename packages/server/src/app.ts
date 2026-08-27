@@ -18,6 +18,7 @@ import { createShareRoutes } from './api/share.ts'
 import { createUploadRoutes } from './api/uploads.ts'
 import { createVaultRoutes } from './api/vault.ts'
 import type { AppEnv } from './auth/middleware.ts'
+import type { Database } from './db/index.ts'
 import { respondWithError } from './lib/errors.ts'
 import { createMcpRoutes } from './mcp/routes.ts'
 import type { Services } from './services.ts'
@@ -101,7 +102,10 @@ export function createApp({ services, webRoot }: AppOptions) {
 
   // --- The versioned API ---
   const v1 = new OpenAPIHono<AppEnv>()
-  v1.get('/health', (c) => c.json({ status: 'ok', version: VERSION }))
+  v1.get('/health', async (c) => {
+    const reachable = await isDatabaseReachable(c.get('services').db)
+    return c.json({ status: reachable ? 'ok' : 'error', version: VERSION }, reachable ? 200 : 503)
+  })
   v1.route('/auth', createAuthRoutes())
 
   // Each router applies its own authentication. A wildcard across /api/v1 would also
@@ -197,6 +201,38 @@ export function createApp({ services, webRoot }: AppOptions) {
  * health check went on claiming 0.1.0 through three tagged releases.
  */
 export const VERSION: string = manifest.version
+
+// Comfortably inside the Docker HEALTHCHECK's 5s timeout, so an exhausted pool fails
+// the check instead of hanging until the container's own timeout kills the request.
+const HEALTH_CHECK_TIMEOUT_MS = 2_000
+
+/**
+ * A cheap round trip through the pool, not just a process-is-alive check. A pool with
+ * every connection stuck behind an abandoned transaction answers HTTP requests fine but
+ * can never complete one that touches the database — the health check has to notice
+ * that to be worth anything. See #9.
+ *
+ * Reserves a connection with an abort signal, rather than racing an unbounded query
+ * against a timer: if every connection is busy, the reservation itself is cancelled at
+ * the deadline instead of sitting in the pool's queue outliving the response that gave
+ * up on it — which matters here of all places, with repeated probes against a pool
+ * that's already exhausted.
+ */
+async function isDatabaseReachable(db: Database): Promise<boolean> {
+  try {
+    const reserved = await db.$client.reserve({
+      signal: AbortSignal.timeout(HEALTH_CHECK_TIMEOUT_MS),
+    })
+    try {
+      await reserved`select 1`
+      return true
+    } finally {
+      reserved.release()
+    }
+  } catch {
+    return false
+  }
+}
 
 /**
  * Serves the built single-page app: hashed assets cached forever, everything else

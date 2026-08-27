@@ -34,6 +34,12 @@ export class IngestService {
    * Registers an uploaded file and schedules its processing. Returns as soon as the
    * bytes are safely in the library — an upload should not wait on thumbnailing, so the
    * asset comes back `pending` and the client shows a placeholder.
+   *
+   * Every await in here is server-side (hashing a temp file, a query, a filesystem
+   * move); nothing waits on the client, whose bytes are already fully spooled to
+   * `input.tempPath` by the time this runs. That matters for `claimChecksum`, below: a
+   * lock held only across awaits like these can never be abandoned by a client that
+   * disconnects, because there is nothing left to disconnect from. See #9.
    */
   async ingest(input: IngestInput): Promise<AssetUploadResult> {
     const type = this.pipeline.classify(input.mimeType, input.filename)
@@ -45,56 +51,47 @@ export class IngestService {
     const checksum = await hashFile(input.tempPath)
     const { size } = await stat(input.tempPath)
 
-    const existing = await this.findByChecksum(input.ownerId, checksum)
-    if (existing) {
-      // Already have these exact bytes. Drop the copy rather than storing it twice.
-      await rm(input.tempPath, { force: true })
-      return { asset: await this.hydrate(existing.id), duplicate: true }
-    }
-
-    await this.assertWithinQuota(input.ownerId, size)
-
     // Capture time is provisional until the pipeline reads EXIF, but the library path
     // depends on it, so use the best guess available now.
     const provisionalCapturedAt = input.metadata.capturedAt
       ? new Date(input.metadata.capturedAt)
       : await fileModifiedTime(input.tempPath)
 
-    const [row] = await this.db
-      .insert(assets)
-      .values({
-        ownerId: input.ownerId,
-        type,
-        status: 'pending',
-        originalFilename: input.metadata.filename ?? input.filename,
-        mimeType: input.mimeType,
-        checksum,
-        sizeBytes: size,
-        originalPath: '',
-        capturedAt: provisionalCapturedAt,
-        capturedAtIsExact: false,
-        favorite: input.metadata.favorite ?? false,
-        deviceAssetId: input.metadata.deviceAssetId ?? null,
-        description: input.metadata.description ?? null,
-        latitude: input.metadata.location?.latitude ?? null,
-        longitude: input.metadata.location?.longitude ?? null,
-        altitude: input.metadata.location?.altitude ?? null,
-      })
-      .returning()
+    const claim = await this.claimChecksum(input.ownerId, checksum, size, {
+      type,
+      status: 'pending',
+      originalFilename: input.metadata.filename ?? input.filename,
+      mimeType: input.mimeType,
+      originalPath: '',
+      capturedAt: provisionalCapturedAt,
+      capturedAtIsExact: false,
+      favorite: input.metadata.favorite ?? false,
+      deviceAssetId: input.metadata.deviceAssetId ?? null,
+      description: input.metadata.description ?? null,
+      latitude: input.metadata.location?.latitude ?? null,
+      longitude: input.metadata.location?.longitude ?? null,
+      altitude: input.metadata.location?.altitude ?? null,
+    })
 
-    const asset = row!
+    if (claim.duplicate) {
+      // Already have these exact bytes. Drop the copy rather than storing it twice.
+      await rm(input.tempPath, { force: true })
+      return { asset: await this.hydrate(claim.id), duplicate: true }
+    }
+
+    const assetId = claim.id
     const relativePath = libraryPath({
       ownerId: input.ownerId,
-      assetId: asset.id,
+      assetId,
       capturedAt: provisionalCapturedAt,
       filename: input.filename,
     })
 
     try {
       const stored = await this.storage.moveInto(relativePath, input.tempPath)
-      await this.db.update(assets).set({ originalPath: stored.path }).where(eq(assets.id, asset.id))
+      await this.db.update(assets).set({ originalPath: stored.path }).where(eq(assets.id, assetId))
       await this.db.insert(assetFiles).values({
-        assetId: asset.id,
+        assetId,
         variant: 'original',
         path: stored.path,
         mimeType: input.mimeType,
@@ -102,7 +99,7 @@ export class IngestService {
       })
     } catch (error) {
       // Never leave a row pointing at bytes that are not there.
-      await this.db.delete(assets).where(eq(assets.id, asset.id))
+      await this.db.delete(assets).where(eq(assets.id, assetId))
       await rm(input.tempPath, { force: true })
       throw error
     }
@@ -112,9 +109,9 @@ export class IngestService {
       .set({ usedBytes: sql`${users.usedBytes} + ${size}` })
       .where(eq(users.id, input.ownerId))
 
-    await this.enqueue(INGEST_JOB, { assetId: asset.id })
+    await this.enqueue(INGEST_JOB, { assetId })
 
-    return { asset: await this.hydrate(asset.id), duplicate: false }
+    return { asset: await this.hydrate(assetId), duplicate: false }
   }
 
   /** Generates derivatives and fills in metadata. Runs in a worker, never on a request. */
@@ -194,25 +191,56 @@ export class IngestService {
       .where(eq(assets.id, assetId))
   }
 
-  private async findByChecksum(ownerId: string, checksum: string) {
-    const [row] = await this.db
-      .select({ id: assets.id })
-      .from(assets)
-      .where(and(eq(assets.ownerId, ownerId), eq(assets.checksum, checksum)))
-      .limit(1)
-    return row ?? null
-  }
+  /**
+   * Finds the existing asset for this checksum, or reserves one, atomically.
+   *
+   * Two uploads of the same file arriving together must not both pass the dedup check
+   * and both insert — one would then trip the unique index and fail outright instead of
+   * coming back a tidy `duplicate: true`. A per-checksum advisory lock serialises that
+   * narrow window, the same pattern `FaceService.recordFace` uses for a per-owner one.
+   *
+   * The lock lives entirely inside this transaction, alongside the quota check and the
+   * insert it guards — three quick queries, nothing else. `lock_timeout` and
+   * `statement_timeout` on the pool (see `db/index.ts`) bound how long a caller waits
+   * here even if that invariant is ever broken by a future change.
+   *
+   * This closes the race between the dedup check and the insert, but not the ones on
+   * either side of it: the row this reserves is visible, and `input.tempPath` removable
+   * by a concurrent duplicate upload, before `ingest` has moved the bytes into the
+   * library, and `usedBytes` is still incremented outside this transaction. Both are
+   * pre-existing and out of scope here.
+   */
+  private async claimChecksum(
+    ownerId: string,
+    checksum: string,
+    size: number,
+    values: Omit<typeof assets.$inferInsert, 'ownerId' | 'checksum' | 'sizeBytes'>,
+  ): Promise<{ id: string; duplicate: boolean }> {
+    return this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${checksum}))`)
 
-  private async assertWithinQuota(ownerId: string, incoming: number) {
-    const [user] = await this.db
-      .select({ quotaBytes: users.quotaBytes, usedBytes: users.usedBytes })
-      .from(users)
-      .where(eq(users.id, ownerId))
-      .limit(1)
-    if (!user?.quotaBytes) return
-    if (user.usedBytes + incoming > user.quotaBytes) {
-      throw quotaExceeded('This upload would exceed your storage quota')
-    }
+      const [existing] = await tx
+        .select({ id: assets.id })
+        .from(assets)
+        .where(and(eq(assets.ownerId, ownerId), eq(assets.checksum, checksum)))
+        .limit(1)
+      if (existing) return { id: existing.id, duplicate: true }
+
+      const [user] = await tx
+        .select({ quotaBytes: users.quotaBytes, usedBytes: users.usedBytes })
+        .from(users)
+        .where(eq(users.id, ownerId))
+        .limit(1)
+      if (user?.quotaBytes && user.usedBytes + size > user.quotaBytes) {
+        throw quotaExceeded('This upload would exceed your storage quota')
+      }
+
+      const [row] = await tx
+        .insert(assets)
+        .values({ ownerId, checksum, sizeBytes: size, ...values })
+        .returning({ id: assets.id })
+      return { id: row!.id, duplicate: false }
+    })
   }
 
   private async hydrate(assetId: string) {
