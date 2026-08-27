@@ -22,3 +22,16 @@ export function chunk<T>(items: T[], size: number): T[][] {
  * constant covers every call site without per-query tuning.
  */
 export const BULK_BATCH_SIZE = 5000
+
+/**
+ * How many photographs travel with an album or a person. Enough to draw a cover and a
+ * glance; not a substitute for the timeline, which is where the grid gets its contents
+ * now. An album of thirty thousand used to arrive here in full, as full Assets.
+ *
+ * Lives here rather than in `media/albums.ts`, where the brief for this cap first put
+ * it: `faces/faces.ts` needs the same number, and a faces module reaching into the
+ * albums module for a constant would be a dependency with nothing to do with faces.
+ * `lib/` already exists for exactly this — a value more than one domain needs to agree
+ * on, same as `BULK_BATCH_SIZE` above.
+ */
+export const COVER_SAMPLE = 60

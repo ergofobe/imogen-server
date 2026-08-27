@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
 import { asc, eq, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { albumAssets, assets, users } from '../db/schema.ts'
+import { COVER_SAMPLE } from '../lib/batch.ts'
 import { createTestDatabase } from '../test/harness.ts'
 import { AlbumService } from './albums.ts'
 import { AssetService } from './assets.ts'
@@ -141,5 +142,37 @@ describe('adding and removing assets in batches', () => {
     // the derived cover, not merely "newest within whichever batch it landed in".
     const newest = seeded.find((a) => a.capturedAt.toISOString().startsWith('2024-06-30'))!
     expect(rows[0]!.assetId).toBe(newest.id)
+  })
+})
+
+/**
+ * `getWithAssets` used to hand back every photograph an album held, as full `Asset`
+ * rows — a thirty-thousand-photograph album arrived as roughly 24 MB of JSON. The grid
+ * now comes from the timeline under an `albumId` filter; this is only a cover sample.
+ */
+describe('the cover sample', () => {
+  test('an album carries a cover sample, not every photograph it holds', async () => {
+    const album = await service.create(ownerId, { name: 'Big album' })
+    const seeded = await Promise.all(
+      Array.from({ length: COVER_SAMPLE + 40 }, (_, i) =>
+        addAsset({ capturedAt: new Date(Date.now() - i * 1000) }),
+      ),
+    )
+    await service.addAssets(
+      ownerId,
+      album.id,
+      seeded.map((a) => a.id),
+    )
+
+    const withAssets = await service.getWithAssets(ownerId, album.id)
+
+    expect(withAssets.assets).toHaveLength(COVER_SAMPLE)
+    for (let i = 1; i < withAssets.assets.length; i++) {
+      expect(new Date(withAssets.assets[i - 1]!.capturedAt).getTime()).toBeGreaterThanOrEqual(
+        new Date(withAssets.assets[i]!.capturedAt).getTime(),
+      )
+    }
+    // The sample is the newest ones, not an arbitrary slice — seeded[0] is the newest.
+    expect(withAssets.assets[0]!.id).toBe(seeded[0]!.id)
   })
 })

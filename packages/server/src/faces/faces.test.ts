@@ -8,6 +8,7 @@ import type { Sharp } from 'sharp'
 import sharp from 'sharp'
 import type { Database } from '../db/index.ts'
 import { assets, faces, people, users } from '../db/schema.ts'
+import { COVER_SAMPLE } from '../lib/batch.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
 import { FaceService } from './faces.ts'
 import { ModelStore } from './models.ts'
@@ -202,6 +203,51 @@ describe('forgetting a set of assets', () => {
     await service.forgetAssets([], ownerId)
 
     expect(await db.select().from(people).where(eq(people.id, orphan!.id))).toHaveLength(1)
+  })
+})
+
+/**
+ * `photosOf` used to be `selectDistinctOn([assets.id])` with no `orderBy` at all — an
+ * arbitrary five hundred in whatever order Postgres felt like handing back uuids, not
+ * the most recent five hundred. Driven with plain `faces` rows rather than real
+ * detection, so this runs without the model fixtures `canRun` gates.
+ */
+describe('the cover sample', () => {
+  test("a person's sample is the most recent, not an arbitrary slice of uuid order", async () => {
+    const [person] = await db.insert(people).values({ ownerId, name: 'Many' }).returning()
+    const seeded = []
+    for (let i = 0; i < COVER_SAMPLE + 40; i++) {
+      const asset = await addBareAsset({ capturedAt: new Date(Date.now() - i * 1000) })
+      await addFace(asset.id, person!.id)
+      seeded.push(asset)
+    }
+
+    const photos = await service.photosOf(ownerId, person!.id)
+
+    expect(photos).toHaveLength(COVER_SAMPLE)
+    for (let i = 1; i < photos.length; i++) {
+      expect(photos[i - 1]!.capturedAt.getTime()).toBeGreaterThanOrEqual(
+        photos[i]!.capturedAt.getTime(),
+      )
+    }
+    // The sample is the newest ones, not an arbitrary slice — seeded[0] is the newest.
+    expect(photos[0]!.id).toBe(seeded[0]!.id)
+  })
+
+  /**
+   * A person can have more than one face in the same photograph (a mistaken split, a
+   * photo of them in a mirror). `selectDistinctOn` must dedupe by photograph, not
+   * return the join's one row per face.
+   */
+  test('a photograph with two faces of the same person is returned once', async () => {
+    const [person] = await db.insert(people).values({ ownerId, name: 'Twice' }).returning()
+    const asset = await addBareAsset()
+    await addFace(asset.id, person!.id)
+    await addFace(asset.id, person!.id)
+
+    const photos = await service.photosOf(ownerId, person!.id)
+
+    expect(photos.map((p) => p.id)).toEqual([asset.id])
   })
 })
 

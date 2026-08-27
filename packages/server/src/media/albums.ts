@@ -10,7 +10,7 @@ import type {
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { type AlbumRow, albumAssets, albums, assets, shareLinks } from '../db/schema.ts'
-import { BULK_BATCH_SIZE, chunk } from '../lib/batch.ts'
+import { BULK_BATCH_SIZE, COVER_SAMPLE, chunk } from '../lib/batch.ts'
 import { forbidden, notFound } from '../lib/errors.ts'
 import { generateToken } from '../lib/tokens.ts'
 import { toAsset } from './serialize.ts'
@@ -132,7 +132,7 @@ export class AlbumService {
         and(eq(albumAssets.albumId, albumId), isNull(assets.deletedAt), isNull(assets.vaultedAt)),
       )
       /*
-       * Newest first, the same as the timeline.
+       * Newest first, the same as the timeline, and capped to `COVER_SAMPLE`.
        *
        * This used to lead with `position`, which is assigned as things are inserted
        * and so held the order they happened to be added in — and since the query that
@@ -141,9 +141,13 @@ export class AlbumService {
        * of the timeline, depending on the day.
        *
        * The id breaks ties so two photographs taken in the same second do not swap
-       * places between requests.
+       * places between requests. The cap is new: this used to return every photograph
+       * the album held, as full `Asset` rows — thirty thousand of them arrives as
+       * roughly 24 MB of JSON. The grid reads the timeline under an `albumId` filter
+       * now; what is left here is a cover, not the contents.
        */
       .orderBy(desc(assets.capturedAt), desc(assets.id))
+      .limit(COVER_SAMPLE)
     return { ...album, assets: rows.map((r) => toAsset(r.asset)) }
   }
 
@@ -402,24 +406,32 @@ export class AlbumService {
     const [album] = await this.db.select().from(albums).where(eq(albums.id, link.albumId)).limit(1)
     if (!album) return null
 
+    const membership = and(
+      eq(albumAssets.albumId, link.albumId),
+      isNull(assets.deletedAt),
+      isNull(assets.vaultedAt),
+    )
+    // Same cap as `getWithAssets`: the public page is a cover, not a full download —
+    // and `getWithAssets(...).assets` used to be this route's only defence against a
+    // 24 MB reply too. The count below stays the true total; only the array is capped.
     const rows = await this.db
       .select({ asset: assets })
       .from(albumAssets)
       .innerJoin(assets, eq(assets.id, albumAssets.assetId))
-      .where(
-        and(
-          eq(albumAssets.albumId, link.albumId),
-          isNull(assets.deletedAt),
-          isNull(assets.vaultedAt),
-        ),
-      )
+      .where(membership)
       .orderBy(desc(assets.capturedAt), desc(assets.id))
+      .limit(COVER_SAMPLE)
+    const [counted] = await this.db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(albumAssets)
+      .innerJoin(assets, eq(assets.id, albumAssets.assetId))
+      .where(membership)
 
     return {
       link,
       requiresPassword: link.passwordHash !== null,
       album: {
-        ...toAlbum(album, rows.length, link.slug),
+        ...toAlbum(album, Number(counted?.count ?? 0), link.slug),
         assets: rows.map((r) => toAsset(r.asset)),
       },
     }

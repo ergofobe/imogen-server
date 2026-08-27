@@ -4,6 +4,8 @@ import { sql } from 'drizzle-orm'
 import sharp from 'sharp'
 import manifest from '../../package.json'
 import { createApp } from '../app.ts'
+import { albumAssets, assets } from '../db/schema.ts'
+import { COVER_SAMPLE } from '../lib/batch.ts'
 import { createServices } from '../services.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
 
@@ -515,6 +517,121 @@ describe('albums and sharing', () => {
     const response = await request(`/api/v1/share/${link.slug}/assets/${other.asset.id}/preview`)
 
     expect(response.status).toBe(404)
+  })
+
+  /**
+   * The guard used to scan `share.album.assets` — now a capped cover sample — for the
+   * requested id. Once the sample is capped, that scan would wrongly refuse a real
+   * photograph the sample happens to leave out; the guard has to ask the database
+   * instead. Filler assets are inserted directly rather than uploaded: a real upload
+   * per photo, sixty-five times over, would make this test glacial for no benefit —
+   * what's under test is the membership check, not ingestion.
+   */
+  test('a shared album serves a photo outside its cover sample, and refuses one genuinely outside the album', async () => {
+    const { cookie, user } = await signUp()
+    const ownerId = user.id
+
+    const target = (await (await upload(cookie, await makePhoto('target.jpg'))).json()) as {
+      asset: { id: string }
+    }
+    const outsider = (await (await upload(cookie, await makePhoto('outsider.jpg'))).json()) as {
+      asset: { id: string }
+    }
+    await services.queue.drain()
+
+    const album = (await (
+      await jsonRequest('/api/v1/albums', 'POST', { name: 'Big album' }, cookie)
+    ).json()) as { id: string }
+    await jsonRequest(
+      `/api/v1/albums/${album.id}/assets`,
+      'POST',
+      { assetIds: [target.asset.id] },
+      cookie,
+    )
+
+    // Backdated so a wall of newer filler photos pushes it out of the cover sample
+    // while it stays a genuine member of the album.
+    await harness.db.execute(
+      sql`update assets set captured_at = '2000-01-01' where id = ${target.asset.id}`,
+    )
+    const fillerIds: string[] = []
+    for (let i = 0; i < COVER_SAMPLE + 5; i++) {
+      const [row] = await harness.db
+        .insert(assets)
+        .values({
+          ownerId,
+          type: 'image',
+          status: 'ready',
+          originalFilename: `filler-${i}.jpg`,
+          mimeType: 'image/jpeg',
+          checksum: `filler-${i}`.padStart(64, '0'),
+          sizeBytes: 10,
+          originalPath: `filler/${i}.jpg`,
+          capturedAt: new Date(),
+        })
+        .returning({ id: assets.id })
+      fillerIds.push(row!.id)
+    }
+    await harness.db
+      .insert(albumAssets)
+      .values(fillerIds.map((assetId, i) => ({ albumId: album.id, assetId, position: i })))
+
+    const link = (await (
+      await jsonRequest(`/api/v1/albums/${album.id}/share`, 'POST', { allowDownload: true }, cookie)
+    ).json()) as { slug: string }
+
+    const opened = (await (await request(`/api/v1/share/${link.slug}`)).json()) as {
+      album: { assets: Array<{ id: string }> }
+    }
+    expect(opened.album.assets).toHaveLength(COVER_SAMPLE)
+    expect(opened.album.assets.map((a) => a.id)).not.toContain(target.asset.id)
+
+    const insideAlbum = await request(
+      `/api/v1/share/${link.slug}/assets/${target.asset.id}/thumbnail`,
+    )
+    const outsideAlbum = await request(
+      `/api/v1/share/${link.slug}/assets/${outsider.asset.id}/thumbnail`,
+    )
+
+    expect(insideAlbum.status).toBe(200)
+    expect(outsideAlbum.status).toBe(404)
+  })
+
+  test('a shared album has its own timeline, scoped to its own photos', async () => {
+    const { cookie, albumId, assetId } = await setup()
+    const link = (await (
+      await jsonRequest(`/api/v1/albums/${albumId}/share`, 'POST', { allowDownload: true }, cookie)
+    ).json()) as { slug: string }
+
+    const timeline = await request(`/api/v1/share/${link.slug}/timeline`)
+    const { buckets } = (await timeline.json()) as { buckets: Array<{ count: number }> }
+
+    expect(timeline.status).toBe(200)
+    expect(buckets.reduce((sum, b) => sum + b.count, 0)).toBe(1)
+
+    const period = new Date().toISOString().slice(0, 7)
+    const bucket = await request(`/api/v1/share/${link.slug}/timeline/bucket?period=${period}`)
+    const page = (await bucket.json()) as { items: Array<{ id: string }> }
+
+    expect(bucket.status).toBe(200)
+    expect(page.items.map((i) => i.id)).toEqual([assetId])
+  })
+
+  test('the share timeline ignores any albumId a visitor tries to supply', async () => {
+    const { cookie, albumId } = await setup()
+    // A second, unshared album belonging to the same owner — never reachable through
+    // this slug, no matter what the query string asks for.
+    const other = (await (
+      await jsonRequest('/api/v1/albums', 'POST', { name: 'Private' }, cookie)
+    ).json()) as { id: string }
+    const link = (await (
+      await jsonRequest(`/api/v1/albums/${albumId}/share`, 'POST', { allowDownload: true }, cookie)
+    ).json()) as { slug: string }
+
+    const response = await request(`/api/v1/share/${link.slug}/timeline?albumId=${other.id}`)
+    const { buckets } = (await response.json()) as { buckets: Array<{ count: number }> }
+
+    expect(buckets.reduce((sum, b) => sum + b.count, 0)).toBe(1)
   })
 })
 
