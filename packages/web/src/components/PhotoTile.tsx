@@ -1,16 +1,37 @@
-import type { Asset } from '@imogen/shared'
+import type { Asset, TimelineTile } from '@imogen/shared'
 import { useAssetUrls } from '../lib/assetUrls.tsx'
-import { formatDuration } from '../lib/format.ts'
+import { formatCaptureMoment, formatDuration } from '../lib/format.ts'
+
+/**
+ * A tile draws from whichever of the two shapes the caller happens to hold. The windowed
+ * timeline fetches `TimelineTile`, which is an `Asset` with everything a tile never reads
+ * left out; an album or a shared link already holds whole `Asset`s. The two agree on every
+ * field below except the filename, which only exists on one of them and only ever reaches
+ * a screen reader.
+ */
+export type TileSubject = Asset | TimelineTile
 
 type Props = {
-  asset: Asset
+  asset: TileSubject
   width: number
   height: number
   selected: boolean
   selectable?: boolean
   selecting: boolean
-  onOpen: (asset: Asset) => void
-  onToggleSelect: (asset: Asset, shiftKey: boolean) => void
+  onOpen: (asset: TileSubject) => void
+  onToggleSelect: (asset: TileSubject, shiftKey: boolean) => void
+}
+
+/**
+ * What to call a photograph out loud.
+ *
+ * A tile has no filename, so it is named by the moment it was taken — to the second, because
+ * a day's worth of tiles named only by their day would be a screen full of buttons a screen
+ * reader cannot tell apart, and the grid is nothing but buttons.
+ */
+function nameOf(asset: TileSubject): string {
+  if ('originalFilename' in asset) return asset.originalFilename
+  return `photo taken ${formatCaptureMoment(asset.capturedAt)}`
 }
 
 /**
@@ -44,7 +65,7 @@ export function PhotoTile({
       {!pending && (
         <img
           src={urls.url(asset.id, 'thumbnail')}
-          alt={asset.description ?? asset.originalFilename}
+          alt={('description' in asset ? asset.description : null) ?? nameOf(asset)}
           width={width}
           height={height}
           loading="lazy"
@@ -70,7 +91,7 @@ export function PhotoTile({
             return
           } else onOpen(asset)
         }}
-        aria-label={`Open ${asset.originalFilename}`}
+        aria-label={`Open ${nameOf(asset)}`}
         className="absolute inset-0 cursor-pointer"
       />
 

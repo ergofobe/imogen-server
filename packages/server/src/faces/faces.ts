@@ -3,6 +3,7 @@ import type ort from 'onnxruntime-node'
 import type { Database } from '../db/index.ts'
 import { assets, faces, people, settings } from '../db/schema.ts'
 import { FACE_BACKFILL_JOB, FACE_MODELS_JOB } from '../jobs/faces.ts'
+import { COVER_SAMPLE } from '../lib/batch.ts'
 import { forbidden, notFound } from '../lib/errors.ts'
 import { bestMatch, CLUSTER, updateCentroid } from './cluster.ts'
 import { detect } from './detect.ts'
@@ -251,9 +252,12 @@ export class FaceService {
     await this.refreshCounts(ownerId)
   }
 
-  /** Called when a photo is vaulted: its faces stop existing. */
-  async forgetAsset(assetId: string, ownerId: string): Promise<void> {
-    await this.db.delete(faces).where(eq(faces.assetId, assetId))
+  /** Called when a photo is vaulted: its faces stop existing. Also used for a set of many. */
+  async forgetAssets(assetIds: string[], ownerId: string): Promise<void> {
+    if (assetIds.length === 0) return
+    await this.db
+      .delete(faces)
+      .where(and(eq(faces.ownerId, ownerId), inArray(faces.assetId, assetIds)))
     await this.refreshCounts(ownerId)
   }
 
@@ -363,11 +367,23 @@ export class FaceService {
       .where(eq(people.id, personId))
   }
 
-  /** The photos a person appears in. Vaulted and trashed photos are never among them. */
-  async photosOf(ownerId: string, personId: string, limit = 500) {
+  /**
+   * A sample of the photographs a person appears in, newest first. This used to be
+   * `selectDistinctOn([assets.id])` with no `orderBy` at all, which meant an arbitrary
+   * `limit` in whatever order Postgres felt like handing back uuids — not the most
+   * recent, and grouped by day it read as noise. The grid now comes from the timeline
+   * under a `personId` filter; this is the cover sample.
+   *
+   * Postgres requires the `distinct on` expressions to lead the `order by`, so the
+   * dedup key is `(capturedAt, id)` rather than `id` alone — the pair is exactly as
+   * unique as `id` alone (it's still one row per asset), and is the order wanted
+   * anyway. A person can have more than one face in the same photograph, and the join
+   * would otherwise hand back that photograph once per face.
+   */
+  async photosOf(ownerId: string, personId: string, limit = COVER_SAMPLE) {
     await this.getPerson(ownerId, personId)
     const rows = await this.db
-      .selectDistinctOn([assets.id], { asset: assets })
+      .selectDistinctOn([assets.capturedAt, assets.id], { asset: assets })
       .from(faces)
       .innerJoin(assets, eq(assets.id, faces.assetId))
       .where(
@@ -378,6 +394,7 @@ export class FaceService {
           isNull(assets.deletedAt),
         ),
       )
+      .orderBy(desc(assets.capturedAt), desc(assets.id))
       .limit(limit)
     return rows.map((r) => r.asset)
   }

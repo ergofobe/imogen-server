@@ -176,7 +176,7 @@ export const TOOLS: Tool[] = [
   {
     name: 'get_album',
     title: 'Get album contents',
-    description: 'One album and the photos in it.',
+    description: 'One album and a cover sample of the photos in it.',
     scope: 'albums:read',
     input: z.object({ albumId: z.string() }),
     run: async (args, { services, principal }) => {
@@ -185,7 +185,9 @@ export const TOOLS: Tool[] = [
         id: album.id,
         name: album.name,
         description: album.description,
-        photoCount: album.assets.length,
+        // `album.assets` is capped at COVER_SAMPLE, not the whole album — `assetCount`
+        // is the true total, the same figure `list_albums` above already reports.
+        photoCount: album.assetCount,
         photos: album.assets.map(summarize),
       })
     },

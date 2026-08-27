@@ -6,8 +6,16 @@ import { imogen } from '../lib/client.ts'
 /** Matches the limit the API enforces, so the field stops before the request fails. */
 const MAX_LENGTH = 4096
 
-/** Query keys whose data holds assets, and so goes stale when a description changes. */
-const ASSET_QUERIES = new Set(['assets', 'album', 'person', 'vault-assets'])
+/**
+ * Query keys whose data holds assets, and so goes stale when a description changes.
+ *
+ * `asset` is the whole photograph the viewer fetches for itself, which is where a description
+ * is read and written. `album` and `person` carry whole assets too, and their grids draw the
+ * description as an image's alt text. The timeline's own tiles do not carry one — and since a
+ * description changes no day's count, the windowed grid will not refetch the month for it
+ * either; there is simply nothing on a timeline tile for this to make stale.
+ */
+const ASSET_QUERIES = new Set(['assets', 'album', 'person', 'vault-assets', 'timeline', 'asset'])
 
 /**
  * What the photograph is of, in the owner's own words.

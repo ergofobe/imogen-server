@@ -116,6 +116,47 @@ describe('a vaulted photo is absent from the ordinary library', () => {
     expect(body.buckets.reduce((sum, b) => sum + b.count, 0)).toBe(1)
   })
 
+  test('it is absent from a period bucket, whose tiles serialise what the route promises', async () => {
+    const { cookie, secretId, publicId } = await setup()
+    // Uploaded fixtures carry no EXIF capture time, so they land in the current month.
+    const period = new Date().toISOString().slice(0, 7)
+
+    const body = (await (
+      await request(`/api/v1/assets/timeline/bucket?period=${period}&limit=10`, {
+        headers: { Cookie: cookie },
+      })
+    ).json()) as {
+      items: Array<{
+        id: string
+        capturedAt: string
+        type: string
+        status: string
+        width: number | null
+        height: number | null
+        favorite: boolean
+        duration: number | null
+        placeholderColor: string | null
+        livePhotoVideoId: string | null
+      }>
+      nextCursor: string | null
+      total: number | null
+    }
+
+    // Pins that /timeline/bucket is reachable ahead of /:id — an id-shaped route
+    // registered first would otherwise swallow this path — and that the handler's
+    // inferred return type matches the declared pageOf(TimelineTile) response, which
+    // @hono/zod-openapi does not check at runtime.
+    expect(body.items.map((i) => i.id)).toEqual([publicId])
+    expect(body.items.map((i) => i.id)).not.toContain(secretId)
+    expect(body.total).toBe(1)
+    expect(body.nextCursor).toBeNull()
+    const tile = body.items[0]!
+    expect(tile.type).toBe('image')
+    expect(typeof tile.capturedAt).toBe('string')
+    expect('width' in tile).toBe(true)
+    expect('livePhotoVideoId' in tile).toBe(true)
+  })
+
   test('it is not counted in library statistics', async () => {
     const { cookie } = await setup()
 
@@ -336,6 +377,80 @@ describe('an AI assistant can never reach the vault', () => {
   })
 })
 
+/**
+ * The unlock gate, checked against a signed-in browser session that has NOT unlocked.
+ *
+ * That last part is the whole point, and it is what the existing "an OAuth token cannot list
+ * the vault" test does not do: a bearer token is refused by `vaultIsOpen`'s
+ * `principal.via !== 'session'` branch long before the gate's path matters, so that test
+ * passes identically whether the gate covers one path or all of them. These use `cookie`
+ * alone — a real session, a real person, no unlock — which is the only shape that can tell
+ * a wildcard gate from a gate that names `/assets` and nothing else.
+ *
+ * That distinction is not hypothetical. The gate WAS `app.use('/assets', …)`, and adding
+ * `/vault/timeline` under it put the vault's day counts, its tiles and its ids one
+ * unauthenticated request away. The endpoints below are enumerated rather than sampled so
+ * that the next route added under `/vault` has to be added here too, or noticed here first.
+ */
+describe('the unlock gate covers every path that reveals the vault', () => {
+  test('a signed-in session that has not unlocked cannot read the vault spine', async () => {
+    const { cookie } = await setup()
+
+    const response = await request('/api/v1/vault/timeline', { headers: { Cookie: cookie } })
+
+    expect(response.status).toBe(403)
+  })
+
+  test('nor a bucket of it, which carries the tiles themselves', async () => {
+    const { cookie } = await setup()
+
+    const response = await request('/api/v1/vault/timeline/bucket?period=2011-08', {
+      headers: { Cookie: cookie },
+    })
+
+    expect(response.status).toBe(403)
+  })
+
+  test('nor the asset listing', async () => {
+    const { cookie } = await setup()
+
+    const response = await request('/api/v1/vault/assets', { headers: { Cookie: cookie } })
+
+    expect(response.status).toBe(403)
+  })
+
+  /*
+   * The property that actually matters. A gate spelled as a literal path is correct until
+   * somebody adds a route, and then it is silently wrong — which is exactly how the hole
+   * above was made. A wildcard refuses a path nobody has written yet.
+   */
+  test('and a route that does not exist yet is refused rather than found', async () => {
+    const { cookie } = await setup()
+
+    const response = await request('/api/v1/vault/something-added-later', {
+      headers: { Cookie: cookie },
+    })
+
+    expect(response.status).toBe(403)
+  })
+
+  /*
+   * The other side of it: `/status` sits deliberately outside the gate, because a locked
+   * vault still has to be able to say that it is locked. It reveals whether one is
+   * configured and whether it is open, and nothing about what is inside.
+   */
+  test('but a locked vault can still say that it is locked, without saying what it holds', async () => {
+    const { cookie } = await setup()
+
+    const response = await request('/api/v1/vault/status', { headers: { Cookie: cookie } })
+    const body = (await response.json()) as { unlocked: boolean; count?: number }
+
+    expect(response.status).toBe(200)
+    expect(body.unlocked).toBe(false)
+    expect(body.count).toBeUndefined()
+  })
+})
+
 describe('locking', () => {
   test('locking the vault immediately hides it again', async () => {
     const { cookie, bothCookies, secretId } = await setup()
@@ -361,5 +476,39 @@ describe('locking', () => {
     expect(status.configured).toBe(true)
     expect(status.unlocked).toBe(false)
     expect(status.count).toBeUndefined()
+  })
+})
+
+describe('moving photos back out of the vault', () => {
+  test('moves a photo out by an explicit id list', async () => {
+    const { cookie, bothCookies, secretId } = await setup()
+
+    const response = await json(
+      '/api/v1/vault/assets',
+      'DELETE',
+      { assetIds: [secretId] },
+      bothCookies,
+    )
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ moved: 1 })
+
+    // Back in the ordinary library, reachable through the plain session cookie.
+    const page = (await (
+      await request('/api/v1/assets', { headers: { Cookie: cookie } })
+    ).json()) as { items: Array<{ id: string }> }
+    expect(page.items.map((i) => i.id)).toContain(secretId)
+  })
+
+  /**
+   * `AssetFilter` cannot see into the vault by design, so a query-form selection here
+   * could only ever resolve to zero ids — a silent, successful no-op a client could not
+   * tell apart from "nothing matched". Rejected instead of accepted and ignored.
+   */
+  test('rejects a query-form selection instead of silently moving nothing', async () => {
+    const { bothCookies } = await setup()
+
+    const response = await json('/api/v1/vault/assets', 'DELETE', { query: {} }, bothCookies)
+
+    expect(response.status).toBe(400)
   })
 })

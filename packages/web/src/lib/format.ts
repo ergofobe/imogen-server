@@ -5,7 +5,31 @@ const DAY_WITH_YEAR = new Intl.DateTimeFormat(undefined, {
   month: 'long',
   year: 'numeric',
 })
+const DAY_UTC = new Intl.DateTimeFormat(undefined, {
+  weekday: 'long',
+  day: 'numeric',
+  month: 'long',
+  timeZone: 'UTC',
+})
+const DAY_WITH_YEAR_UTC = new Intl.DateTimeFormat(undefined, {
+  weekday: 'long',
+  day: 'numeric',
+  month: 'long',
+  year: 'numeric',
+  timeZone: 'UTC',
+})
+const CAPTURE_MOMENT = new Intl.DateTimeFormat(undefined, {
+  dateStyle: 'full',
+  timeStyle: 'medium',
+  timeZone: 'UTC',
+})
 const MONTH_YEAR = new Intl.DateTimeFormat(undefined, { month: 'short', year: 'numeric' })
+const MONTH_UTC = new Intl.DateTimeFormat(undefined, { month: 'long', timeZone: 'UTC' })
+const MONTH_YEAR_UTC = new Intl.DateTimeFormat(undefined, {
+  month: 'long',
+  year: 'numeric',
+  timeZone: 'UTC',
+})
 const EXACT = new Intl.DateTimeFormat(undefined, { dateStyle: 'full', timeStyle: 'short' })
 
 /** Omits the year for photos from this year, the way a person would say the date aloud. */
@@ -15,7 +39,45 @@ export function formatDayHeading(iso: string): string {
   return (thisYear ? DAY : DAY_WITH_YEAR).format(date)
 }
 
+/**
+ * The same heading, for a `YYYY-MM-DD` day key rather than an instant.
+ *
+ * The server buckets on UTC days and the whole timeline is keyed on them, so the heading
+ * has to be read in UTC too: formatting `2011-08-14` anywhere behind UTC would title the
+ * section with the thirteenth while every photograph under it belongs to the fourteenth.
+ */
+export function formatDayKeyHeading(day: string): string {
+  const date = new Date(`${day}T00:00:00.000Z`)
+  const thisYear = date.getUTCFullYear() === new Date().getUTCFullYear()
+  return (thisYear ? DAY_UTC : DAY_WITH_YEAR_UTC).format(date)
+}
+
+/**
+ * A photograph named by when it was taken, for a tile that has no filename to be named by.
+ *
+ * To the second, and in UTC like every other date the timeline speaks: forty photographs
+ * from one afternoon have to be forty different names, or a screen reader reads out forty
+ * identical buttons and none of them can be told apart or referred to.
+ */
+export const formatCaptureMoment = (iso: string) => CAPTURE_MOMENT.format(new Date(iso))
+
 export const formatMonthYear = (iso: string) => MONTH_YEAR.format(new Date(iso))
+
+/**
+ * '2012-06' -> 'June'. Read in UTC like every other date the timeline speaks: the month
+ * key comes from a UTC day key, and formatting it behind UTC would name the month before
+ * it for anything captured on the first.
+ */
+export const formatMonthKey = (month: string) =>
+  MONTH_UTC.format(new Date(`${month}-01T00:00:00.000Z`))
+
+/**
+ * '2024-12' -> 'December 2024'. What the rail says while it is being dragged: a month is
+ * the granularity somebody actually remembers a photograph by, and the exact day under the
+ * thumb is noise at scrubbing speed.
+ */
+export const formatMonthYearKey = (month: string) =>
+  MONTH_YEAR_UTC.format(new Date(`${month}-01T00:00:00.000Z`))
 export const formatExact = (iso: string) => EXACT.format(new Date(iso))
 
 export function formatBytes(bytes: number): string {

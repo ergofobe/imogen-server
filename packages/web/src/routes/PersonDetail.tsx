@@ -1,17 +1,18 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
-import { EmptyState } from '../components/EmptyState.tsx'
-import { PhotoGrid } from '../components/PhotoGrid.tsx'
+import { TimelineBody, TimelineCount } from '../components/TimelineBody.tsx'
+import { TimelineSkeleton } from '../components/TimelineSkeleton.tsx'
 import { Viewer } from '../components/Viewer.tsx'
-import { useViewerParam } from '../hooks/useViewerParam.ts'
+import { useOverviewKey } from '../hooks/useOverviewKey.ts'
+import { useTimelineGrid } from '../hooks/useTimelineGrid.ts'
+import { useTimelineViewer } from '../hooks/useTimelineViewer.ts'
 import { imogen } from '../lib/client.ts'
 
 export function PersonDetail() {
   const { id = '' } = useParams()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { openId, open: openPhoto, replace: showPhoto, close: closePhoto } = useViewerParam()
   const [editing, setEditing] = useState(false)
   const [name, setName] = useState('')
 
@@ -19,11 +20,6 @@ export function PersonDetail() {
     queryKey: ['person', id],
     queryFn: () => imogen.people.get(id),
   })
-
-  const refresh = () => {
-    void queryClient.invalidateQueries({ queryKey: ['person', id] })
-    void queryClient.invalidateQueries({ queryKey: ['people'] })
-  }
 
   const rename = useMutation({
     mutationFn: (value: string | null) => imogen.people.update(id, { name: value }),
@@ -41,10 +37,26 @@ export function PersonDetail() {
     },
   })
 
-  if (isPending || !person) return <div className="h-40 animate-pulse rounded-lg bg-sunken" />
+  /*
+   * The timeline under `{ personId }`, not `person.photos`.
+   *
+   * `people.get` answers with a capped sample, the same shape and the same sixty as an
+   * album's. Reading a grid from it showed sixty photographs of somebody who appears in
+   * six hundred, with nothing on the page to say so and no way to reach the rest.
+   */
+  const filter = useMemo(() => ({ personId: id }), [id])
+  const grid = useTimelineGrid(filter)
+  const viewer = useTimelineViewer(grid)
+  useOverviewKey(grid, viewer.openId)
 
-  const photos = person.photos
-  const openIndex = openId ? photos.findIndex((p) => p.id === openId) : -1
+  const refresh = () => {
+    void queryClient.invalidateQueries({ queryKey: ['person', id] })
+    void queryClient.invalidateQueries({ queryKey: ['people'] })
+    void queryClient.invalidateQueries({ queryKey: ['asset'] })
+    grid.reload()
+  }
+
+  if (isPending || !person) return <TimelineSkeleton />
 
   return (
     <>
@@ -117,9 +129,10 @@ export function PersonDetail() {
                 {person.name ?? <span className="text-muted italic">Add a name</span>}
               </button>
             )}
-            <p className="label-micro mt-1">
-              {person.photoCount} {person.photoCount === 1 ? 'photo' : 'photos'}
-            </p>
+            <TimelineCount
+              totalCount={grid.totalCount}
+              onShowOverview={() => grid.setShowingOverview(true)}
+            />
           </div>
         </div>
 
@@ -132,34 +145,30 @@ export function PersonDetail() {
         </button>
       </div>
 
-      {photos.length === 0 ? (
-        <EmptyState
-          headline="No photos to show"
-          body="Every photo this person appeared in has been vaulted or deleted."
-        />
-      ) : (
-        <PhotoGrid
-          assets={photos}
-          selected={new Set()}
-          onOpen={(asset) => openPhoto(asset.id)}
-          onToggleSelect={() => {}}
-        />
-      )}
+      <TimelineBody
+        grid={grid}
+        filter={filter}
+        empty={{
+          headline: 'No photos to show',
+          body: 'Every photo this person appeared in has been vaulted or deleted.',
+        }}
+        onOpen={(tile) => viewer.open(tile.id)}
+      />
 
-      {openIndex >= 0 && photos[openIndex] && (
+      {viewer.asset && (
         <Viewer
-          asset={photos[openIndex]}
-          hasPrevious={openIndex > 0}
-          hasNext={openIndex < photos.length - 1}
-          onClose={closePhoto}
-          onPrevious={() => showPhoto(photos[openIndex - 1]?.id ?? '')}
-          onNext={() => showPhoto(photos[openIndex + 1]?.id ?? '')}
+          asset={viewer.asset}
+          hasPrevious={viewer.hasPrevious}
+          hasNext={viewer.hasNext}
+          onClose={viewer.close}
+          onPrevious={() => viewer.step(-1)}
+          onNext={() => viewer.step(1)}
           onToggleFavorite={(asset) => {
             void imogen.assets.update(asset.id, { favorite: !asset.favorite }).then(refresh)
           }}
           onTrash={(asset) => {
-            closePhoto()
-            void imogen.assets.trash([asset.id]).then(refresh)
+            viewer.close()
+            void imogen.assets.trash({ assetIds: [asset.id] }).then(refresh)
           }}
         />
       )}

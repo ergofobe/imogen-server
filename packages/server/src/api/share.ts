@@ -1,11 +1,12 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
-import { eq } from 'drizzle-orm'
+import { TimelineBucketQuery, TimelineQuery } from '@imogen/shared'
+import { and, eq } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { getCookie, setCookie } from 'hono/cookie'
 import type { AppEnv } from '../auth/middleware.ts'
-import { assetFiles } from '../db/schema.ts'
+import { albumAssets, assetFiles, assets } from '../db/schema.ts'
 import { badRequest, notFound, unauthorized } from '../lib/errors.ts'
-import type { OpenedShare } from '../media/albums.ts'
+import { inAlbum, type OpenedShare } from '../media/albums.ts'
 import type { Services } from '../services.ts'
 
 const UNLOCK_TTL_MS = 12 * 60 * 60 * 1000
@@ -99,9 +100,13 @@ export function createShareRoutes() {
     }
 
     // The asset must belong to the shared album. Otherwise a valid slug would be a
-    // key to the whole library.
+    // key to the whole library. Checked against the database, not `share.album.assets`
+    // — that array is now a capped cover sample (see `openShare`), so scanning it would
+    // wrongly reject a real photograph the sample happens to leave out. It was also an
+    // O(n) scan run once per thumbnail, over an array that could hold every photo in
+    // the album.
     const assetId = c.req.param('assetId')
-    if (!share.album.assets.some((a) => a.id === assetId)) {
+    if (!(await isMemberOfShare(services, share, assetId))) {
       throw notFound('That photo is not part of this album')
     }
 
@@ -120,7 +125,108 @@ export function createShareRoutes() {
     })
   })
 
+  /*
+   * One photograph, whole, for the viewer.
+   *
+   * The page used to open a photograph out of `share.album.assets`, which is a capped
+   * cover sample — so once the grid windows over the whole album, anything past the sample
+   * had a tile and no asset behind it. Guarded by the same membership predicate as the
+   * file routes: a valid slug is a key to one album, never to the library.
+   */
+  app.get('/:slug/assets/:assetId', async (c) => {
+    const services = c.get('services')
+    const share = await open(services, c.req.param('slug'), c)
+    if (share === 'locked') throw unauthorized('This album is locked')
+
+    const assetId = c.req.param('assetId')
+    if (!(await isMemberOfShare(services, share, assetId))) {
+      throw notFound('That photo is not part of this album')
+    }
+    return c.json(await services.assets.get(share.album.ownerId, assetId), 200)
+  })
+
+  app.get('/:slug/timeline', async (c) => {
+    const services = c.get('services')
+    const share = await open(services, c.req.param('slug'), c)
+    if (share === 'locked') throw unauthorized('This album is locked')
+
+    // A visitor supplies only `covers`; the filter itself — which album, whose
+    // library — is fixed by the share, never by anything the request carries. A photo
+    // share (album.id is the link's own id, not a real album) simply has nothing to
+    // match and answers with no buckets.
+    const parsed = TimelineQuery.safeParse({ covers: c.req.query('covers') })
+    if (!parsed.success) throw badRequest('Invalid query')
+
+    const buckets = await services.assets.timeline(share.album.ownerId, {
+      ...parsed.data,
+      albumId: share.album.id,
+    })
+    return c.json({ buckets }, 200)
+  })
+
+  app.get('/:slug/timeline/bucket', async (c) => {
+    const services = c.get('services')
+    const share = await open(services, c.req.param('slug'), c)
+    if (share === 'locked') throw unauthorized('This album is locked')
+
+    const parsed = TimelineBucketQuery.safeParse({
+      period: c.req.query('period'),
+      cursor: c.req.query('cursor'),
+      limit: c.req.query('limit'),
+    })
+    if (!parsed.success) throw badRequest('Invalid query')
+
+    const page = await services.assets.bucket(share.album.ownerId, {
+      ...parsed.data,
+      albumId: share.album.id,
+    })
+    return c.json(page, 200)
+  })
+
   return app
+}
+
+/**
+ * Whether a photo belongs to the shared album — the guard for the asset route above.
+ *
+ * A photo share (`share.link.assetId` set) dresses a single asset as an album of one;
+ * `share.album.id` there is the share link's own id, not a row in `albums`, so a photo
+ * share is checked directly rather than against `album_assets`. It needs no deletedAt
+ * or vaultedAt check of its own: `openShare` re-resolves a photo share on every
+ * request through `openPhotoShare`, which already excludes a trashed or vaulted
+ * asset — a trashed shared photo dissolves the share itself before `open()` below
+ * ever reaches this guard.
+ *
+ * An album share has no such protection. Trashing a photo (`AssetService.trash`) only
+ * sets `deletedAt` — the `album_assets` row survives, and so does `asset_files` until
+ * the retention sweep runs, often weeks later. Vaulting happens to remove the
+ * `album_assets` row today, in the same transaction, but that is `VaultService.moveIn`'s
+ * behaviour, not something this guard should assume without checking. So membership
+ * is judged against the same predicate `openShare` builds `share.album.assets` from
+ * (see the `membership` condition in `AlbumService.openShare`), not against
+ * `album_assets` alone: a row that points at a trashed or vaulted asset is not really
+ * a member any more.
+ */
+async function isMemberOfShare(
+  services: Services,
+  share: OpenedShare,
+  assetId: string,
+): Promise<boolean> {
+  if (share.link.assetId) return share.link.assetId === assetId
+
+  const [member] = await services.db
+    .select({ id: albumAssets.assetId })
+    .from(albumAssets)
+    .innerJoin(assets, eq(assets.id, albumAssets.assetId))
+    .where(
+      // `inAlbum` rather than a fourth hand-written copy of the same predicate: the
+      // share's own timeline endpoints select through `buildFilters`, so anything this
+      // guard admits that they do not list is a photograph the page can never show but
+      // can still fetch, and anything they list that this refuses is a broken tile.
+      and(inAlbum(share.album.id), eq(albumAssets.assetId, assetId)),
+    )
+    .limit(1)
+  return member !== undefined
 }
 
 /** Resolves a share, requiring the unlock cookie when the album has a password. */

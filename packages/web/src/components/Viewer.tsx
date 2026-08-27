@@ -206,6 +206,11 @@ export function Viewer({
             <path d="M12 20.3 4.6 13a4.6 4.6 0 0 1 6.5-6.5l.9.9.9-.9A4.6 4.6 0 0 1 19.4 13Z" />
           </IconButton>
         )}
+        {/*
+          The panel still has something to say without a session — the capture date, the
+          camera, the description — so it stays. What it must not do is reach for the
+          library, and that is gated inside it rather than by hiding the button.
+        */}
         <IconButton onClick={() => setShowInfo((v) => !v)} label="Photo details" active={showInfo}>
           <path d="M12 11v6M12 7.5v.01" />
         </IconButton>
@@ -382,7 +387,16 @@ function InfoPanel({
         ))}
       </dl>
 
-      <PeopleInPhoto assetId={asset.id} onNavigate={onClose} onHighlight={onHighlight} />
+      {/*
+        Not on a shared link. `PeopleInPhoto` asks `/api/v1/people/status` and then the
+        library's own people endpoints, all of which need a session — a visitor's browser
+        would fire them and collect a 401, and the panel would offer to navigate somewhere
+        that visitor cannot go. Nothing leaked, but a page built for people with no account
+        should not be making authenticated requests at all.
+      */}
+      {editable && (
+        <PeopleInPhoto assetId={asset.id} onNavigate={onClose} onHighlight={onHighlight} />
+      )}
 
       <PhotoDescription asset={asset} editable={editable} />
 

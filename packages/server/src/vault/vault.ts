@@ -2,7 +2,8 @@ import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { AssetQuery } from '@imogen/shared'
 import { and, desc, eq, inArray, isNotNull, isNull, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
-import { albumAssets, assets, users } from '../db/schema.ts'
+import { albumAssets, assets, faces, users } from '../db/schema.ts'
+import { BULK_BATCH_SIZE, chunk } from '../lib/batch.ts'
 import { badRequest, forbidden } from '../lib/errors.ts'
 import { toAsset } from '../media/serialize.ts'
 
@@ -39,7 +40,8 @@ export class VaultError extends Error {
 export class VaultService {
   constructor(
     private readonly db: Database,
-    private readonly options: { secret: string },
+    /** `batchSize` is overridable so a test can cross the batch boundary cheaply. */
+    private readonly options: { secret: string; batchSize?: number },
   ) {}
 
   async isConfigured(userId: string): Promise<boolean> {
@@ -143,26 +145,43 @@ export class VaultService {
   /**
    * Moves assets into the vault, and out of every album on the way in — an album is a
    * shareable surface, so leaving a vaulted photo in one would defeat the exercise.
+   * Their faces stop existing too, deleted here directly by table rather than through
+   * FaceService, which keeps this service from needing to know that one exists — the
+   * caller reconciles the aggregate people/count rows once, after every batch is done.
+   *
+   * Batched: a query-resolved selection can run to tens of thousands of ids, and the
+   * update's `inArray` binds one parameter per id — Postgres refuses a statement bound
+   * past 65,535. Each batch is one transaction, so the asset update, leaving its albums,
+   * and forgetting its faces commit together or not at all. That is what makes a partial
+   * failure self-healing: a batch that never committed leaves its assets with
+   * `vaultedAt` still null, so a retry of the same request picks them straight back up
+   * (the `isNull(assets.vaultedAt)` guard below excludes only what actually moved) — and
+   * a batch that did commit can never be left vaulted with its faces rows still
+   * standing, because both happen in the same transaction. Returns every id actually
+   * moved, across every batch, so a caller acts on what happened rather than what was
+   * requested.
    */
-  async moveIn(userId: string, assetIds: string[]): Promise<number> {
-    if (assetIds.length === 0) return 0
-    const moved = await this.db
-      .update(assets)
-      .set({ vaultedAt: new Date(), updatedAt: new Date() })
-      .where(
-        and(eq(assets.ownerId, userId), inArray(assets.id, assetIds), isNull(assets.vaultedAt)),
-      )
-      .returning({ id: assets.id })
+  async moveIn(userId: string, assetIds: string[]): Promise<string[]> {
+    const movedIds: string[] = []
+    for (const batch of chunk(assetIds, this.options.batchSize ?? BULK_BATCH_SIZE)) {
+      const moved = await this.db.transaction(async (tx) => {
+        const rows = await tx
+          .update(assets)
+          .set({ vaultedAt: new Date(), updatedAt: new Date() })
+          .where(
+            and(eq(assets.ownerId, userId), inArray(assets.id, batch), isNull(assets.vaultedAt)),
+          )
+          .returning({ id: assets.id })
 
-    if (moved.length > 0) {
-      await this.db.delete(albumAssets).where(
-        inArray(
-          albumAssets.assetId,
-          moved.map((m) => m.id),
-        ),
-      )
+        if (rows.length === 0) return []
+        const ids = rows.map((r) => r.id)
+        await tx.delete(albumAssets).where(inArray(albumAssets.assetId, ids))
+        await tx.delete(faces).where(and(eq(faces.ownerId, userId), inArray(faces.assetId, ids)))
+        return ids
+      })
+      movedIds.push(...moved)
     }
-    return moved.length
+    return movedIds
   }
 
   async moveOut(userId: string, assetIds: string[]): Promise<number> {

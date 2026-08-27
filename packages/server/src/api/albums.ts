@@ -1,11 +1,11 @@
 import { createRoute, OpenAPIHono, z } from '@hono/zod-openapi'
 import {
   Album,
-  AlbumAssetsMutation,
   AlbumAssetsResult,
   AlbumCreate,
   AlbumUpdate,
   AlbumWithAssets,
+  AssetSelection,
   ShareLink,
   ShareLinkCreate,
 } from '@imogen/shared'
@@ -61,7 +61,7 @@ export function createAlbumRoutes() {
       method: 'get',
       path: '/{id}',
       tags: ['Albums'],
-      summary: 'One album, with its photos',
+      summary: 'One album, with a cover sample of its photos',
       security: security(),
       middleware: [requireScope('albums:read')] as const,
       request: { params: IdParam },
@@ -132,17 +132,15 @@ export function createAlbumRoutes() {
       middleware: [requireScope('albums:write')] as const,
       request: {
         params: IdParam,
-        body: { content: { 'application/json': { schema: AlbumAssetsMutation } } },
+        body: { content: { 'application/json': { schema: AssetSelection } } },
       },
       responses: { ...ok(AlbumAssetsResult, 'What changed'), ...ERROR_RESPONSES },
     }),
     async (c) => {
       const services = c.get('services')
-      const result = await services.albums.addAssets(
-        c.get('principal').user.id,
-        c.req.valid('param').id,
-        c.req.valid('json').assetIds,
-      )
+      const ownerId = c.get('principal').user.id
+      const assetIds = await services.assets.resolveSelection(ownerId, c.req.valid('json'))
+      const result = await services.albums.addAssets(ownerId, c.req.valid('param').id, assetIds)
       return c.json(result, 200)
     },
   )
@@ -157,7 +155,7 @@ export function createAlbumRoutes() {
       middleware: [requireScope('albums:write')] as const,
       request: {
         params: IdParam,
-        body: { content: { 'application/json': { schema: AlbumAssetsMutation } } },
+        body: { content: { 'application/json': { schema: AssetSelection } } },
       },
       responses: {
         ...ok(z.object({ removed: z.number().int().nonnegative() }), 'How many were removed'),
@@ -166,11 +164,9 @@ export function createAlbumRoutes() {
     }),
     async (c) => {
       const services = c.get('services')
-      const removed = await services.albums.removeAssets(
-        c.get('principal').user.id,
-        c.req.valid('param').id,
-        c.req.valid('json').assetIds,
-      )
+      const ownerId = c.get('principal').user.id
+      const assetIds = await services.assets.resolveSelection(ownerId, c.req.valid('json'))
+      const removed = await services.albums.removeAssets(ownerId, c.req.valid('param').id, assetIds)
       return c.json({ removed }, 200)
     },
   )

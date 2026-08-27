@@ -1,55 +1,83 @@
+import type { AssetSelection } from '@imogen/shared'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
-import { ConfirmDialog } from '../components/ConfirmDialog.tsx'
-import { EmptyState } from '../components/EmptyState.tsx'
-import { PhotoGrid } from '../components/PhotoGrid.tsx'
 import { SelectionBar } from '../components/SelectionBar.tsx'
 import { SharePanel } from '../components/SharePanel.tsx'
+import { TimelineBody, TimelineCount } from '../components/TimelineBody.tsx'
+import { TimelineSkeleton } from '../components/TimelineSkeleton.tsx'
+import { TrashConfirmation, useTrashConfirmation } from '../components/TrashConfirmation.tsx'
 import { Viewer } from '../components/Viewer.tsx'
+import { useOverviewKey } from '../hooks/useOverviewKey.ts'
 import { useSelection } from '../hooks/useSelection.ts'
-import { useViewerParam } from '../hooks/useViewerParam.ts'
+import { useTimelineGrid } from '../hooks/useTimelineGrid.ts'
+import { useTimelineViewer } from '../hooks/useTimelineViewer.ts'
 import { imogen } from '../lib/client.ts'
 
 export function AlbumDetail() {
   const { id = '' } = useParams()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { openId, open: openPhoto, replace: showPhoto, close: closePhoto } = useViewerParam()
   const [sharing, setSharing] = useState(false)
-  const [confirmingTrash, setConfirmingTrash] = useState<string[] | null>(null)
 
   const { data: album, isPending } = useQuery({
     queryKey: ['album', id],
     queryFn: () => imogen.albums.get(id),
   })
 
-  // Hooks cannot wait for the album to arrive, so the ids are read defensively.
-  const ids = useMemo(() => album?.assets.map((asset) => asset.id) ?? [], [album])
-  const { selected, toggle, clear, selectAll } = useSelection(ids)
+  /*
+   * The grid is the timeline under `{ albumId }`, not `album.assets`.
+   *
+   * `albums.get` answers with a capped cover sample — sixty photographs — which is the
+   * right size for a header and emphatically the wrong size for a grid. Reading the grid
+   * from it drew sixty tiles under a heading that said thirty thousand, sized the scroller
+   * to sixty so there was no blank region to notice and no more to ask for, and left the
+   * viewer's next arrow dead at the sixtieth photograph. The filter has no such ceiling.
+   */
+  const filter = useMemo(() => ({ albumId: id }), [id])
+  const grid = useTimelineGrid(filter)
+  const viewer = useTimelineViewer(grid)
+  useOverviewKey(grid, viewer.openId)
+
+  /*
+   * Select-all here is the album, not the tiles in hand — which is what makes it right for
+   * an album past a thousand photographs, where an id list is not even expressible.
+   * `totalCount` is the spine's own, so it agrees with the grid by construction.
+   */
+  const selection = useSelection({
+    query: filter,
+    orderedIds: grid.ids,
+    totalCount: grid.totalCount,
+  })
+  const confirmation = useTrashConfirmation()
 
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ['album', id] })
     void queryClient.invalidateQueries({ queryKey: ['albums'] })
+    void queryClient.invalidateQueries({ queryKey: ['asset'] })
+    grid.reload()
+  }
+
+  const afterMutation = () => {
+    selection.clear()
+    refresh()
   }
 
   /** Takes photographs out of the album. They stay in the library. */
   const removeFromAlbum = useMutation({
-    mutationFn: (assetIds: string[]) => imogen.albums.removeAssets(id, assetIds),
-    onSuccess: () => {
-      clear()
-      refresh()
-    },
+    mutationFn: (request: AssetSelection) => imogen.albums.removeAssets(id, request),
+    onSuccess: afterMutation,
   })
 
   const trash = useMutation({
-    mutationFn: (assetIds: string[]) => imogen.assets.trash(assetIds),
-    onSuccess: () => {
-      clear()
-      setConfirmingTrash(null)
-      refresh()
-      void queryClient.invalidateQueries({ queryKey: ['assets'] })
-    },
+    mutationFn: (request: AssetSelection) => imogen.assets.trash(request),
+    onSuccess: afterMutation,
+  })
+
+  const favourite = useMutation({
+    mutationFn: (asset: { id: string; favorite: boolean }) =>
+      imogen.assets.update(asset.id, { favorite: !asset.favorite }),
+    onSuccess: refresh,
   })
 
   const remove = useMutation({
@@ -60,10 +88,7 @@ export function AlbumDetail() {
     },
   })
 
-  if (isPending || !album) return <div className="h-40 animate-pulse rounded-lg bg-sunken" />
-
-  const assets = album.assets
-  const openIndex = openId ? assets.findIndex((a) => a.id === openId) : -1
+  if (isPending || !album) return <TimelineSkeleton />
 
   return (
     <>
@@ -85,12 +110,13 @@ export function AlbumDetail() {
         Albums
       </Link>
 
-      <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
+      <div className="mb-6 flex flex-wrap items-end justify-between gap-3 pr-11">
         <div>
           <h1 className="heading-display text-2xl md:text-[28px]">{album.name}</h1>
-          <p className="label-micro mt-1">
-            {album.assetCount} {album.assetCount === 1 ? 'photo' : 'photos'}
-          </p>
+          <TimelineCount
+            totalCount={grid.totalCount}
+            onShowOverview={() => grid.setShowingOverview(true)}
+          />
         </div>
 
         <div className="flex items-center gap-2">
@@ -118,77 +144,61 @@ export function AlbumDetail() {
         </div>
       )}
 
-      {assets.length === 0 ? (
-        <EmptyState
-          headline="This album is empty"
-          body="Select photos in your timeline and add them here."
-        />
-      ) : (
-        <PhotoGrid
-          assets={assets}
-          selected={selected}
-          onOpen={(asset) => openPhoto(asset.id)}
-          onToggleSelect={(asset, shiftKey) => toggle(asset.id, shiftKey)}
-        />
-      )}
+      <TimelineBody
+        grid={grid}
+        filter={filter}
+        empty={{
+          headline: 'This album is empty',
+          body: 'Select photos in your timeline and add them here.',
+        }}
+        isSelected={selection.isSelected}
+        selecting={selection.selecting}
+        onOpen={(tile) => viewer.open(tile.id)}
+        onToggleSelect={(tile, shiftKey) => selection.toggle(tile.id, shiftKey)}
+      />
 
-      {selected.size > 0 && (
+      {selection.selecting && (
         <SelectionBar
-          count={selected.size}
-          onClear={clear}
-          onSelectAll={selectAll}
+          count={selection.count}
+          onClear={selection.clear}
+          onSelectAll={selection.selectAll}
+          canSelectAll={selection.canSelectAll}
+          refusal={selection.refusal}
           actions={[
             {
               label: 'Remove from album',
-              onClick: () => removeFromAlbum.mutate([...selected]),
+              onClick: () => removeFromAlbum.mutate(selection.toRequest()),
               icon: 'M5 12h14',
             },
             {
               label: 'Move to trash',
-              onClick: () => setConfirmingTrash([...selected]),
+              onClick: () => confirmation.ask(selection),
               icon: 'M5 7h14M9 7V5h6v2M7 7l1 12h8l1-12',
             },
           ]}
         />
       )}
 
-      {confirmingTrash && (
-        <ConfirmDialog
-          title={
-            confirmingTrash.length === 1
-              ? 'Move this photo to the trash?'
-              : `Move ${confirmingTrash.length} photos to the trash?`
-          }
-          body={
-            confirmingTrash.length === 1
-              ? 'It leaves the timeline and every album. You can put it back from the trash until it is swept.'
-              : 'They leave the timeline and every album. You can put them back from the trash until it is swept.'
-          }
-          confirmLabel="Move to trash"
-          destructive
-          onConfirm={() => trash.mutate(confirmingTrash)}
-          onCancel={() => setConfirmingTrash(null)}
-        />
-      )}
+      <TrashConfirmation
+        confirmation={confirmation}
+        onConfirm={(request) => {
+          viewer.close()
+          trash.mutate(request)
+        }}
+      />
 
-      {openIndex >= 0 && assets[openIndex] && (
+      {viewer.asset && (
         <Viewer
-          asset={assets[openIndex]}
-          hasPrevious={openIndex > 0}
-          hasNext={openIndex < assets.length - 1}
-          onClose={() => closePhoto()}
-          onPrevious={() => showPhoto(assets[openIndex - 1]?.id ?? '')}
-          onNext={() => showPhoto(assets[openIndex + 1]?.id ?? '')}
-          onToggleFavorite={(asset) => {
-            void imogen.assets
-              .update(asset.id, { favorite: !asset.favorite })
-              .then(() => queryClient.invalidateQueries({ queryKey: ['album', id] }))
-          }}
+          asset={viewer.asset}
+          hasPrevious={viewer.hasPrevious}
+          hasNext={viewer.hasNext}
+          onClose={viewer.close}
+          onPrevious={() => viewer.step(-1)}
+          onNext={() => viewer.step(1)}
+          onToggleFavorite={(asset) => favourite.mutate(asset)}
           onTrash={(asset) => {
-            closePhoto()
-            void imogen.assets
-              .trash([asset.id])
-              .then(() => queryClient.invalidateQueries({ queryKey: ['album', id] }))
+            viewer.close()
+            trash.mutate({ assetIds: [asset.id] })
           }}
         />
       )}

@@ -4,6 +4,7 @@ import { createRoute, OpenAPIHono, z } from '@hono/zod-openapi'
 import {
   Asset,
   AssetQuery,
+  AssetSelection,
   AssetUpdate,
   AssetUploadMetadata,
   AssetUploadResult,
@@ -13,6 +14,9 @@ import {
   ShareLink,
   ShareLinkCreate,
   TimelineBucket,
+  TimelineBucketQuery,
+  TimelineQuery,
+  TimelineTile,
 } from '@imogen/shared'
 import { eq } from 'drizzle-orm'
 import { type AppEnv, requireAuth, requireScope } from '../auth/middleware.ts'
@@ -22,7 +26,6 @@ import { created, ERROR_RESPONSES, NO_CONTENT, ok, security } from './openapi.ts
 import { assertVaultAccess, vaultIsOpen } from './vault.ts'
 
 const IdParam = z.object({ id: z.uuid() })
-const IdsBody = z.object({ assetIds: z.array(z.uuid()).min(1).max(1000) })
 const CountResult = z.object({ count: z.number().int().nonnegative() })
 
 export function createAssetRoutes() {
@@ -55,6 +58,7 @@ export function createAssetRoutes() {
       summary: 'Per-day counts, so a client can size its scrollbar before loading anything',
       security: security(),
       middleware: [requireScope('library:read')] as const,
+      request: { query: TimelineQuery },
       responses: {
         ...ok(z.object({ buckets: z.array(TimelineBucket) }), 'Day buckets, newest first'),
         ...ERROR_RESPONSES,
@@ -62,8 +66,33 @@ export function createAssetRoutes() {
     }),
     async (c) => {
       const services = c.get('services')
-      const buckets = await services.assets.timeline(c.get('principal').user.id)
+      const buckets = await services.assets.timeline(
+        c.get('principal').user.id,
+        c.req.valid('query'),
+      )
       return c.json({ buckets }, 200)
+    },
+  )
+
+  app.openapi(
+    createRoute({
+      method: 'get',
+      path: '/timeline/bucket',
+      tags: ['Assets'],
+      summary: 'Every tile in one period, for a grid that lays itself out',
+      description:
+        'A lean projection — id, capture time, dimensions, and what a tile draws — for ' +
+        'every asset in a month or a day. Around a quarter the bytes of the same assets ' +
+        'from `GET /assets`.',
+      security: security(),
+      middleware: [requireScope('library:read')] as const,
+      request: { query: TimelineBucketQuery },
+      responses: { ...ok(pageOf(TimelineTile), 'A page of tiles'), ...ERROR_RESPONSES },
+    }),
+    async (c) => {
+      const services = c.get('services')
+      const page = await services.assets.bucket(c.get('principal').user.id, c.req.valid('query'))
+      return c.json(page, 200)
     },
   )
 
@@ -205,13 +234,13 @@ export function createAssetRoutes() {
       description: 'Reversible. Assets are destroyed only after the retention window.',
       security: security(),
       middleware: [requireScope('library:write')] as const,
-      request: { body: { content: { 'application/json': { schema: IdsBody } } } },
+      request: { body: { content: { 'application/json': { schema: AssetSelection } } } },
       responses: { ...ok(CountResult, 'How many moved'), ...ERROR_RESPONSES },
     }),
     async (c) => {
       const services = c.get('services')
       const ownerId = c.get('principal').user.id
-      const count = await services.assets.trash(ownerId, c.req.valid('json').assetIds)
+      const count = await services.assets.trashSelection(ownerId, c.req.valid('json'))
       // A trashed photo is recoverable, so its faces stay — but they stop counting.
       await services.faces.refreshFor(ownerId)
       return c.json({ count }, 200)
@@ -226,13 +255,13 @@ export function createAssetRoutes() {
       summary: 'Restore assets from the trash',
       security: security(),
       middleware: [requireScope('library:write')] as const,
-      request: { body: { content: { 'application/json': { schema: IdsBody } } } },
+      request: { body: { content: { 'application/json': { schema: AssetSelection } } } },
       responses: { ...ok(CountResult, 'How many restored'), ...ERROR_RESPONSES },
     }),
     async (c) => {
       const services = c.get('services')
       const ownerId = c.get('principal').user.id
-      const count = await services.assets.restore(ownerId, c.req.valid('json').assetIds)
+      const count = await services.assets.restoreSelection(ownerId, c.req.valid('json'))
       await services.faces.refreshFor(ownerId)
       return c.json({ count }, 200)
     },

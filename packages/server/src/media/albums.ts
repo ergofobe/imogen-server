@@ -10,6 +10,7 @@ import type {
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { type AlbumRow, albumAssets, albums, assets, shareLinks } from '../db/schema.ts'
+import { BULK_BATCH_SIZE, COVER_SAMPLE, chunk } from '../lib/batch.ts'
 import { forbidden, notFound } from '../lib/errors.ts'
 import { generateToken } from '../lib/tokens.ts'
 import { toAsset } from './serialize.ts'
@@ -38,6 +39,41 @@ function toShareLink(row: typeof shareLinks.$inferSelect, publicUrl: string): Sh
     allowDownload: row.allowDownload,
     createdAt: row.createdAt.toISOString(),
   }
+}
+
+/**
+ * What it means for a photograph to be in an album, stated once.
+ *
+ * The `album_assets` row is not the answer on its own. Trashing a photograph only sets
+ * `deletedAt` and leaves the membership row behind; vaulting removes it today but as a
+ * side effect of `VaultService.moveIn` rather than as a promise; archiving touches
+ * neither. So a raw `count(album_assets)` is the number of rows, not the number of
+ * photographs anybody can see.
+ *
+ * These are exactly the terms `AssetService.buildFilters` selects an `albumId` under,
+ * and they have to stay exactly those. The album page now reads its grid from the
+ * timeline under an `albumId` filter and resolves a select-all through the same filter,
+ * so a count that disagreed would put one number in the header, a different number of
+ * tiles under it, and a third in the confirmation before a destructive action. That is
+ * the failure this constant exists to make impossible: three definitions of "in this
+ * album" is three chances to disagree.
+ */
+export function inAlbum(albumId: string) {
+  return and(
+    eq(albumAssets.albumId, albumId),
+    isNull(assets.deletedAt),
+    isNull(assets.vaultedAt),
+    eq(assets.archived, false),
+  )
+}
+
+/** The membership count above, as one number. */
+function countIn(db: Database, albumId: string) {
+  return db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(albumAssets)
+    .innerJoin(assets, eq(assets.id, albumAssets.assetId))
+    .where(inAlbum(albumId))
 }
 
 const SHARE_PASSWORD_HASH = { algorithm: 'argon2id', memoryCost: 19456, timeCost: 2 } as const
@@ -73,18 +109,31 @@ const coverAssetId = sql<string | null>`coalesce(
 )`
 
 export class AlbumService {
-  constructor(private readonly db: Database) {}
+  /** Overridable so a test can cross the batch boundary without seeding thousands of rows. */
+  constructor(
+    private readonly db: Database,
+    private readonly batchSize: number = BULK_BATCH_SIZE,
+  ) {}
 
   async list(ownerId: string): Promise<Album[]> {
     const rows = await this.db
       .select({
         album: albums,
-        assetCount: sql<number>`count(${albumAssets.assetId})::int`,
+        // Counted through the join, not off `album_assets` alone — see `inAlbum`. The
+        // filter lives in the aggregate because this is a LEFT join: moving it into the
+        // WHERE clause would drop every empty album from the listing entirely.
+        assetCount: sql<number>`count(*) filter (
+          where ${albumAssets.assetId} is not null
+            and ${assets.deletedAt} is null
+            and ${assets.vaultedAt} is null
+            and ${assets.archived} = false
+        )::int`,
         shareSlug: sql<string | null>`max(${shareLinks.slug})`,
         cover: coverAssetId,
       })
       .from(albums)
       .leftJoin(albumAssets, eq(albumAssets.albumId, albums.id))
+      .leftJoin(assets, eq(assets.id, albumAssets.assetId))
       .leftJoin(shareLinks, and(eq(shareLinks.albumId, albums.id), isNull(shareLinks.revokedAt)))
       .where(eq(albums.ownerId, ownerId))
       .groupBy(albums.id)
@@ -104,10 +153,7 @@ export class AlbumService {
     if (!row) throw notFound('No such album')
     if (row.ownerId !== ownerId) throw forbidden('That album belongs to someone else')
 
-    const [counted] = await this.db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(albumAssets)
-      .where(eq(albumAssets.albumId, albumId))
+    const [counted] = await countIn(this.db, albumId)
     const [share] = await this.db
       .select({ slug: shareLinks.slug })
       .from(shareLinks)
@@ -123,11 +169,9 @@ export class AlbumService {
       .select({ asset: assets })
       .from(albumAssets)
       .innerJoin(assets, eq(assets.id, albumAssets.assetId))
-      .where(
-        and(eq(albumAssets.albumId, albumId), isNull(assets.deletedAt), isNull(assets.vaultedAt)),
-      )
+      .where(inAlbum(albumId))
       /*
-       * Newest first, the same as the timeline.
+       * Newest first, the same as the timeline, and capped to `COVER_SAMPLE`.
        *
        * This used to lead with `position`, which is assigned as things are inserted
        * and so held the order they happened to be added in — and since the query that
@@ -136,9 +180,13 @@ export class AlbumService {
        * of the timeline, depending on the day.
        *
        * The id breaks ties so two photographs taken in the same second do not swap
-       * places between requests.
+       * places between requests. The cap is new: this used to return every photograph
+       * the album held, as full `Asset` rows — thirty thousand of them arrives as
+       * roughly 24 MB of JSON. The grid reads the timeline under an `albumId` filter
+       * now; what is left here is a cover, not the contents.
        */
       .orderBy(desc(assets.capturedAt), desc(assets.id))
+      .limit(COVER_SAMPLE)
     return { ...album, assets: rows.map((r) => toAsset(r.asset)) }
   }
 
@@ -174,6 +222,13 @@ export class AlbumService {
     await this.db.delete(albums).where(eq(albums.id, albumId))
   }
 
+  /**
+   * Batched: a query-resolved selection can run to tens of thousands of ids, and both
+   * the owned-assets lookup and the membership insert bind one parameter per id (the
+   * insert binds three — album id, asset id, position — so it is the tighter limit).
+   * Postgres refuses a statement bound past 65,535 parameters; `this.batchSize` stays
+   * comfortably under that for every shape here.
+   */
   async addAssets(
     ownerId: string,
     albumId: string,
@@ -181,54 +236,59 @@ export class AlbumService {
   ): Promise<AlbumAssetsResult> {
     await this.get(ownerId, albumId)
 
-    // Only the caller's own assets, so an album cannot be used to reach someone else's.
-    const owned = await this.db
-      .select({ id: assets.id })
-      .from(assets)
-      .where(
-        and(eq(assets.ownerId, ownerId), inArray(assets.id, assetIds), isNull(assets.vaultedAt)),
-      )
-      // Nothing displays `position` today, but a column that decides an order should
-      // not be filled from whatever order the rows came back in.
-      .orderBy(desc(assets.capturedAt), desc(assets.id))
-    const ownedIds = owned.map((a) => a.id)
-
     const [maxPosition] = await this.db
       .select({ max: sql<number>`coalesce(max(${albumAssets.position}), -1)::int` })
       .from(albumAssets)
       .where(eq(albumAssets.albumId, albumId))
     let position = Number(maxPosition?.max ?? -1)
 
-    const inserted = ownedIds.length
-      ? await this.db
-          .insert(albumAssets)
-          .values(ownedIds.map((assetId) => ({ albumId, assetId, position: ++position })))
-          .onConflictDoNothing()
-          .returning({ assetId: albumAssets.assetId })
-      : []
+    let added = 0
+    for (const batch of chunk(assetIds, this.batchSize)) {
+      // Only the caller's own assets, so an album cannot be used to reach someone else's.
+      const owned = await this.db
+        .select({ id: assets.id })
+        .from(assets)
+        .where(
+          and(eq(assets.ownerId, ownerId), inArray(assets.id, batch), isNull(assets.vaultedAt)),
+        )
+        // Nothing displays `position` today, but a column that decides an order should
+        // not be filled from whatever order the rows came back in.
+        .orderBy(desc(assets.capturedAt), desc(assets.id))
+      const ownedIds = owned.map((a) => a.id)
+      if (ownedIds.length === 0) continue
+
+      const inserted = await this.db
+        .insert(albumAssets)
+        .values(ownedIds.map((assetId) => ({ albumId, assetId, position: ++position })))
+        .onConflictDoNothing()
+        .returning({ assetId: albumAssets.assetId })
+      added += inserted.length
+    }
 
     await this.db.update(albums).set({ updatedAt: new Date() }).where(eq(albums.id, albumId))
 
-    const [counted] = await this.db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(albumAssets)
-      .where(eq(albumAssets.albumId, albumId))
+    const [counted] = await countIn(this.db, albumId)
 
     return {
-      added: inserted.length,
-      skipped: assetIds.length - inserted.length,
+      added,
+      skipped: assetIds.length - added,
       assetCount: Number(counted?.count ?? 0),
     }
   }
 
+  /** Batched for the same reason `addAssets` is: a selection's ids can outrun the bind limit. */
   async removeAssets(ownerId: string, albumId: string, assetIds: string[]): Promise<number> {
     await this.get(ownerId, albumId)
-    const removed = await this.db
-      .delete(albumAssets)
-      .where(and(eq(albumAssets.albumId, albumId), inArray(albumAssets.assetId, assetIds)))
-      .returning({ assetId: albumAssets.assetId })
+    let removed = 0
+    for (const batch of chunk(assetIds, this.batchSize)) {
+      const rows = await this.db
+        .delete(albumAssets)
+        .where(and(eq(albumAssets.albumId, albumId), inArray(albumAssets.assetId, batch)))
+        .returning({ assetId: albumAssets.assetId })
+      removed += rows.length
+    }
     await this.db.update(albums).set({ updatedAt: new Date() }).where(eq(albums.id, albumId))
-    return removed.length
+    return removed
   }
 
   // --- Sharing ---
@@ -382,24 +442,24 @@ export class AlbumService {
     const [album] = await this.db.select().from(albums).where(eq(albums.id, link.albumId)).limit(1)
     if (!album) return null
 
+    const membership = inAlbum(link.albumId)
+    // Same cap as `getWithAssets`: the public page is a cover, not a full download —
+    // and `getWithAssets(...).assets` used to be this route's only defence against a
+    // 24 MB reply too. The count below stays the true total; only the array is capped.
     const rows = await this.db
       .select({ asset: assets })
       .from(albumAssets)
       .innerJoin(assets, eq(assets.id, albumAssets.assetId))
-      .where(
-        and(
-          eq(albumAssets.albumId, link.albumId),
-          isNull(assets.deletedAt),
-          isNull(assets.vaultedAt),
-        ),
-      )
+      .where(membership)
       .orderBy(desc(assets.capturedAt), desc(assets.id))
+      .limit(COVER_SAMPLE)
+    const [counted] = await countIn(this.db, link.albumId)
 
     return {
       link,
       requiresPassword: link.passwordHash !== null,
       album: {
-        ...toAlbum(album, rows.length, link.slug),
+        ...toAlbum(album, Number(counted?.count ?? 0), link.slug),
         assets: rows.map((r) => toAsset(r.asset)),
       },
     }
