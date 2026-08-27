@@ -5,6 +5,19 @@ const DAY_WITH_YEAR = new Intl.DateTimeFormat(undefined, {
   month: 'long',
   year: 'numeric',
 })
+const DAY_UTC = new Intl.DateTimeFormat(undefined, {
+  weekday: 'long',
+  day: 'numeric',
+  month: 'long',
+  timeZone: 'UTC',
+})
+const DAY_WITH_YEAR_UTC = new Intl.DateTimeFormat(undefined, {
+  weekday: 'long',
+  day: 'numeric',
+  month: 'long',
+  year: 'numeric',
+  timeZone: 'UTC',
+})
 const MONTH_YEAR = new Intl.DateTimeFormat(undefined, { month: 'short', year: 'numeric' })
 const EXACT = new Intl.DateTimeFormat(undefined, { dateStyle: 'full', timeStyle: 'short' })
 
@@ -13,6 +26,19 @@ export function formatDayHeading(iso: string): string {
   const date = new Date(iso)
   const thisYear = date.getFullYear() === new Date().getFullYear()
   return (thisYear ? DAY : DAY_WITH_YEAR).format(date)
+}
+
+/**
+ * The same heading, for a `YYYY-MM-DD` day key rather than an instant.
+ *
+ * The server buckets on UTC days and the whole timeline is keyed on them, so the heading
+ * has to be read in UTC too: formatting `2011-08-14` anywhere behind UTC would title the
+ * section with the thirteenth while every photograph under it belongs to the fourteenth.
+ */
+export function formatDayKeyHeading(day: string): string {
+  const date = new Date(`${day}T00:00:00.000Z`)
+  const thisYear = date.getUTCFullYear() === new Date().getUTCFullYear()
+  return (thisYear ? DAY_UTC : DAY_WITH_YEAR_UTC).format(date)
 }
 
 export const formatMonthYear = (iso: string) => MONTH_YEAR.format(new Date(iso))

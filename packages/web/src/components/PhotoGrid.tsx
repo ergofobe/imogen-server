@@ -1,130 +1,312 @@
-import type { Asset } from '@imogen/shared'
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { formatDayHeading, groupByDay } from '../lib/format.ts'
+import type { TimelineTile } from '@imogen/shared'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { anchoredScrollTop } from '../hooks/timelineWindow.ts'
+import { DAY_HEADER_CLASS, DAY_HEADING_CLASS } from '../hooks/useGridLayout.ts'
+import { formatDayKeyHeading } from '../lib/format.ts'
 import { aspectOf, justify } from '../lib/justify.ts'
+import {
+  estimateRowLayout,
+  type LayoutOptions,
+  type SegmentTable,
+  segmentsInRange,
+} from '../lib/timelineLayout.ts'
 import { PhotoTile } from './PhotoTile.tsx'
 
 type Props = {
-  assets: Asset[]
+  /** Where every day in the library sits, whether or not its photographs are in hand. */
+  table: SegmentTable
+  tiles: Map<string, TimelineTile[]>
+  options: LayoutOptions
+  /** Owned by `useGridLayout`, because the options above are measured from this element. */
+  containerRef: React.RefObject<HTMLDivElement | null>
   selected: Set<string>
-  onOpen: (asset: Asset) => void
-  onToggleSelect: (asset: Asset, shiftKey: boolean) => void
-  onReachEnd?: () => void
-  loadingMore?: boolean
+  onOpen: (tile: TimelineTile) => void
+  onToggleSelect: (tile: TimelineTile, shiftKey: boolean) => void
+  /** In grid coordinates, so the caller can turn it into the months worth fetching. */
+  onVisibleRangeChange?: (top: number, bottom: number) => void
   /** A shared page has nothing to do with a selection, so it does not offer one. */
   selectable?: boolean
 }
 
-const GAP = 4
-const SECTION_GAP = 44
+/**
+ * How far beyond the viewport to draw, so a flick meets photographs rather than blanks.
+ * Roughly a screen's worth on a laptop, which is about as far as a fast scroll travels
+ * between two animation frames.
+ */
+const OVERSCAN = 1200
 
-/** Row height scales with the viewport: a phone wants fewer, larger photos per row. */
-function targetHeightFor(width: number): number {
-  if (width < 480) return 132
-  if (width < 900) return 168
-  if (width < 1600) return 208
-  return 240
-}
+/**
+ * The scroll position is rounded down to this before it reaches React. What gets drawn is a
+ * band, not a pixel, and re-rendering the grid sixty times a second to move a band that has
+ * not moved is most of what a virtualised list costs. Half the overscan leaves at least six
+ * hundred pixels of drawn-but-unseen grid in either direction.
+ */
+const BAND = OVERSCAN / 2
 
+/**
+ * A window over the timeline: an element as tall as the whole library, with only the days
+ * the viewport touches inside it.
+ *
+ * The grid used to render every photograph that had ever been fetched. A long scroll into a
+ * large library ended with a hundred thousand nodes in the document and a justify pass over
+ * all of them on every resize; this draws the handful of days a reader can actually see.
+ */
 export function PhotoGrid({
-  assets,
+  table,
+  tiles,
+  options,
+  containerRef,
   selected,
   onOpen,
   onToggleSelect,
-  onReachEnd,
-  loadingMore,
+  onVisibleRangeChange,
   selectable = true,
 }: Props) {
-  const containerRef = useRef<HTMLDivElement>(null)
-  const sentinelRef = useRef<HTMLDivElement>(null)
-  const [width, setWidth] = useState(0)
+  const [band, setBand] = useState({ top: 0, height: 0 })
+  const previousTable = useRef<SegmentTable | null>(null)
+  const readBand = useRef<(() => void) | undefined>(undefined)
+  const reportRange = useRef(onVisibleRangeChange)
+  reportRange.current = onVisibleRangeChange
 
   useEffect(() => {
-    const element = containerRef.current
-    if (!element) return
-    const observer = new ResizeObserver(([entry]) => {
-      setWidth(entry?.contentRect.width ?? 0)
-    })
-    observer.observe(element)
-    return () => observer.disconnect()
-  }, [])
+    const container = containerRef.current
+    if (!container) return
+    const scroller = scrollingAncestorOf(container)
 
-  // Fetch the next page slightly before the user arrives, so scrolling never stalls.
-  useEffect(() => {
-    const sentinel = sentinelRef.current
-    if (!sentinel || !onReachEnd) return
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry?.isIntersecting) onReachEnd()
-      },
-      { rootMargin: '1200px 0px' },
-    )
-    observer.observe(sentinel)
-    return () => observer.disconnect()
-  }, [onReachEnd])
+    let frame = 0
+    const read = () => {
+      frame = 0
+      const top = scroller.scrollTop - gridOffsetWithin(container, scroller)
+      const height = scroller.clientHeight
+      reportRange.current?.(top, top + height)
+      // Only the band reaches React. The exact position goes to the caller, which uses it
+      // to decide what to fetch and redraws nothing.
+      const banded = Math.floor(top / BAND) * BAND
+      setBand((current) =>
+        current.top === banded && current.height === height ? current : { top: banded, height },
+      )
+    }
+    readBand.current = read
 
-  const sections = useMemo(() => {
-    if (width <= 0) return []
-    const targetHeight = targetHeightFor(width)
-    return groupByDay(assets).map(([day, items]) => ({
-      day,
-      capturedAt: items[0]!.capturedAt,
-      count: items.length,
-      rows: justify(
-        items.map((asset) => ({ id: asset.id, aspect: aspectOf(asset) })),
-        { width, targetHeight, gap: GAP },
-      ),
-    }))
-  }, [assets, width])
+    const schedule = () => {
+      if (!frame) frame = requestAnimationFrame(read)
+    }
+    read()
 
-  const byId = useMemo(() => new Map(assets.map((a) => [a.id, a])), [assets])
+    // The document is the scroller on every page in this app today, and it reports its
+    // scrolling through `window` rather than through the element.
+    const source: EventTarget = scroller === document.scrollingElement ? window : scroller
+    source.addEventListener('scroll', schedule, { passive: true })
+    window.addEventListener('resize', schedule, { passive: true })
+    return () => {
+      cancelAnimationFrame(frame)
+      readBand.current = undefined
+      source.removeEventListener('scroll', schedule)
+      window.removeEventListener('resize', schedule)
+    }
+  }, [containerRef])
+
+  /**
+   * When a day's real measurements replace its estimate, every day below it moves. If that
+   * day was above the viewport then the photograph under the reader moves with it, which is
+   * the one thing this whole apparatus exists to prevent.
+   *
+   * A layout effect, emphatically not an effect: this has to run between React writing the
+   * new heights into the document and the browser painting them. From a `useEffect` the
+   * paint has already happened, and the correction is a visible jump rather than a
+   * correction.
+   */
+  useLayoutEffect(() => {
+    const previous = previousTable.current
+    previousTable.current = table
+    const container = containerRef.current
+
+    if (container && previous && previous.segments.length > 0) {
+      const scroller = scrollingAncestorOf(container)
+      const target = anchoredScrollTop(
+        previous,
+        table,
+        scroller,
+        gridOffsetWithin(container, scroller),
+      )
+      if (target !== scroller.scrollTop) scroller.scrollTop = target
+    }
+
+    // Every table is a different shape, and the first one the grid ever sees arrives after
+    // the container has been measured — long after the only scroll event there has been.
+    // Reading again here is what draws the right days and tells the caller which months it
+    // needs, without waiting for the reader to touch the page.
+    readBand.current?.()
+  }, [table, containerRef])
+
+  const visible = useMemo(
+    () => segmentsInRange(table, band.top - OVERSCAN, band.top + band.height + OVERSCAN),
+    [table, band],
+  )
+
   const selecting = selected.size > 0
 
   return (
-    <div ref={containerRef} className="w-full">
-      {sections.map((section) => (
-        <section key={section.day} style={{ marginBottom: SECTION_GAP }}>
-          <header className="sticky top-0 z-10 -mx-4 mb-2.5 bg-paper/85 px-4 py-2 backdrop-blur-md">
-            <h2 className="heading-display text-[15px]">{formatDayHeading(section.capturedAt)}</h2>
-          </header>
+    <div
+      ref={containerRef}
+      className="w-full"
+      style={{ position: 'relative', height: table.totalHeight }}
+    >
+      {visible.map((segment) => {
+        const dayTiles = tiles.get(segment.date)
+        return (
+          <section
+            key={segment.date}
+            className="absolute inset-x-0"
+            style={{ top: segment.top, height: segment.height - options.sectionGap }}
+          >
+            <header className={DAY_HEADER_CLASS}>
+              <h2 className={DAY_HEADING_CLASS}>{formatDayKeyHeading(segment.date)}</h2>
+            </header>
 
-          <div style={{ position: 'relative', height: heightOf(section.rows) }}>
-            {section.rows.map((row) => (
-              <div
-                key={row.top}
-                className="absolute left-0 flex"
-                style={{ top: row.top, height: row.height, gap: GAP }}
-              >
-                {row.items.map((item) => {
-                  const asset = byId.get(item.id)
-                  if (!asset) return null
-                  return (
-                    <PhotoTile
-                      key={item.id}
-                      asset={asset}
-                      width={item.width}
-                      height={item.height}
-                      selected={selected.has(item.id)}
-                      selecting={selecting}
-                      selectable={selectable}
-                      onOpen={onOpen}
-                      onToggleSelect={onToggleSelect}
-                    />
-                  )
-                })}
-              </div>
-            ))}
-          </div>
-        </section>
-      ))}
-
-      <div ref={sentinelRef} className="h-px" />
-      {loadingMore && <p className="label-micro py-8 text-center">Loading more</p>}
+            {dayTiles ? (
+              <LoadedDay
+                tiles={dayTiles}
+                options={options}
+                selected={selected}
+                selecting={selecting}
+                selectable={selectable}
+                onOpen={onOpen}
+                onToggleSelect={onToggleSelect}
+              />
+            ) : (
+              <PlaceholderDay date={segment.date} count={segment.count} options={options} />
+            )}
+          </section>
+        )
+      })}
     </div>
   )
 }
 
-function heightOf(rows: Array<{ top: number; height: number }>): number {
+function LoadedDay({
+  tiles,
+  options,
+  selected,
+  selecting,
+  selectable,
+  onOpen,
+  onToggleSelect,
+}: {
+  tiles: TimelineTile[]
+  options: LayoutOptions
+  selected: Set<string>
+  selecting: boolean
+  selectable: boolean
+  onOpen: (tile: TimelineTile) => void
+  onToggleSelect: (tile: TimelineTile, shiftKey: boolean) => void
+}) {
+  const rows = useMemo(
+    () =>
+      justify(
+        tiles.map((tile) => ({ id: tile.id, aspect: aspectOf(tile) })),
+        { width: options.width, targetHeight: options.targetHeight, gap: options.gap },
+      ),
+    [tiles, options],
+  )
+
+  const byId = useMemo(() => new Map(tiles.map((tile) => [tile.id, tile])), [tiles])
   const last = rows.at(-1)
-  return last ? last.top + last.height : 0
+
+  return (
+    <div style={{ position: 'relative', height: last ? last.top + last.height : 0 }}>
+      {rows.map((row) => (
+        <div
+          key={row.top}
+          className="absolute left-0 flex"
+          style={{ top: row.top, height: row.height, gap: options.gap }}
+        >
+          {row.items.map((item) => {
+            const tile = byId.get(item.id)
+            if (!tile) return null
+            return (
+              <PhotoTile
+                key={item.id}
+                asset={tile}
+                width={item.width}
+                height={item.height}
+                selected={selected.has(item.id)}
+                selecting={selecting}
+                selectable={selectable}
+                onOpen={onOpen}
+                onToggleSelect={onToggleSelect}
+              />
+            )
+          })}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/**
+ * A day whose photographs have not arrived, blocked out at the shape the estimate reserved
+ * room for. The count is known from the spine, so the number of rows and the number of
+ * blocks in them are right; the proportions and the colours are not known, and guessing at
+ * those would be inventing photographs.
+ */
+function PlaceholderDay({
+  date,
+  count,
+  options,
+}: {
+  date: string
+  count: number
+  options: LayoutOptions
+}) {
+  const { perRow, rows } = estimateRowLayout(count, options)
+  const width = (options.width - options.gap * (perRow - 1)) / perRow
+
+  return (
+    <div
+      aria-hidden="true"
+      style={{
+        position: 'relative',
+        height: rows * options.targetHeight + (rows - 1) * options.gap,
+      }}
+    >
+      {/* biome-ignore-start lint/suspicious/noArrayIndexKey: a grid of blanks has nothing else to be keyed by */}
+      {Array.from({ length: rows }, (_, row) => (
+        <div
+          key={`${date}-${row}`}
+          className="absolute left-0 flex"
+          style={{ top: row * (options.targetHeight + options.gap), gap: options.gap }}
+        >
+          {Array.from({ length: Math.min(perRow, count - row * perRow) }, (_, cell) => (
+            <div
+              key={`${date}-${row}-${cell}`}
+              className="rounded-[--radius-tile] bg-sunken"
+              style={{ width, height: options.targetHeight }}
+            />
+          ))}
+        </div>
+      ))}
+      {/* biome-ignore-end lint/suspicious/noArrayIndexKey: a grid of blanks has nothing else to be keyed by */}
+    </div>
+  )
+}
+
+/**
+ * The element that actually scrolls this grid. Today that is always the document, but
+ * finding it rather than assuming it means a grid dropped inside a panel or a dialog
+ * measures the thing it is really inside.
+ */
+function scrollingAncestorOf(element: HTMLElement): Element {
+  for (let node = element.parentElement; node; node = node.parentElement) {
+    const overflow = getComputedStyle(node).overflowY
+    if (overflow === 'auto' || overflow === 'scroll') return node
+  }
+  return document.scrollingElement ?? document.documentElement
+}
+
+/** Where the grid's own top sits in the scroller's content, page furniture included. */
+function gridOffsetWithin(container: HTMLElement, scroller: Element): number {
+  const scrollerTop =
+    scroller === document.scrollingElement ? 0 : scroller.getBoundingClientRect().top
+  return container.getBoundingClientRect().top - scrollerTop + scroller.scrollTop
 }

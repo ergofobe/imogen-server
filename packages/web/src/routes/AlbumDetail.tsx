@@ -7,7 +7,9 @@ import { PhotoGrid } from '../components/PhotoGrid.tsx'
 import { SelectionBar } from '../components/SelectionBar.tsx'
 import { SharePanel } from '../components/SharePanel.tsx'
 import { Viewer } from '../components/Viewer.tsx'
+import { useGridLayout } from '../hooks/useGridLayout.ts'
 import { useSelection } from '../hooks/useSelection.ts'
+import { useAssetTable } from '../hooks/useTimeline.ts'
 import { useViewerParam } from '../hooks/useViewerParam.ts'
 import { imogen } from '../lib/client.ts'
 
@@ -27,6 +29,11 @@ export function AlbumDetail() {
   // Hooks cannot wait for the album to arrive, so the ids are read defensively.
   const ids = useMemo(() => album?.assets.map((asset) => asset.id) ?? [], [album])
   const { selected, toggle, clear, selectAll } = useSelection(ids)
+
+  // The album is fetched whole, so the grid gets its geometry rather than its machinery.
+  const { containerRef, options } = useGridLayout()
+  const photographs = useMemo(() => album?.assets ?? [], [album])
+  const { table, tiles } = useAssetTable(photographs, options)
 
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ['album', id] })
@@ -125,10 +132,13 @@ export function AlbumDetail() {
         />
       ) : (
         <PhotoGrid
-          assets={assets}
+          table={table}
+          tiles={tiles}
+          options={options}
+          containerRef={containerRef}
           selected={selected}
-          onOpen={(asset) => openPhoto(asset.id)}
-          onToggleSelect={(asset, shiftKey) => toggle(asset.id, shiftKey)}
+          onOpen={(tile) => openPhoto(tile.id)}
+          onToggleSelect={(tile, shiftKey) => toggle(tile.id, shiftKey)}
         />
       )}
 

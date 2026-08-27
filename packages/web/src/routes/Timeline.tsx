@@ -1,6 +1,6 @@
-import type { Asset, AssetQuery } from '@imogen/shared'
-import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import type { Asset, AssetFilter, TimelineTile } from '@imogen/shared'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { AlbumPicker } from '../components/AlbumPicker.tsx'
 import { ConfirmDialog } from '../components/ConfirmDialog.tsx'
@@ -8,13 +8,17 @@ import { EmptyState } from '../components/EmptyState.tsx'
 import { PhotoGrid } from '../components/PhotoGrid.tsx'
 import { SelectionBar } from '../components/SelectionBar.tsx'
 import { Viewer } from '../components/Viewer.tsx'
+import { neighbouringPeriod, tilesInTimelineOrder } from '../hooks/timelineWindow.ts'
+import { useGridLayout } from '../hooks/useGridLayout.ts'
 import { useSelection } from '../hooks/useSelection.ts'
+import { useTimeline } from '../hooks/useTimeline.ts'
 import { useViewerParam } from '../hooks/useViewerParam.ts'
 import { imogen } from '../lib/client.ts'
+import { periodOf, segmentsInRange } from '../lib/timelineLayout.ts'
 
 type Props = {
   title: string
-  query?: Partial<AssetQuery>
+  query?: Partial<AssetFilter>
   empty: { headline: string; body: string; action?: React.ReactNode }
   /** Trash shows restore rather than delete. */
   mode?: 'library' | 'trash'
@@ -24,31 +28,17 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
   const queryClient = useQueryClient()
   const { openId, open: openPhoto, replace: showPhoto, close: closePhoto } = useViewerParam()
 
-  const key = ['assets', query] as const
-  const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isPending } = useInfiniteQuery({
-    queryKey: key,
-    initialPageParam: undefined as string | undefined,
-    queryFn: ({ pageParam }) =>
-      imogen.assets.list({ ...query, limit: 120, ...(pageParam ? { cursor: pageParam } : {}) }),
-    getNextPageParam: (last) => last.nextCursor ?? undefined,
-    /*
-     * An upload lands as `pending` and is thumbnailed by a background worker, so the
-     * timeline has to find out when that finishes. Polling runs only while something is
-     * actually in flight and stops the moment the library is settled — no upload, no
-     * traffic.
-     */
-    refetchInterval: (query) => {
-      const pages = query.state.data?.pages ?? []
-      const working = pages.some((page) =>
-        page.items.some((asset) => asset.status === 'pending' || asset.status === 'processing'),
-      )
-      return working ? 2000 : false
-    },
-  })
+  const { containerRef, options } = useGridLayout()
+  const { table, tiles, isPending, totalCount, requestPeriods, reload } = useTimeline(
+    query,
+    options,
+  )
 
-  const assets = useMemo(() => data?.pages.flatMap((page) => page.items) ?? [], [data])
-  const ids = useMemo(() => assets.map((a) => a.id), [assets])
+  /** Only the loaded months, but in true timeline order rather than in arrival order. */
+  const ordered = useMemo(() => tilesInTimelineOrder(table, tiles), [table, tiles])
+  const ids = useMemo(() => ordered.map((tile) => tile.id), [ordered])
   const { selected, toggle, clear, selectAll } = useSelection(ids)
+
   const [pickingAlbum, setPickingAlbum] = useState(false)
   const [confirmingTrash, setConfirmingTrash] = useState<string[] | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
@@ -60,7 +50,11 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
     return () => clearTimeout(timer)
   }, [notice])
 
-  const refresh = () => queryClient.invalidateQueries({ queryKey: ['assets'] })
+  const refresh = useCallback(() => {
+    // The open photograph is fetched whole and separately, so it has its own copy to update.
+    void queryClient.invalidateQueries({ queryKey: ['asset'] })
+    reload()
+  }, [queryClient, reload])
 
   const favourite = useMutation({
     mutationFn: (asset: Asset) => imogen.assets.update(asset.id, { favorite: !asset.favorite }),
@@ -103,16 +97,70 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
     },
   })
 
-  const openIndex = openId ? assets.findIndex((a) => a.id === openId) : -1
-  const open = openIndex >= 0 ? assets[openIndex] : null
+  /** What the reader can see, kept so the viewer can ask for a month without unpinning it. */
+  const onScreenPeriods = useRef<string[]>([])
+
+  const onVisibleRangeChange = useCallback(
+    (top: number, bottom: number) => {
+      const periods = new Set<string>()
+      for (const segment of segmentsInRange(table, top, bottom)) periods.add(periodOf(segment.date))
+      onScreenPeriods.current = [...periods]
+      requestPeriods(onScreenPeriods.current)
+    },
+    [table, requestPeriods],
+  )
+
+  /**
+   * The viewer needs the whole asset — exif, place, description, the corrected date — and a
+   * tile carries none of that. Fetching the one photograph that is open costs a request the
+   * grid would otherwise have paid for every photograph in the month.
+   */
+  const viewing = useQuery({
+    queryKey: ['asset', openId],
+    queryFn: () => imogen.assets.get(openId as string),
+    enabled: Boolean(openId),
+  })
+  const open = openId && viewing.data?.id === openId ? viewing.data : null
+
+  const openIndex = useMemo(
+    () => (openId ? ordered.findIndex((tile) => tile.id === openId) : -1),
+    [ordered, openId],
+  )
+
+  /** Set when a step ran off the end of the loaded months; taken once one more arrives. */
+  const pendingStep = useRef<number | null>(null)
 
   const step = useCallback(
     (delta: number) => {
-      const next = assets[openIndex + delta]
-      if (next) showPhoto(next.id)
+      if (openIndex < 0) return
+      const next = ordered[openIndex + delta]
+      if (next) {
+        pendingStep.current = null
+        showPhoto(next.id)
+        return
+      }
+      // Off the edge of what is loaded. The next photograph exists — the spine says so —
+      // but its month has not been fetched, so ask for it and take the step when it lands.
+      const edge = delta > 0 ? ordered.at(-1) : ordered[0]
+      if (!edge) return
+      const period = neighbouringPeriod(table, edge.capturedAt.slice(0, 10), delta)
+      if (!period) return
+      pendingStep.current = delta
+      requestPeriods([...new Set([...onScreenPeriods.current, period])])
     },
-    [assets, openIndex, showPhoto],
+    [ordered, openIndex, showPhoto, table, requestPeriods],
   )
+
+  useEffect(() => {
+    const delta = pendingStep.current
+    if (delta === null || openIndex < 0) return
+    const arrived = ordered[openIndex + delta]
+    if (!arrived) return
+    pendingStep.current = null
+    showPhoto(arrived.id)
+  }, [ordered, openIndex, showPhoto])
+
+  const edges = useMemo(() => atEdges(table, ordered, openIndex), [table, ordered, openIndex])
 
   if (isPending) return <TimelineSkeleton title={title} />
 
@@ -120,26 +168,26 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
     <>
       <div className="mb-5 flex items-baseline justify-between gap-4">
         <h1 className="heading-display text-2xl md:text-[28px]">{title}</h1>
-        {assets.length > 0 && (
+        {/* The spine counts every day the filter matches, so this is the number, not a floor. */}
+        {totalCount > 0 && (
           <span className="label-micro">
-            {assets.length}
-            {hasNextPage ? '+' : ''} {assets.length === 1 ? 'photo' : 'photos'}
+            {totalCount} {totalCount === 1 ? 'photo' : 'photos'}
           </span>
         )}
       </div>
 
-      {assets.length === 0 ? (
+      {totalCount === 0 ? (
         <EmptyState headline={empty.headline} body={empty.body} action={empty.action} />
       ) : (
         <PhotoGrid
-          assets={assets}
+          table={table}
+          tiles={tiles}
+          options={options}
+          containerRef={containerRef}
           selected={selected}
-          onOpen={(asset) => openPhoto(asset.id)}
-          onToggleSelect={(asset, shiftKey) => toggle(asset.id, shiftKey)}
-          onReachEnd={() => {
-            if (hasNextPage && !isFetchingNextPage) void fetchNextPage()
-          }}
-          loadingMore={isFetchingNextPage}
+          onOpen={(tile) => openPhoto(tile.id)}
+          onToggleSelect={(tile, shiftKey) => toggle(tile.id, shiftKey)}
+          onVisibleRangeChange={onVisibleRangeChange}
         />
       )}
 
@@ -223,8 +271,8 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
       {open && (
         <Viewer
           asset={open}
-          hasPrevious={openIndex > 0}
-          hasNext={openIndex < assets.length - 1}
+          hasPrevious={edges.hasPrevious}
+          hasNext={edges.hasNext}
           onClose={() => closePhoto()}
           onPrevious={() => step(-1)}
           onNext={() => step(1)}
@@ -237,6 +285,29 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
       )}
     </>
   )
+}
+
+/**
+ * Whether there is anything either side of the open photograph, judged against the whole
+ * timeline rather than the loaded months: the arrows have to stay lit at the seam between
+ * two months, or stepping across one would look like the end of the library.
+ */
+function atEdges(
+  table: { segments: Array<{ date: string }> },
+  ordered: TimelineTile[],
+  openIndex: number,
+): { hasPrevious: boolean; hasNext: boolean } {
+  if (openIndex < 0) return { hasPrevious: false, hasNext: false }
+  const dayOf = (tile: TimelineTile | undefined) => tile?.capturedAt.slice(0, 10)
+  const indexOfDay = (date: string | undefined) =>
+    date === undefined ? -1 : table.segments.findIndex((segment) => segment.date === date)
+
+  const first = indexOfDay(dayOf(ordered[0]))
+  const last = indexOfDay(dayOf(ordered.at(-1)))
+  return {
+    hasPrevious: openIndex > 0 || first > 0,
+    hasNext: openIndex < ordered.length - 1 || (last >= 0 && last < table.segments.length - 1),
+  }
 }
 
 /** Mirrors the real grid's rhythm, so nothing jumps when the photos arrive. */

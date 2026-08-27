@@ -152,10 +152,24 @@ function measureDayHeight(tiles: TimelineTile[], options: LayoutOptions): number
  * jitter this module exists to prevent.
  */
 export function estimateDayHeight(count: number, options: LayoutOptions): number {
-  const perRow = Math.max(1, Math.floor(options.width / (options.targetHeight * AVERAGE_ASPECT)))
-  const rows = Math.max(1, Math.ceil(count / perRow))
+  const { rows } = estimateRowLayout(count, options)
   const grid = rows * options.targetHeight + (rows - 1) * options.gap
   return options.headerHeight + grid + options.sectionGap
+}
+
+/**
+ * The rows an unfetched day will probably fill, and how many photographs stand in each.
+ *
+ * Exported so a placeholder day draws the same shape the estimate reserved room for: if
+ * the grid guessed its own row count the two could disagree, and a day would be blocked
+ * out at one height and filled at another.
+ */
+export function estimateRowLayout(
+  count: number,
+  options: LayoutOptions,
+): { perRow: number; rows: number } {
+  const perRow = Math.max(1, Math.floor(options.width / (options.targetHeight * AVERAGE_ASPECT)))
+  return { perRow, rows: Math.max(1, Math.ceil(count / perRow)) }
 }
 
 /** The days a window touches, in timeline order. */

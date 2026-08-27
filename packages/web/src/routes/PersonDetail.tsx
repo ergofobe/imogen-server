@@ -1,11 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { EmptyState } from '../components/EmptyState.tsx'
 import { PhotoGrid } from '../components/PhotoGrid.tsx'
 import { Viewer } from '../components/Viewer.tsx'
+import { useGridLayout } from '../hooks/useGridLayout.ts'
+import { useAssetTable } from '../hooks/useTimeline.ts'
 import { useViewerParam } from '../hooks/useViewerParam.ts'
 import { imogen } from '../lib/client.ts'
+
+/** A page with no selection still needs one object rather than a new Set every render. */
+const EMPTY_SELECTION = new Set<string>()
 
 export function PersonDetail() {
   const { id = '' } = useParams()
@@ -41,9 +46,11 @@ export function PersonDetail() {
     },
   })
 
-  if (isPending || !person) return <div className="h-40 animate-pulse rounded-lg bg-sunken" />
+  const { containerRef, options } = useGridLayout()
+  const photos = useMemo(() => person?.photos ?? [], [person])
+  const { table, tiles } = useAssetTable(photos, options)
 
-  const photos = person.photos
+  if (isPending || !person) return <div className="h-40 animate-pulse rounded-lg bg-sunken" />
   const openIndex = openId ? photos.findIndex((p) => p.id === openId) : -1
 
   return (
@@ -139,9 +146,12 @@ export function PersonDetail() {
         />
       ) : (
         <PhotoGrid
-          assets={photos}
-          selected={new Set()}
-          onOpen={(asset) => openPhoto(asset.id)}
+          table={table}
+          tiles={tiles}
+          options={options}
+          containerRef={containerRef}
+          selected={EMPTY_SELECTION}
+          onOpen={(tile) => openPhoto(tile.id)}
           onToggleSelect={() => {}}
         />
       )}

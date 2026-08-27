@@ -1,11 +1,13 @@
 import type { Asset } from '@imogen/shared'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { EmptyState } from '../components/EmptyState.tsx'
 import { PhotoGrid } from '../components/PhotoGrid.tsx'
 import { SelectionBar } from '../components/SelectionBar.tsx'
 import { Viewer } from '../components/Viewer.tsx'
+import { useGridLayout } from '../hooks/useGridLayout.ts'
 import { useSelection } from '../hooks/useSelection.ts'
+import { useAssetTable } from '../hooks/useTimeline.ts'
 import { useViewerParam } from '../hooks/useViewerParam.ts'
 import { imogen } from '../lib/client.ts'
 
@@ -33,6 +35,10 @@ export function VaultRoute() {
 
   const ids = assets?.map((a) => a.id) ?? []
   const { selected, toggle, clear, selectAll } = useSelection(ids)
+
+  const { containerRef, options } = useGridLayout()
+  const photographs = useMemo(() => assets ?? [], [assets])
+  const { table, tiles } = useAssetTable(photographs, options)
 
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ['vault-status'] })
@@ -81,10 +87,13 @@ export function VaultRoute() {
 
       {assets && assets.length > 0 ? (
         <PhotoGrid
-          assets={assets}
+          table={table}
+          tiles={tiles}
+          options={options}
+          containerRef={containerRef}
           selected={selected}
-          onOpen={(asset) => openPhoto(asset.id)}
-          onToggleSelect={(asset, shiftKey) => toggle(asset.id, shiftKey)}
+          onOpen={(tile) => openPhoto(tile.id)}
+          onToggleSelect={(tile, shiftKey) => toggle(tile.id, shiftKey)}
         />
       ) : (
         <EmptyState

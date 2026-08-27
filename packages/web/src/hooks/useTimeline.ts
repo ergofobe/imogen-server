@@ -1,0 +1,248 @@
+import type { AssetFilter, TimelineBucket, TimelineTile } from '@imogen/shared'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { imogen } from '../lib/client.ts'
+import {
+  buildSegments,
+  groupTilesByDay,
+  type LayoutOptions,
+  periodOf,
+  type SegmentTable,
+} from '../lib/timelineLayout.ts'
+import { evictPeriods, mergeDays, periodsToFetch } from './timelineWindow.ts'
+
+export {
+  anchoredScrollTop,
+  evictPeriods,
+  MAX_LOADED_PERIODS,
+  mergeDays,
+  periodsToFetch,
+} from './timelineWindow.ts'
+
+/**
+ * The timeline as a window rather than as a list.
+ *
+ * The spine — one row per day, counts only — is fetched once and sizes the whole scroller,
+ * so the page is its true height from the first paint and the reader can be anywhere in
+ * twenty years without waiting. Tiles are fetched a month at a time, for the months on
+ * screen and their immediate neighbours, and are let go once they are far enough behind.
+ * What stays behind is each day's measured height, which is what lets an evicted region
+ * keep its place in the scroll.
+ */
+
+export type TimelineWindow = {
+  table: SegmentTable
+  /** By UTC day, for the days currently loaded. A day that is absent is drawn as blocks. */
+  tiles: Map<string, TimelineTile[]>
+  isPending: boolean
+  /** Exact, from the spine: every day the filter matches is counted, not just fetched ones. */
+  totalCount: number
+  requestPeriods: (periods: string[]) => void
+  suspendFetching: (suspended: boolean) => void
+  /** Refetches the spine and every loaded period, after a mutation changes the library. */
+  reload: () => void
+}
+
+type LoadedTiles = {
+  byDay: Map<string, TimelineTile[]>
+  /** Least recently used first, which is the order eviction walks. */
+  periods: string[]
+}
+
+const NOTHING_LOADED: LoadedTiles = { byDay: new Map(), periods: [] }
+const NO_BUCKETS: TimelineBucket[] = []
+
+export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions): TimelineWindow {
+  const queryClient = useQueryClient()
+
+  // Routes build their filter inline, so it is a new object on every render even when
+  // nothing about it changed. Everything below keys on its content, not on its identity.
+  const filterKey = JSON.stringify(filter)
+  // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on the filter's content
+  const query = useMemo(() => filter, [filterKey])
+
+  const spine = useQuery({
+    queryKey: ['timeline', query],
+    queryFn: () => imogen.assets.timeline(query),
+    staleTime: 30_000,
+  })
+
+  const buckets = spine.data?.buckets ?? NO_BUCKETS
+  const allPeriods = useMemo(
+    () => [...new Set(buckets.map((bucket) => periodOf(bucket.date)))],
+    [buckets],
+  )
+  const totalCount = useMemo(
+    () => buckets.reduce((sum, bucket) => sum + bucket.count, 0),
+    [buckets],
+  )
+
+  const [loaded, setLoaded] = useState<LoadedTiles>(NOTHING_LOADED)
+  const [visiblePeriods, setVisiblePeriods] = useState<string[]>([])
+  const [suspended, setSuspended] = useState(false)
+
+  /**
+   * Every height ever derived, kept for the life of the filter. Its keys carry the whole
+   * layout, so a height learned at one width cannot be served at another and a resize has
+   * nothing to clear. A different filter is another matter: the same day holds a different
+   * number of photographs under it, and none of these heights describe it any more.
+   */
+  const measured = useRef(new Map<string, number>())
+
+  const pinned = useRef<string[]>([])
+  const loadedPeriods = useRef<string[]>([])
+  const inFlight = useRef(new Set<string>())
+  /** Bumped when the filter changes, so a reply to the old question is dropped. */
+  const generation = useRef(0)
+
+  useLayoutEffect(() => {
+    pinned.current = visiblePeriods
+  }, [visiblePeriods])
+
+  useLayoutEffect(() => {
+    loadedPeriods.current = loaded.periods
+  }, [loaded.periods])
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: a filter change is the one thing that invalidates everything held
+  useEffect(() => {
+    generation.current += 1
+    inFlight.current.clear()
+    measured.current = new Map()
+    setLoaded(NOTHING_LOADED)
+  }, [filterKey])
+
+  const loadPeriod = useCallback(
+    async (period: string) => {
+      if (inFlight.current.has(period)) return
+      inFlight.current.add(period)
+      const era = generation.current
+      try {
+        const collected: TimelineTile[] = []
+        let cursor: string | undefined
+        // The endpoint pages at 5000 and a heavy month runs well past that. Every page is
+        // gathered before any of them lands, because a day straddling a page boundary only
+        // reaches the count that lets it be measured once the last page is in.
+        do {
+          const page = await imogen.assets.timelineBucket({
+            ...query,
+            period,
+            ...(cursor ? { cursor } : {}),
+          })
+          collected.push(...page.items)
+          cursor = page.nextCursor ?? undefined
+        } while (cursor)
+
+        if (era !== generation.current) return
+        setLoaded((current) => absorb(current, period, collected, pinned.current))
+      } finally {
+        inFlight.current.delete(period)
+      }
+    },
+    [query],
+  )
+
+  const wanted = useMemo(
+    () => periodsToFetch(visiblePeriods, allPeriods),
+    [visiblePeriods, allPeriods],
+  )
+
+  useEffect(() => {
+    if (suspended) return
+    for (const period of wanted) {
+      if (loaded.periods.includes(period)) continue
+      void loadPeriod(period)
+    }
+  }, [wanted, suspended, loaded.periods, loadPeriod])
+
+  const reload = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: ['timeline'] })
+    for (const period of loadedPeriods.current) void loadPeriod(period)
+  }, [queryClient, loadPeriod])
+
+  /*
+   * An upload lands as `pending` and a background worker thumbnails it, so the timeline has
+   * to find out when that finishes. Polling runs only while something in hand is actually
+   * in flight and stops the moment it settles — no upload, no traffic.
+   */
+  const settling = useMemo(
+    () =>
+      [...loaded.byDay.values()].some((day) =>
+        day.some((tile) => tile.status === 'pending' || tile.status === 'processing'),
+      ),
+    [loaded.byDay],
+  )
+
+  useEffect(() => {
+    if (!settling || suspended) return
+    const timer = setInterval(reload, 2000)
+    return () => clearInterval(timer)
+  }, [settling, suspended, reload])
+
+  const table = useMemo(
+    () => buildSegments(buckets, loaded.byDay, options, measured.current),
+    [buckets, loaded.byDay, options],
+  )
+
+  const requestPeriods = useCallback((periods: string[]) => {
+    setVisiblePeriods((current) => (sameList(current, periods) ? current : periods))
+  }, [])
+
+  const suspendFetching = useCallback((next: boolean) => setSuspended(next), [])
+
+  return {
+    table,
+    tiles: loaded.byDay,
+    isPending: spine.isPending,
+    totalCount,
+    requestPeriods,
+    suspendFetching,
+    reload,
+  }
+}
+
+/**
+ * The same table, for a view that already holds every photograph it will ever show — an
+ * album, a person, the vault, a shared link. Those are bounded by construction, so there is
+ * nothing to window and nothing to fetch: they want the geometry, not the machinery.
+ */
+export function useAssetTable(
+  assets: TimelineTile[],
+  options: LayoutOptions,
+): { table: SegmentTable; tiles: Map<string, TimelineTile[]> } {
+  const measured = useRef(new Map<string, number>())
+
+  const tiles = useMemo(() => groupTilesByDay(assets), [assets])
+  const table = useMemo(() => {
+    const buckets = [...tiles].map(([date, dayTiles]) => ({
+      date,
+      count: dayTiles.length,
+      coverAssetId: null,
+    }))
+    return buildSegments(buckets, tiles, options, measured.current)
+  }, [tiles, options])
+
+  return { table, tiles }
+}
+
+function absorb(
+  current: LoadedTiles,
+  period: string,
+  tiles: TimelineTile[],
+  pinned: string[],
+): LoadedTiles {
+  const periods = [...current.periods.filter((each) => each !== period), period]
+  const kept = evictPeriods(periods, pinned)
+  const byDay = mergeDays(current.byDay, period, tiles)
+  if (kept.length === periods.length) return { byDay, periods: kept }
+
+  const surviving = new Set(kept)
+  const trimmed = new Map<string, TimelineTile[]>()
+  for (const [day, dayTiles] of byDay) {
+    if (surviving.has(periodOf(day))) trimmed.set(day, dayTiles)
+  }
+  return { byDay: trimmed, periods: kept }
+}
+
+function sameList(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((value, index) => value === b[index])
+}

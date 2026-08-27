@@ -1,10 +1,12 @@
 import type { Album, Asset } from '@imogen/shared'
 import { useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useParams } from 'react-router'
 import { PhotoGrid } from '../components/PhotoGrid.tsx'
 import { Viewer } from '../components/Viewer.tsx'
 import { Wordmark } from '../components/Wordmark.tsx'
+import { useGridLayout } from '../hooks/useGridLayout.ts'
+import { useAssetTable } from '../hooks/useTimeline.ts'
 import { useViewerParam } from '../hooks/useViewerParam.ts'
 import { ShareAssetUrls } from '../lib/assetUrls.tsx'
 
@@ -16,6 +18,9 @@ type ShareResponse =
       album: Album & { assets: Asset[] }
       allowDownload: boolean
     }
+
+/** A page with no selection still needs one object rather than a new Set every render. */
+const EMPTY_SELECTION = new Set<string>()
 
 /** A public album. No account, no session — the slug is the only credential. */
 export function SharedAlbum() {
@@ -34,6 +39,10 @@ export function SharedAlbum() {
     },
     retry: false,
   })
+
+  const { containerRef, options } = useGridLayout()
+  const photographs = useMemo(() => (data && !data.locked ? data.album.assets : []), [data])
+  const { table, tiles } = useAssetTable(photographs, options)
 
   async function unlock(event: React.FormEvent) {
     event.preventDefault()
@@ -137,9 +146,12 @@ export function SharedAlbum() {
             </button>
           ) : (
             <PhotoGrid
-              assets={assets}
-              selected={new Set()}
-              onOpen={(asset) => openPhoto(asset.id)}
+              table={table}
+              tiles={tiles}
+              options={options}
+              containerRef={containerRef}
+              selected={EMPTY_SELECTION}
+              onOpen={(tile) => openPhoto(tile.id)}
               onToggleSelect={() => {}}
               // A visitor has nothing to do with a selection: there is no bar to act on it.
               selectable={false}
