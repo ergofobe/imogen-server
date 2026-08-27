@@ -8,9 +8,11 @@ import { formatExact } from '../lib/format.ts'
  * Query keys whose data holds assets, and so goes stale when a date changes.
  *
  * `timeline` is the spine the windowed grid is laid out from, and `asset` is the whole
- * photograph the viewer fetches for itself. The grid's tile map follows the spine on its
- * own — it refetches whatever month the new counts disagree with — so refreshing the spine
- * is all this has to do.
+ * photograph the viewer fetches for itself. A correction that carries a photograph across a
+ * UTC midnight changes two days' counts, and the grid's tile map notices that on its own and
+ * refetches both months. A correction within the same UTC day changes no count, so the grid
+ * keeps the tile it already has — same picture, same place, but its accessible name still
+ * reads the old time until that month is fetched again for some other reason.
  */
 const ASSET_QUERIES = new Set(['assets', 'album', 'person', 'vault-assets', 'timeline', 'asset'])
 

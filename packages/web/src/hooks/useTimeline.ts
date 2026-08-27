@@ -11,6 +11,7 @@ import {
 } from '../lib/timelineLayout.ts'
 import {
   collectPeriod,
+  createPeriodLoader,
   evictPeriods,
   mergeDays,
   periodsOutOfDate,
@@ -20,6 +21,7 @@ import {
 export {
   anchoredScrollTop,
   collectPeriod,
+  createPeriodLoader,
   evictPeriods,
   MAX_LOADED_PERIODS,
   mergeDays,
@@ -99,7 +101,6 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
 
   const pinned = useRef<string[]>([])
   const loadedNow = useRef<LoadedTiles>(NOTHING_LOADED)
-  const inFlight = useRef(new Set<string>())
   /** Bumped when the filter changes, so a reply to the old question is dropped. */
   const generation = useRef(0)
 
@@ -114,31 +115,27 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
   // biome-ignore lint/correctness/useExhaustiveDependencies: a filter change is the one thing that invalidates everything held
   useEffect(() => {
     generation.current += 1
-    inFlight.current.clear()
     measured.current = new Map()
     setLoaded(NOTHING_LOADED)
   }, [filterKey])
 
-  const loadPeriod = useCallback(
+  const fetchPeriod = useCallback(
     async (period: string) => {
-      if (inFlight.current.has(period)) return
-      inFlight.current.add(period)
       const era = generation.current
-      try {
-        // The endpoint pages at 5000 and a heavy month runs well past that; `collectPeriod`
-        // follows the cursor to the end before any of it lands.
-        const collected = await collectPeriod((cursor) =>
-          imogen.assets.timelineBucket({ ...query, period, ...(cursor ? { cursor } : {}) }),
-        )
-
-        if (era !== generation.current) return
-        setLoaded((current) => absorb(current, period, collected, pinned.current))
-      } finally {
-        inFlight.current.delete(period)
-      }
+      // The endpoint pages at 5000 and a heavy month runs well past that; `collectPeriod`
+      // follows the cursor to the end before any of it lands.
+      const collected = await collectPeriod((cursor) =>
+        imogen.assets.timelineBucket({ ...query, period, ...(cursor ? { cursor } : {}) }),
+      )
+      if (era !== generation.current) return
+      setLoaded((current) => absorb(current, period, collected, pinned.current))
     },
     [query],
   )
+
+  // Rebuilt when the filter changes, which discards what the old one was tracking. Anything
+  // still in the air from it is dropped on arrival by the generation check above.
+  const periods = useMemo(() => createPeriodLoader(fetchPeriod), [fetchPeriod])
 
   const wanted = useMemo(
     () => periodsToFetch(visiblePeriods, allPeriods),
@@ -149,27 +146,33 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
     if (suspended) return
     for (const period of wanted) {
       if (loaded.periods.includes(period)) continue
-      void loadPeriod(period)
+      void periods.load(period)
     }
-  }, [wanted, suspended, loaded.periods, loadPeriod])
+  }, [wanted, suspended, loaded.periods, periods])
 
   /*
    * The tile map is not a query, so nothing invalidates it. When a fresh spine disagrees with
    * what a loaded month holds — an upload landed, a date was corrected, a day was emptied —
-   * that month is fetched again in place. This is what makes invalidating `['timeline']` the
-   * only thing a mutation anywhere in the app has to do.
+   * that month is fetched again in place. So a mutation that changes a day's count only has
+   * to invalidate `['timeline']`; one that changes a photograph without changing any count
+   * is not seen here, and its tile stays as it was.
+   *
+   * `reload` rather than `load`, because a fetch may already be in flight for that month —
+   * one sent before the mutation, which will land carrying the tiles this is trying to
+   * replace. Dropping the request then would leave the map stale with nothing left to trigger
+   * another attempt, since the spine has already changed and will not change again.
    *
    * The map is read through a ref rather than taken as a dependency: depending on it would
    * re-run this on its own result, and only a fresh spine can make a loaded month stale.
    */
   useEffect(() => {
-    for (const period of periodsOutOfDate(buckets, loadedNow.current)) void loadPeriod(period)
-  }, [buckets, loadPeriod])
+    for (const period of periodsOutOfDate(buckets, loadedNow.current)) void periods.reload(period)
+  }, [buckets, periods])
 
   const reload = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ['timeline'] })
-    for (const period of loadedNow.current.periods) void loadPeriod(period)
-  }, [queryClient, loadPeriod])
+    for (const period of loadedNow.current.periods) void periods.reload(period)
+  }, [queryClient, periods])
 
   /*
    * An upload lands as `pending` and a background worker thumbnails it, so the timeline has

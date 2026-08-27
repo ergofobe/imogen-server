@@ -9,10 +9,11 @@ const MAX_LENGTH = 4096
 /**
  * Query keys whose data holds assets, and so goes stale when a description changes.
  *
- * `timeline` is the spine the windowed grid is laid out from, and `asset` is the whole
- * photograph the viewer fetches for itself. The grid's tile map follows the spine on its
- * own — it refetches whatever month the new counts disagree with — so refreshing the spine
- * is all this has to do.
+ * `asset` is the whole photograph the viewer fetches for itself, which is where a description
+ * is read and written. `album` and `person` carry whole assets too, and their grids draw the
+ * description as an image's alt text. The timeline's own tiles do not carry one — and since a
+ * description changes no day's count, the windowed grid will not refetch the month for it
+ * either; there is simply nothing on a timeline tile for this to make stale.
  */
 const ASSET_QUERIES = new Set(['assets', 'album', 'person', 'vault-assets', 'timeline', 'asset'])
 

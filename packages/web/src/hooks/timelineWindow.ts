@@ -82,18 +82,23 @@ export async function collectPeriod(
 }
 
 /**
- * The loaded months the spine no longer agrees with, and which therefore have to be fetched
- * again.
+ * The loaded months whose day counts the spine no longer agrees with, and which therefore
+ * have to be fetched again.
  *
  * The tile map is not a query and nothing invalidates it, so without this an upload landing
  * mid-scroll would size its day for one more photograph than the day draws — the spine knows
  * about it, the tiles do not — and a photograph given a corrected date would leave both the
- * day it left and the day it joined wrong. Comparing counts makes the spine the single thing
- * that has to be refreshed after a mutation: whatever it says has changed is refetched, and
- * the caller does not have to know which days a mutation touched.
+ * day it left and the day it joined wrong. A day the spine now lists that a loaded month
+ * holds no tiles for counts as a disagreement too, which is what a new day's first upload
+ * looks like.
  *
- * A day the spine now lists that a loaded month holds no tiles for counts as a disagreement
- * too: that is exactly what a new day's first upload looks like.
+ * It compares counts and nothing else, so what it guarantees is narrow: a mutation that moves
+ * a photograph between days, adds one, or removes one is caught, and a mutation that changes
+ * a photograph while leaving every count alone is not. Favouriting, describing, and
+ * correcting a capture time within the same UTC day all fall in the second group, and their
+ * tiles stay as they were until that month is fetched again for some other reason. Comparing
+ * the tiles themselves would mean holding a second copy of the month to compare against,
+ * which is the thing this whole hook exists to avoid.
  */
 export function periodsOutOfDate(
   buckets: TimelineBucket[],
@@ -170,6 +175,61 @@ export function neighbouringPeriod(
   if (index < 0) return null
   const neighbour = table.segments[index + (direction > 0 ? 1 : -1)]
   return neighbour ? periodOf(neighbour.date) : null
+}
+
+export type PeriodLoader = {
+  /** Fetches a period unless one is already being fetched for it. */
+  load: (period: string) => Promise<void>
+  /** Fetches it again even if one is in flight, because that one is answering a stale question. */
+  reload: (period: string) => Promise<void>
+}
+
+/**
+ * Runs at most one fetch per period at a time, and tells `load` and `reload` apart.
+ *
+ * `load` is the scroll path: a period that is already on its way needs nothing, and dropping
+ * the duplicate is the whole point — a reader scrolling through unfetched months asks for the
+ * same one on every band.
+ *
+ * `reload` is the mutation path, and dropping it there is a bug rather than an economy. A
+ * fetch already in flight was sent before whatever made the period stale, so it is answering
+ * a question from before the upload and will land carrying pre-mutation tiles. Discarding the
+ * request would leave the map holding those tiles with nothing left to ask again: the spine
+ * has already changed, and it does not change a second time. So a `reload` that arrives
+ * mid-flight is remembered and run once more when the flight lands, however many arrive.
+ */
+export function createPeriodLoader(fetchPeriod: (period: string) => Promise<void>): PeriodLoader {
+  const running = new Set<string>()
+  const stale = new Set<string>()
+
+  const run = async (period: string) => {
+    running.add(period)
+    try {
+      do {
+        // Cleared before the fetch, not after: anything arriving while it is in the air has
+        // to count, and clearing afterwards would swallow exactly those.
+        stale.delete(period)
+        await fetchPeriod(period)
+      } while (stale.has(period))
+    } finally {
+      running.delete(period)
+      stale.delete(period)
+    }
+  }
+
+  return {
+    load: async (period) => {
+      if (running.has(period)) return
+      await run(period)
+    },
+    reload: async (period) => {
+      if (running.has(period)) {
+        stale.add(period)
+        return
+      }
+      await run(period)
+    },
+  }
 }
 
 /**

@@ -4,6 +4,7 @@ import { buildSegments, type LayoutOptions } from '../lib/timelineLayout.ts'
 import {
   anchoredScrollTop,
   collectPeriod,
+  createPeriodLoader,
   evictPeriods,
   MAX_LOADED_PERIODS,
   mergeDays,
@@ -429,5 +430,129 @@ describe('periodsOutOfDate', () => {
     expect(periodsOutOfDate([bucket('2011-08-14', 9)], { byDay: new Map(), periods: [] })).toEqual(
       [],
     )
+  })
+})
+
+describe('createPeriodLoader', () => {
+  /** A fetch that can be finished on demand, so two requests can be made to overlap. */
+  const controllable = () => {
+    const calls: string[] = []
+    let finish: (() => void) | null = null
+    return {
+      calls,
+      settle: () => {
+        const done = finish
+        finish = null
+        done?.()
+      },
+      fetchPeriod: (period: string) =>
+        new Promise<void>((resolve) => {
+          calls.push(period)
+          finish = resolve
+        }),
+    }
+  }
+
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+  test('a load asks once', async () => {
+    const { calls, fetchPeriod, settle } = controllable()
+    const loader = createPeriodLoader(fetchPeriod)
+    const inFlight = loader.load('2011-08')
+    settle()
+    await inFlight
+    expect(calls).toEqual(['2011-08'])
+  })
+
+  // The scroll path: a reader crossing a month of placeholders asks for it on every band.
+  test('a load while one is in flight is dropped, not queued', async () => {
+    const { calls, fetchPeriod, settle } = controllable()
+    const loader = createPeriodLoader(fetchPeriod)
+    const inFlight = loader.load('2011-08')
+    await loader.load('2011-08')
+    await loader.load('2011-08')
+    settle()
+    await inFlight
+    await tick()
+    expect(calls).toEqual(['2011-08'])
+  })
+
+  /*
+   * The race this exists for. A spine arrives while that month's fetch is still in the air:
+   * the fetch was sent before the upload, so it will land holding the tiles the reconciliation
+   * is trying to replace. Dropping the request would leave the day drawing N tiles inside a
+   * section sized for N+1 — the very symptom the reconciliation was added to remove — with
+   * nothing left to trigger another attempt, because the spine does not change twice.
+   */
+  test('a reload while one is in flight runs again once it lands', async () => {
+    const { calls, fetchPeriod, settle } = controllable()
+    const loader = createPeriodLoader(fetchPeriod)
+    const inFlight = loader.load('2011-08')
+    await loader.reload('2011-08')
+    expect(calls).toEqual(['2011-08'])
+
+    settle()
+    await tick()
+    expect(calls).toEqual(['2011-08', '2011-08'])
+    // The `load` promise stays open across the repeat run, which is what makes the repeat
+    // part of the same flight rather than a second one racing it.
+    settle()
+    await inFlight
+  })
+
+  test('several reloads mid-flight still cost only one more fetch', async () => {
+    const { calls, fetchPeriod, settle } = controllable()
+    const loader = createPeriodLoader(fetchPeriod)
+    const inFlight = loader.load('2011-08')
+    await loader.reload('2011-08')
+    await loader.reload('2011-08')
+    await loader.reload('2011-08')
+    settle()
+    await tick()
+    expect(calls).toHaveLength(2)
+    settle()
+    await inFlight
+    await tick()
+    expect(calls).toHaveLength(2)
+  })
+
+  test('a reload arriving during the repeat run earns another one', async () => {
+    const { calls, fetchPeriod, settle } = controllable()
+    const loader = createPeriodLoader(fetchPeriod)
+    const inFlight = loader.load('2011-08')
+    await loader.reload('2011-08')
+    settle()
+    await tick()
+    expect(calls).toHaveLength(2)
+
+    // Now the second fetch is the one in the air, and a third request arrives.
+    await loader.reload('2011-08')
+    settle()
+    await tick()
+    expect(calls).toHaveLength(3)
+    settle()
+    await inFlight
+    expect(calls).toHaveLength(3)
+  })
+
+  test('one period in flight does not block another', async () => {
+    const calls: string[] = []
+    const loader = createPeriodLoader(async (period) => {
+      calls.push(period)
+      await tick()
+    })
+    await Promise.all([loader.load('2011-08'), loader.load('2011-07')])
+    expect(calls.sort()).toEqual(['2011-07', '2011-08'])
+  })
+
+  test('a failed fetch does not wedge its period for good', async () => {
+    let attempts = 0
+    const loader = createPeriodLoader(async () => {
+      attempts++
+      throw new Error('offline')
+    })
+    await loader.load('2011-08').catch(() => {})
+    await loader.load('2011-08').catch(() => {})
+    expect(attempts).toBe(2)
   })
 })
