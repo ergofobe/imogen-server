@@ -4,7 +4,7 @@ services:
     build:
       context: ..
       dockerfile: imogen-server/Dockerfile
-    image: ghcr.io/ergofobe/imogen-photos:latest
+    image: ghcr.io/ergofobe/imogen-server:latest
     restart: unless-stopped
     depends_on:
       db:

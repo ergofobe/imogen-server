@@ -117,14 +117,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tags carry no leading v, so a compose file pins `imogen-photos:0.1.0`
+      # Tags carry no leading v, so a compose file pins `imogen-server:0.1.0`
       # rather than `:v0.1.0`. main additionally moves :latest and publishes a
       # short-sha tag, so an unreleased commit is still deployable by digest.
       - name: Work out the tags
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/ergofobe/imogen-photos
+          images: ghcr.io/ergofobe/imogen-server
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

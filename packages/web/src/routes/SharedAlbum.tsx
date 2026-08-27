@@ -152,7 +152,7 @@ export function SharedAlbum() {
             <p className="text-sm text-muted">
               Shared with{' '}
               <a
-                href="https://github.com/ergofobe/imogen-photos"
+                href="https://github.com/ergofobe/imogen-server"
                 className="underline decoration-line underline-offset-4 transition hover:text-ink"
               >
                 imogen

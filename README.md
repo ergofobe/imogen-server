@@ -29,7 +29,7 @@ your AI assistants can search the library too.
 ## Running it
 
 ```bash
-curl -O https://raw.githubusercontent.com/ergofobe/imogen-photos/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/ergofobe/imogen-server/main/docker-compose.yml
 docker compose up -d
 ```
 
@@ -245,8 +245,8 @@ without keeping its own ledger.
 ## Developing
 
 ```bash
-git clone https://github.com/ergofobe/imogen-photos
-cd imogen-photos
+git clone https://github.com/ergofobe/imogen-server
+cd imogen-server
 bun install
 
 docker compose -f docker/compose.dev.yml up -d     # Postgres

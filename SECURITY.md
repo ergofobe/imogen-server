@@ -7,7 +7,7 @@ here is a serious matter, so thank you for taking the time to report one.
 
 Report it privately, through GitHub:
 
-**[Report a vulnerability →](https://github.com/ergofobe/imogen-photos/security/advisories/new)**
+**[Report a vulnerability →](https://github.com/ergofobe/imogen-server/security/advisories/new)**
 
 That opens a security advisory only the maintainers can see, so the problem can be
 fixed before it is described in public. Please don't open a normal issue for it.
