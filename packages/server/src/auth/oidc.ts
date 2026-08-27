@@ -25,6 +25,27 @@ export type OidcFlow = {
 const FLOW_TTL_MS = 10 * 60 * 1000
 
 /**
+ * The callback URL to hand openid-client, rebuilt on the redirect URI this server
+ * actually registered.
+ *
+ * openid-client derives the token request's `redirect_uri` from the URL it is given
+ * (`redirectUri = stripParams(currentUrl)`), and the provider checks that it is identical
+ * to the one sent at the authorization step. imogen is documented as running behind
+ * something that terminates TLS, so the request reaches it as plain http — and the raw
+ * request URL is therefore `http://…`, while the authorization step correctly used the
+ * public `https://…`. The provider sees two different redirect URIs and rejects the
+ * exchange with invalid_grant.
+ *
+ * Only the query is taken from the incoming request; that is where `code` and `state`
+ * live, and it is the only part the raw URL is authoritative about.
+ */
+export function callbackUrlFor(redirectUri: string, currentUrl: URL): URL {
+  const url = new URL(redirectUri)
+  url.search = currentUrl.search
+  return url
+}
+
+/**
  * Generic OIDC through discovery, so Authentik, Keycloak, Auth0, and Google all take the
  * same code path. imogen never special-cases a provider; if it speaks OIDC, it works.
  */
@@ -88,7 +109,7 @@ export class OidcService {
     this.flows.delete(state!)
 
     const config = await this.discover()
-    const tokens = await client.authorizationCodeGrant(config, currentUrl, {
+    const tokens = await client.authorizationCodeGrant(config, this.callbackUrl(currentUrl), {
       pkceCodeVerifier: flow.codeVerifier,
       expectedState: flow.state,
       expectedNonce: flow.nonce,
@@ -135,6 +156,11 @@ export class OidcService {
       },
       returnTo: flow.returnTo,
     }
+  }
+
+  /** See callbackUrlFor: the raw request URL is not what the provider agreed to. */
+  private callbackUrl(currentUrl: URL): URL {
+    return callbackUrlFor(this.redirectUri, currentUrl)
   }
 
   private grantsAdmin(groups: unknown): boolean {
