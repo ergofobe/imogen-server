@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { buildSegments } from '../lib/timelineLayout.ts'
-import { dayNumber, railTicks, stepMonth } from './TimelineRail.tsx'
+import { dayAt, dayNumber, railTicks, stepMonth } from './TimelineRail.tsx'
 
 const OPTIONS = { width: 1200, targetHeight: 208, gap: 4, sectionGap: 44, headerHeight: 40 }
 const bucket = (date: string, count: number) => ({ date, count, coverAssetId: null })
@@ -179,12 +179,17 @@ describe('railTicks', () => {
   })
 
   /*
-   * Which of two colliding years keeps the label. Seen on real data: a lockdown year of
-   * two hundred frames sat six pixels above a year of four thousand and took the label
-   * off it, so the rail named the year with nothing in it and left the one worth finding
-   * blank. The bigger claim on the rail wins.
+   * First-wins, not densest-wins.
+   *
+   * An earlier round ruled the other way — between two years too close to both be named,
+   * give the label to whichever owns more rail. It reads well in the abstract and it is
+   * wrong at the one position that matters: the top. Both mobile clients thin first-wins
+   * and both say why in the same words — "a rail whose top is unlabelled reads as broken"
+   * — and the user hit exactly that. A reader's first question of a rail is what the
+   * newest thing on it is, and an answer that depends on how heavy the year below happens
+   * to be is not an answer.
    */
-  test('the denser of two colliding years keeps the label', () => {
+  test('the newest year always keeps its label, however dense the year below it', () => {
     const table = buildSegments(
       [
         bucket('2021-06-01', 30),
@@ -198,10 +203,69 @@ describe('railTicks', () => {
       new Map(),
     )
     const years = railTicks(table, 800).filter((t) => t.kind === 'year')
-    expect(years.some((t) => t.label === '2019' && t.labelled)).toBe(true)
-    expect(years.some((t) => t.label === '2020' && t.labelled)).toBe(false)
-    // Demoted, not discarded: 2020's boundary is still drawn.
-    expect(years.some((t) => t.label === '2020')).toBe(true)
+    expect(years[0]!.label).toBe('2021')
+    expect(years[0]!.labelled).toBe(true)
+    expect(years[0]!.y).toBe(0)
+    // The heavier year below is still marked — demoted, never discarded.
+    expect(years.some((t) => t.label === '2019')).toBe(true)
+    expect(years.find((t) => t.label === '2019')!.labelled).toBe(false)
+  })
+
+  /*
+   * The user's actual complaint. The label is drawn centred on its own tick, so a tick at
+   * y = 0 puts half the text above the top of the viewport. Both mobile clients map into a
+   * track of `railHeight - thumbHeight` rather than the full height, which fixes it by
+   * construction at both ends instead of by nudging an offset at one.
+   */
+  test('maps into the track it is given, so the ends are reachable and nothing is clipped', () => {
+    const table = buildSegments(
+      [bucket('2013-01-01', 50), bucket('2012-06-01', 50), bucket('2011-08-14', 50)],
+      new Map(),
+      OPTIONS,
+      new Map(),
+    )
+    const full = railTicks(table, 800)
+    const tracked = railTicks(table, 760)
+    expect(full[0]!.y).toBe(0)
+    expect(tracked[0]!.y).toBe(0)
+    // Every tick scales with the track, so the caller can reserve room for a thumb.
+    expect(tracked.at(-1)!.y).toBeCloseTo(full.at(-1)!.y * (760 / 800), 6)
+  })
+
+  /*
+   * The other half of the same mapping, and the mobile files say it plainly: "the last
+   * screenful is not scrolled past, so a thumb driven by totalHeight alone stops short of
+   * the bottom". A library only a little taller than the window is where this is not a
+   * rounding error but most of the rail.
+   */
+  test('measures against what can actually be scrolled, not the whole library', () => {
+    const table = buildSegments(
+      [bucket('2013-01-01', 40), bucket('2012-06-01', 40), bucket('2011-08-14', 40)],
+      new Map(),
+      OPTIONS,
+      new Map(),
+    )
+    const oldest = table.segments.at(-1)!
+    const reachable = oldest.top
+
+    // Told what is reachable, the oldest day sits at the very bottom of the track.
+    expect(railTicks(table, 800, reachable).at(-1)!.y).toBe(800)
+    // Told nothing, it stops short by the last screenful's worth — the bug.
+    expect(railTicks(table, 800).at(-1)!.y).toBeLessThan(800)
+  })
+
+  test('days inside the last screenful clamp to the bottom rather than running past it', () => {
+    const table = buildSegments(
+      [bucket('2013-01-01', 40), bucket('2012-06-01', 40), bucket('2011-08-14', 40)],
+      new Map(),
+      OPTIONS,
+      new Map(),
+    )
+    // Only the first day is reachable; everything below it is in the final screenful.
+    for (const tick of railTicks(table, 800, 1)) {
+      expect(tick.y).toBeLessThanOrEqual(800)
+      expect(tick.y).toBeGreaterThanOrEqual(0)
+    }
   })
 })
 
@@ -258,6 +322,33 @@ describe('stepMonth', () => {
     const table = gapped()
     const oldest = topOf(table, '2011-07-19')
     expect(stepMonth(table, oldest, -1)).toBe(oldest)
+  })
+
+  /*
+   * The stuck arrow key, found in a browser and reproduced here.
+   *
+   * A step lands exactly on a month's first day, but the position read back off the DOM
+   * comes to a fraction less than what was written: the scroller quantises to device
+   * pixels and the grid's own top is not on a whole one. Judged strictly, the reader is
+   * then still in the month above — so the next step recomputes the very same target,
+   * writes the position it is already at, produces no scroll event, and the arrow key does
+   * nothing ever again. It moved once and died.
+   */
+  test('a position a hair short of a month boundary steps as if it were on it', () => {
+    const table = gapped()
+    const may = topOf(table, '2026-05-11')
+    expect(stepMonth(table, may - 0.4, -1)).toBe(topOf(table, '2019-03-30'))
+    // Not "back to the month I am already in", which is what the stuck loop did.
+    expect(stepMonth(table, may - 0.4, -1)).not.toBe(may)
+  })
+
+  test('and the same slack decides what the rail announces, so the two agree', () => {
+    const table = gapped()
+    const may = topOf(table, '2026-05-11')
+    // The step and the label are read through one function for exactly this reason: the
+    // step moved to April while the label went on saying May, one whole month behind.
+    expect(dayAt(table, may - 0.4)).toBe('2026-05-11')
+    expect(dayAt(table, may)).toBe('2026-05-11')
   })
 
   test('an empty table does not throw', () => {

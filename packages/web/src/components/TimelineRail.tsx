@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { formatDayKeyHeading } from '../lib/format.ts'
+import { formatDayKeyHeading, formatMonthYearKey } from '../lib/format.ts'
 import {
   gridTopOf,
   scrollEventSourceFor,
   scrollGridTo,
   scrollingAncestorOf,
+  viewportHeightOf,
 } from '../lib/scroller.ts'
 import { dateAtOffset, offsetForDate, periodOf, type SegmentTable } from '../lib/timelineLayout.ts'
 
@@ -65,21 +66,63 @@ const MIN_TICK_SPACING = 12
 /** Long enough that a flick past a month does not fetch it; short enough to feel instant. */
 const RESUME_DELAY = 150
 
+/**
+ * The thumb, which is a real object to take hold of rather than a hairline to chase.
+ *
+ * It is also the unit the whole rail is measured in: positions run from 0 to
+ * `railHeight - THUMB_HEIGHT`, so the thumb's top edge at one end and its bottom edge at
+ * the other both land exactly on the rail's, and neither it nor a label centred on it can
+ * fall off the screen.
+ */
+const THUMB_HEIGHT = 40
+
+/**
+ * How close to a segment's first pixel still counts as being in it.
+ *
+ * A step writes a month's exact top and then reads the position back off the DOM, and the
+ * two are not quite equal: the scroller quantises to device pixels and the grid's own top
+ * is rarely on a whole one. A fraction short reads as "still in the month above", so the
+ * next step recomputes the identical target, writes the position it is already at,
+ * produces no scroll event — and the arrow key does nothing for the rest of the session.
+ * Observed doing precisely that: it stepped four months and then died.
+ */
+const BOUNDARY_SLACK = 1
+
 const DAY_MS = 86_400_000
 
 /**
  * Where every year — and, where there is room, every month — falls on a rail of a given
  * height. Pure, and the only place the mapping between timeline pixels and rail pixels is
  * written down.
+ *
+ * `trackHeight` is the rail's height less the thumb's, not the rail's height. The thumb is
+ * positioned by its top edge, so a fraction mapped across the full height puts the thumb
+ * half off the bottom at one end — and a label drawn centred on a tick at zero puts half
+ * its text above the top of the window at the other, which is exactly what a reader saw.
+ * Reserving the thumb's height makes both ends reachable by construction rather than by
+ * nudging an offset at whichever end was noticed.
+ *
+ * `scrollableHeight` is how far the content can actually be scrolled — the library's
+ * height less one screenful — because the last screenful is never scrolled past. A rail
+ * measured against the whole library stops short of the bottom by a screen's worth: a
+ * rounding error on twenty years, and most of the rail on a library only a little taller
+ * than the window. It defaults to the whole library, which is the honest answer when the
+ * caller has no viewport to speak of.
  */
-export function railTicks(table: SegmentTable, railHeight: number): RailTick[] {
+export function railTicks(
+  table: SegmentTable,
+  trackHeight: number,
+  scrollableHeight: number = table.totalHeight,
+): RailTick[] {
   const { segments, totalHeight } = table
   // An unmeasured rail, or a table built before the grid had a width, has no honest
   // mapping to report and would divide by zero working one out.
-  if (segments.length === 0 || totalHeight <= 0 || railHeight <= 0) return []
+  if (segments.length === 0 || totalHeight <= 0 || trackHeight <= 0) return []
 
-  const scale = railHeight / totalHeight
-  const ticks: Candidate[] = []
+  const reach = Math.max(scrollableHeight, 1)
+  /** A content offset as a position on the track, clamped: the last screenful has none. */
+  const place = (top: number) => Math.min(trackHeight, Math.max(0, (top / reach) * trackHeight))
+  const ticks: RailTick[] = []
 
   for (let start = 0; start < segments.length; ) {
     const year = segments[start]!.date.slice(0, 4)
@@ -88,9 +131,9 @@ export function railTicks(table: SegmentTable, railHeight: number): RailTick[] {
 
     // Segments run newest first, so a year's first segment is its newest day — the point
     // at which the reader crosses into that year on the way down.
-    const top = segments[start]!.top * scale
-    const bottom = (end < segments.length ? segments[end]!.top : totalHeight) * scale
-    ticks.push({ label: year, y: top, kind: 'year', span: bottom - top, labelled: true })
+    const top = place(segments[start]!.top)
+    const bottom = place(end < segments.length ? segments[end]!.top : totalHeight)
+    ticks.push({ label: year, y: top, kind: 'year', labelled: true })
 
     if (bottom - top >= MONTH_TICK_MIN_YEAR_SPAN) {
       // Seeded with the year tick, so the newest month — which shares its position — is
@@ -99,10 +142,10 @@ export function railTicks(table: SegmentTable, railHeight: number): RailTick[] {
       for (let i = start + 1; i < end; i++) {
         const month = periodOf(segments[i]!.date)
         if (month === periodOf(segments[i - 1]!.date)) continue
-        const y = segments[i]!.top * scale
+        const y = place(segments[i]!.top)
         if (y - lastY < MIN_TICK_SPACING) continue
         lastY = y
-        ticks.push({ label: month, y, kind: 'month', span: 0, labelled: false })
+        ticks.push({ label: month, y, kind: 'month', labelled: false })
       }
     }
 
@@ -112,30 +155,25 @@ export function railTicks(table: SegmentTable, railHeight: number): RailTick[] {
   return resolveLabels(ticks)
 }
 
-/** A tick plus how much rail its period owns, which is how collisions are settled. */
-type Candidate = RailTick & { span: number }
-
 /**
  * Decides which ticks get to print their label. The ticks arrive in ascending `y`, so one
  * pass with a memory of the last label placed is enough.
  *
- * Only labels compete — a bare mark is a line at the right edge and two of them on one
- * pixel are indistinguishable from one, so nothing is dropped for want of room except the
- * text. Between two years that cannot both be named, the one owning more rail wins: the
- * year worth finding, rather than the one that happens to be newer. Taking the newer put
- * the label on a lockdown year of two hundred frames and left the four thousand under it
- * blank.
+ * First-wins. An earlier round gave the label to whichever of two colliding years owned
+ * more rail, which reads well until you look at the top of a rail and find the newest year
+ * unnamed because a heavier year sits nine pixels under it. Both mobile clients thin
+ * first-wins and give the same reason in the same words — a rail whose top is unlabelled
+ * reads as broken — and a reader's first question is always what the newest thing is.
+ *
+ * Only labels compete. A bare mark is a line at the right edge and two of them on one pixel
+ * are indistinguishable from one, so a year that loses the label keeps its boundary: the
+ * rail never implies a year holds nothing merely because it had no room to say its name.
+ * It is allowed to be that incomplete precisely because the overview is not — every year,
+ * an exact count, and no space pressure at all.
  */
-function resolveLabels(ticks: Candidate[]): RailTick[] {
-  const out: Candidate[] = []
+function resolveLabels(ticks: RailTick[]): RailTick[] {
+  const out: RailTick[] = []
   let lastLabelledY = Number.NEGATIVE_INFINITY
-  let lastLabelled = -1
-
-  const place = (tick: Candidate) => {
-    out.push({ ...tick, labelled: true })
-    lastLabelledY = tick.y
-    lastLabelled = out.length - 1
-  }
 
   for (const tick of ticks) {
     if (tick.kind === 'month') {
@@ -155,20 +193,15 @@ function resolveLabels(ticks: Candidate[]): RailTick[] {
       ) {
         out.pop()
       }
-      place(tick)
+      out.push({ ...tick, labelled: true })
+      lastLabelledY = tick.y
       continue
     }
 
-    const holder = lastLabelled >= 0 ? out[lastLabelled] : undefined
-    if (holder && holder.kind === 'year' && tick.span > holder.span) {
-      holder.labelled = false
-      place(tick)
-      continue
-    }
     out.push({ ...tick, labelled: false })
   }
 
-  return out.map(({ label, y, kind, labelled }) => ({ label, y, kind, labelled }))
+  return out
 }
 
 type Props = {
@@ -214,7 +247,10 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
   const [rail, setRail] = useState<HTMLDivElement | null>(null)
   const [railHeight, setRailHeight] = useState(0)
   const [gridTop, setGridTop] = useState(0)
+  const [viewport, setViewport] = useState(0)
   const [scrubbing, setScrubbing] = useState(false)
+  const [pointerOver, setPointerOver] = useState(false)
+  const [focused, setFocused] = useState(false)
 
   const dragging = useRef(false)
   const resuming = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -237,6 +273,7 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
     const read = () => {
       frame = 0
       setGridTop(gridTopOf(grid))
+      setViewport(viewportHeightOf(grid))
     }
     const schedule = () => {
       if (!frame) frame = requestAnimationFrame(read)
@@ -277,14 +314,17 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
     (clientY: number) => {
       if (!rail || !grid || table.totalHeight <= 0) return
       const box = rail.getBoundingClientRect()
-      if (box.height <= 0) return
-      const y = Math.min(box.height, Math.max(0, clientY - box.top))
-      scrollGridTo(grid, (y / box.height) * table.totalHeight)
+      const track = box.height - THUMB_HEIGHT
+      if (track <= 0) return
+      // Less half a thumb, so the thumb sits centred under the pointer rather than hanging
+      // below it — the same correction both mobile clients make.
+      const fraction = Math.min(1, Math.max(0, (clientY - box.top - THUMB_HEIGHT / 2) / track))
+      scrollGridTo(grid, fraction * scrollableExtent(table, viewport))
       // Read back rather than trusting the target: `scrollGridTo` clamps at both ends, and
       // a label reporting a date the view never reached is worse than no label.
       setGridTop(gridTopOf(grid))
     },
-    [rail, grid, table.totalHeight],
+    [rail, grid, table, viewport],
   )
 
   const onPointerDown = useCallback(
@@ -339,8 +379,22 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
     [grid, table, gridTop],
   )
 
-  const ticks = railTicks(table, railHeight)
-  const date = dateAtOffset(table, gridTop)
+  const track = Math.max(0, railHeight - THUMB_HEIGHT)
+  const scrollable = scrollableExtent(table, viewport)
+  const ticks = railTicks(table, track, scrollable)
+  const date = dayAt(table, gridTop)
+
+  /*
+   * The rail is a thumb at rest and a ruler when engaged.
+   *
+   * Both mobile clients reveal the marks only while the rail is held, and the reason is
+   * good: marks drawn permanently down the edge sit on top of the photographs, which are
+   * the one thing the screen is for, and a fixed row of ticks reads as chrome rather than
+   * as a control. A phone has only a finger, so held is all there is. A browser has three
+   * ways of taking hold of something, and a keyboard reader stepping through months needs
+   * to see where the months are quite as much as a dragging one does.
+   */
+  const engaged = scrubbing || pointerOver || focused
 
   /*
    * Whether there is anything to scrub: a library with days in it, taller than the screen
@@ -356,7 +410,10 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
    */
   const usable = ticks.length > 0 && date !== null && table.totalHeight > railHeight
 
-  const thumbY = Math.min(railHeight, Math.max(0, (gridTop / table.totalHeight) * railHeight))
+  const thumbTop = Math.min(track, Math.max(0, (gridTop / scrollable) * track))
+  // Marks are centred on the thumb's middle, so dragging the thumb onto a year's label is
+  // what lands on that year rather than overshooting it by half a thumb.
+  const centreOf = (y: number) => y + THUMB_HEIGHT / 2
   const newest = table.segments[0]?.date
   const oldest = table.segments.at(-1)?.date
 
@@ -384,46 +441,99 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
           onPointerUp={endDrag}
           onPointerCancel={endDrag}
           onKeyDown={onKeyDown}
-          className="pointer-events-auto absolute inset-0 cursor-ns-resize touch-none select-none border-line/60 border-l bg-paper/70 backdrop-blur-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-safelight"
+          onPointerEnter={() => setPointerOver(true)}
+          onPointerLeave={() => setPointerOver(false)}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+          className="pointer-events-auto absolute inset-0 cursor-ns-resize touch-none select-none focus-visible:outline-none"
         >
-          {ticks.map((tick) => (
-            <div
-              key={`${tick.kind}-${tick.label}`}
-              aria-hidden="true"
-              className="pointer-events-none absolute right-0"
-              style={{ top: tick.y }}
-            >
-              {tick.labelled ? (
-                <span className="label-micro -translate-y-1/2 block pr-1.5 text-muted">
-                  {tick.label}
-                </span>
-              ) : (
-                <span className="block h-px w-2 bg-line" />
-              )}
-            </div>
-          ))}
-
-          {/* The reader's own position. Drawn over the ticks, and always visible, so the
-              rail answers "where am I" as well as "where can I go". */}
-          <span
+          {/* The ground the ruler is read against. It fades in with the marks: at rest
+              there is nothing here but the thumb, so the photographs keep the edge. */}
+          <div
             aria-hidden="true"
-            className="pointer-events-none absolute right-0 h-0.5 w-full bg-safelight"
-            style={{ top: thumbY }}
+            className="pointer-events-none absolute inset-0 border-line/60 border-l bg-paper/70 backdrop-blur-sm transition-opacity duration-200"
+            style={{ opacity: engaged ? 1 : 0 }}
           />
 
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-0 transition-opacity duration-200"
+            style={{ opacity: engaged ? 1 : 0 }}
+          >
+            {ticks.map((tick) => (
+              <div
+                key={`${tick.kind}-${tick.label}`}
+                className="-translate-y-1/2 absolute right-0"
+                style={{ top: centreOf(tick.y) }}
+              >
+                {tick.labelled ? (
+                  <span className="label-micro block pr-1.5 text-muted">{tick.label}</span>
+                ) : (
+                  <span className="block h-px w-2 bg-line" />
+                )}
+              </div>
+            ))}
+          </div>
+
+          {/*
+            The month under the thumb, hung to the left of it and unbounded.
+            Both mobile clients arrived here by way of two failures worth not repeating:
+            constrained to the rail's own width, "December 2024" broke across two lines;
+            unbounded but laid out beside the thumb, it pushed the thumb off the screen.
+            Absolutely positioned and `whitespace-nowrap`, it can be as wide as it likes
+            and still move nothing.
+          */}
           {scrubbing && (
             <span
               aria-hidden="true"
-              className="surface-panel pointer-events-none absolute right-[calc(100%+8px)] -translate-y-1/2 whitespace-nowrap rounded-full px-3 py-1.5 text-sm"
-              style={{ top: thumbY }}
+              className="surface-panel pointer-events-none -translate-y-1/2 absolute right-[calc(100%+8px)] whitespace-nowrap rounded-full px-3 py-1.5 font-medium text-sm"
+              style={{ top: centreOf(thumbTop) }}
             >
-              {formatDayKeyHeading(date)}
+              {formatMonthYearKey(periodOf(date))}
             </span>
           )}
+
+          {/* The thumb: always present, because at rest it is the whole control, and a real
+              object rather than a hairline so there is something to take hold of. Eased
+              only when it is following the grid — through a drag it must sit exactly under
+              the pointer, and easing there is just lag. */}
+          <span
+            aria-hidden="true"
+            className={`absolute right-1.5 flex w-7 items-center justify-center rounded-full border border-line/70 shadow-sm ${
+              scrubbing ? 'bg-safelight text-paper' : 'bg-paper text-muted'
+            }`}
+            style={{
+              top: thumbTop,
+              height: THUMB_HEIGHT,
+              transition: scrubbing ? 'none' : 'top 140ms ease-out',
+            }}
+          >
+            <svg
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              aria-hidden="true"
+              className="h-4 w-4"
+            >
+              <path d="M4 6h8M4 10h8" />
+            </svg>
+          </span>
         </div>
       )}
     </div>
   )
+}
+
+/**
+ * How far the timeline can actually be scrolled. The last screenful is never scrolled
+ * past, so a rail measured against the library's whole height can never reach its own
+ * bottom — by a hair over twenty years, and by most of the rail on a library only a little
+ * taller than the window.
+ */
+function scrollableExtent(table: SegmentTable, viewport: number): number {
+  return Math.max(1, table.totalHeight - viewport)
 }
 
 /**
@@ -451,7 +561,7 @@ export function dayNumber(day: string): number {
  * gap of eleven years cost exactly the same.
  */
 export function stepMonth(table: SegmentTable, from: number, step: 1 | -1): number {
-  const date = dateAtOffset(table, from)
+  const date = dayAt(table, from)
   if (!date) return from
   const month = periodOf(date)
   const top = monthTop(table, month)
@@ -475,6 +585,17 @@ export function stepMonth(table: SegmentTable, from: number, step: 1 | -1): numb
   // One pixel above this month's top belongs to the last day of the month above it.
   const newer = dateAtOffset(table, top - 1)
   return newer ? monthTop(table, periodOf(newer)) : 0
+}
+
+/**
+ * The day the reader is looking at, forgiving the sub-pixel shortfall described at
+ * [BOUNDARY_SLACK]. Every question the rail asks about its own position goes through here
+ * — what to step from, what to announce, what to print on the drag label — so that they
+ * cannot disagree about which side of a boundary the reader is on. They did: the step
+ * moved to April while the label went on saying May.
+ */
+export function dayAt(table: SegmentTable, gridTop: number): string | null {
+  return dateAtOffset(table, gridTop + BOUNDARY_SLACK)
 }
 
 /**

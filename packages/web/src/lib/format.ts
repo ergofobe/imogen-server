@@ -25,6 +25,11 @@ const CAPTURE_MOMENT = new Intl.DateTimeFormat(undefined, {
 })
 const MONTH_YEAR = new Intl.DateTimeFormat(undefined, { month: 'short', year: 'numeric' })
 const MONTH_UTC = new Intl.DateTimeFormat(undefined, { month: 'long', timeZone: 'UTC' })
+const MONTH_YEAR_UTC = new Intl.DateTimeFormat(undefined, {
+  month: 'long',
+  year: 'numeric',
+  timeZone: 'UTC',
+})
 const EXACT = new Intl.DateTimeFormat(undefined, { dateStyle: 'full', timeStyle: 'short' })
 
 /** Omits the year for photos from this year, the way a person would say the date aloud. */
@@ -65,6 +70,14 @@ export const formatMonthYear = (iso: string) => MONTH_YEAR.format(new Date(iso))
  */
 export const formatMonthKey = (month: string) =>
   MONTH_UTC.format(new Date(`${month}-01T00:00:00.000Z`))
+
+/**
+ * '2024-12' -> 'December 2024'. What the rail says while it is being dragged: a month is
+ * the granularity somebody actually remembers a photograph by, and the exact day under the
+ * thumb is noise at scrubbing speed.
+ */
+export const formatMonthYearKey = (month: string) =>
+  MONTH_YEAR_UTC.format(new Date(`${month}-01T00:00:00.000Z`))
 export const formatExact = (iso: string) => EXACT.format(new Date(iso))
 
 export function formatBytes(bytes: number): string {

@@ -63,6 +63,16 @@ export function scrollGridTo(container: HTMLElement, gridTop: number): void {
   scroller.scrollTop = scrollTargetFor(scroller, gridOffsetWithin(container, scroller), gridTop)
 }
 
+/**
+ * How much of the scroller is on screen.
+ *
+ * The rail needs it because the last screenful is never scrolled past: a thumb measured
+ * against the library's whole height stops short of the bottom by exactly this much.
+ */
+export function viewportHeightOf(container: HTMLElement): number {
+  return scrollingAncestorOf(container).clientHeight
+}
+
 /** Where the reader is, in grid coordinates. The inverse of `scrollGridTo`. */
 export function gridTopOf(container: HTMLElement): number {
   const scroller = scrollingAncestorOf(container)
