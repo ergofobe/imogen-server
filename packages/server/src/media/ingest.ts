@@ -75,6 +75,10 @@ export class IngestService {
         capturedAtIsExact: false,
         favorite: input.metadata.favorite ?? false,
         deviceAssetId: input.metadata.deviceAssetId ?? null,
+        description: input.metadata.description ?? null,
+        latitude: input.metadata.location?.latitude ?? null,
+        longitude: input.metadata.location?.longitude ?? null,
+        altitude: input.metadata.location?.altitude ?? null,
       })
       .returning()
 
@@ -162,6 +166,16 @@ export class IngestService {
     // EXIF beats the provisional timestamp; a scanned photo should sort by when it was
     // taken, not when it was uploaded.
     const capturedAt = result.capturedAt ?? asset.capturedAt
+    // A file whose EXIF carries no coordinates leaves whatever is already on the row
+    // alone. Writing null here would erase a location the uploader supplied, or one the
+    // owner typed in, the moment the pipeline got round to the photograph.
+    const location = result.location
+      ? {
+          latitude: result.location.latitude,
+          longitude: result.location.longitude,
+          altitude: result.location.altitude ?? null,
+        }
+      : {}
     await this.db
       .update(assets)
       .set({
@@ -172,9 +186,7 @@ export class IngestService {
         capturedAt,
         capturedAtIsExact: result.capturedAt !== null,
         exif: result.exif,
-        latitude: result.location?.latitude ?? null,
-        longitude: result.location?.longitude ?? null,
-        altitude: result.location?.altitude ?? null,
+        ...location,
         placeholderColor: result.placeholderColor,
         processingError: null,
         updatedAt: new Date(),
