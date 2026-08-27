@@ -9,7 +9,6 @@ import { AssetService } from './assets.ts'
 const harness = await createTestDatabase()
 const db: Database = harness.db
 const service = new AlbumService(db)
-const assetService = new AssetService(db)
 
 afterAll(() => harness.close())
 
@@ -115,7 +114,18 @@ describe('adding and removing assets in batches', () => {
       seeded.push(await addAsset({ capturedAt: new Date(`${date}T00:00:00Z`) }))
     }
 
-    const ids = await assetService.resolveSelection(ownerId, { query: {} })
+    // Forced to a sequential scan, inside its own transaction so the `SET LOCAL`s
+    // cannot leak onto the shared test connection and affect any other test. Without
+    // this, an index scan over `assets_timeline_idx` returns already-sorted rows for
+    // free at this table size regardless of whether `resolveSelection` orders anything
+    // itself — which would make every assertion below pass by planner luck rather than
+    // by the code actually being correct.
+    const ids = await db.transaction(async (tx) => {
+      await tx.execute(sql`set local enable_indexscan = off`)
+      await tx.execute(sql`set local enable_bitmapscan = off`)
+      await tx.execute(sql`set local enable_indexonlyscan = off`)
+      return new AssetService(tx as unknown as Database).resolveSelection(ownerId, { query: {} })
+    })
     await batched.addAssets(ownerId, album.id, ids)
 
     const rows = await db
