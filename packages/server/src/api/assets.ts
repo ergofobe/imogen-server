@@ -13,6 +13,9 @@ import {
   ShareLink,
   ShareLinkCreate,
   TimelineBucket,
+  TimelineBucketQuery,
+  TimelineQuery,
+  TimelineTile,
 } from '@imogen/shared'
 import { eq } from 'drizzle-orm'
 import { type AppEnv, requireAuth, requireScope } from '../auth/middleware.ts'
@@ -55,6 +58,7 @@ export function createAssetRoutes() {
       summary: 'Per-day counts, so a client can size its scrollbar before loading anything',
       security: security(),
       middleware: [requireScope('library:read')] as const,
+      request: { query: TimelineQuery },
       responses: {
         ...ok(z.object({ buckets: z.array(TimelineBucket) }), 'Day buckets, newest first'),
         ...ERROR_RESPONSES,
@@ -62,8 +66,33 @@ export function createAssetRoutes() {
     }),
     async (c) => {
       const services = c.get('services')
-      const buckets = await services.assets.timeline(c.get('principal').user.id)
+      const buckets = await services.assets.timeline(
+        c.get('principal').user.id,
+        c.req.valid('query'),
+      )
       return c.json({ buckets }, 200)
+    },
+  )
+
+  app.openapi(
+    createRoute({
+      method: 'get',
+      path: '/timeline/bucket',
+      tags: ['Assets'],
+      summary: 'Every tile in one period, for a grid that lays itself out',
+      description:
+        'A lean projection — id, capture time, dimensions, and what a tile draws — for ' +
+        'every asset in a month or a day. Around a quarter the bytes of the same assets ' +
+        'from `GET /assets`.',
+      security: security(),
+      middleware: [requireScope('library:read')] as const,
+      request: { query: TimelineBucketQuery },
+      responses: { ...ok(pageOf(TimelineTile), 'A page of tiles'), ...ERROR_RESPONSES },
+    }),
+    async (c) => {
+      const services = c.get('services')
+      const page = await services.assets.bucket(c.get('principal').user.id, c.req.valid('query'))
+      return c.json(page, 200)
     },
   )
 

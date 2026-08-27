@@ -1,4 +1,14 @@
-import type { Asset, AssetQuery, AssetUpdate, LibraryStats, TimelineBucket } from '@imogen/shared'
+import type {
+  Asset,
+  AssetFilter,
+  AssetQuery,
+  AssetUpdate,
+  LibraryStats,
+  TimelineBucket,
+  TimelineBucketQuery,
+  TimelineQuery,
+  TimelineTile,
+} from '@imogen/shared'
 import {
   and,
   asc,
@@ -8,13 +18,14 @@ import {
   inArray,
   isNotNull,
   isNull,
+  lt,
   lte,
   or,
   type SQL,
   sql,
 } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
-import { albumAssets, assets } from '../db/schema.ts'
+import { albumAssets, assets, faces } from '../db/schema.ts'
 import { forbidden, notFound } from '../lib/errors.ts'
 import { toAsset } from './serialize.ts'
 
@@ -107,7 +118,7 @@ export class AssetService {
     return date.toISOString()
   }
 
-  private buildFilters(ownerId: string, query: AssetQuery): SQL[] {
+  private buildFilters(ownerId: string, query: AssetFilter): SQL[] {
     // The vault is not a filter anyone can turn off. Assets inside it are excluded from
     // every ordinary listing, search, and count; the only way to see them is through
     // VaultService, which requires a freshly unlocked session.
@@ -130,6 +141,12 @@ export class AssetService {
     if (query.albumId) {
       conditions.push(
         sql`exists (select 1 from ${albumAssets} where ${albumAssets.assetId} = ${assets.id} and ${albumAssets.albumId} = ${query.albumId})`,
+      )
+    }
+
+    if (query.personId) {
+      conditions.push(
+        sql`exists (select 1 from ${faces} where ${faces.assetId} = ${assets.id} and ${faces.personId} = ${query.personId})`,
       )
     }
 
@@ -215,24 +232,92 @@ export class AssetService {
     return rows.length
   }
 
-  async timeline(ownerId: string): Promise<TimelineBucket[]> {
+  async timeline(ownerId: string, query: TimelineQuery = {}): Promise<TimelineBucket[]> {
+    const conditions = this.buildFilters(ownerId, query)
+    const day = sql<string>`to_char(${assets.capturedAt} at time zone 'UTC', 'YYYY-MM-DD')`
+
     const rows = await this.db
       .select({
-        date: sql<string>`to_char(${assets.capturedAt} at time zone 'UTC', 'YYYY-MM-DD')`,
+        date: day,
         count: sql<number>`count(*)::int`,
+        /*
+         * The newest ready asset in the day, or nothing. A period whose photographs are
+         * all still being processed shows a count without a picture rather than
+         * disappearing from an overview.
+         */
+        coverAssetId: query.covers
+          ? sql<
+              string | null
+            >`(array_agg(${assets.id} order by ${assets.capturedAt} desc, ${assets.id} desc) filter (where ${assets.status} = 'ready'))[1]`
+          : sql<string | null>`null::uuid`,
       })
+      .from(assets)
+      .where(and(...conditions))
+      .groupBy(day)
+      .orderBy(sql`1 desc`)
+
+    return rows.map((r) => ({
+      date: r.date,
+      count: Number(r.count),
+      coverAssetId: r.coverAssetId ?? null,
+    }))
+  }
+
+  /**
+   * Every tile in one period, in one answer. The projection is deliberate: a grid draws
+   * ten fields and an `Asset` carries twenty-five, and over a heavy month that is the
+   * difference between one round trip and several.
+   */
+  async bucket(ownerId: string, query: TimelineBucketQuery) {
+    const { start, end } = periodBounds(query.period)
+    const conditions = [
+      ...this.buildFilters(ownerId, query),
+      gte(assets.capturedAt, start),
+      lt(assets.capturedAt, end),
+    ]
+
+    const after = query.cursor ? decodeCursor(query.cursor) : null
+    if (after) {
+      conditions.push(
+        sql`(${assets.capturedAt}, ${assets.id}) < (${new Date(after.value)}, ${after.id})`,
+      )
+    }
+
+    const rows = await this.db
+      .select()
+      .from(assets)
+      .where(and(...conditions))
+      .orderBy(desc(assets.capturedAt), desc(assets.id))
+      .limit(query.limit + 1)
+
+    const hasMore = rows.length > query.limit
+    const page = hasMore ? rows.slice(0, query.limit) : rows
+    const last = page.at(-1)
+
+    /*
+     * The count is cheap here and the client wants it: a period's total is what sizes the
+     * segment before its tiles arrive, and re-deriving it from the day buckets would be
+     * one more thing to keep in step.
+     */
+    const [counted] = await this.db
+      .select({ total: sql<number>`count(*)::int` })
       .from(assets)
       .where(
         and(
-          eq(assets.ownerId, ownerId),
-          isNull(assets.deletedAt),
-          isNull(assets.vaultedAt),
-          eq(assets.archived, false),
+          ...this.buildFilters(ownerId, query),
+          gte(assets.capturedAt, start),
+          lt(assets.capturedAt, end),
         ),
       )
-      .groupBy(sql`1`)
-      .orderBy(sql`1 desc`)
-    return rows.map((r) => ({ date: r.date, count: Number(r.count) }))
+
+    return {
+      items: page.map(toTile),
+      nextCursor:
+        hasMore && last
+          ? encodeCursor({ value: last.capturedAt.toISOString(), id: last.id })
+          : null,
+      total: Number(counted?.total ?? 0),
+    }
   }
 
   async stats(ownerId: string): Promise<LibraryStats> {
@@ -268,6 +353,36 @@ export class AssetService {
       earliestCapturedAt: row?.earliest ? new Date(row.earliest).toISOString() : null,
       latestCapturedAt: row?.latest ? new Date(row.latest).toISOString() : null,
     }
+  }
+}
+
+/** `2011-08` is a month; `2011-08-14` is a day. Both are half-open, both in UTC. */
+function periodBounds(period: string): { start: Date; end: Date } {
+  const [year, month, day] = period.split('-').map(Number)
+  if (day === undefined) {
+    return {
+      start: new Date(Date.UTC(year!, month! - 1, 1)),
+      end: new Date(Date.UTC(year!, month!, 1)),
+    }
+  }
+  return {
+    start: new Date(Date.UTC(year!, month! - 1, day)),
+    end: new Date(Date.UTC(year!, month! - 1, day + 1)),
+  }
+}
+
+function toTile(row: typeof assets.$inferSelect): TimelineTile {
+  return {
+    id: row.id,
+    capturedAt: row.capturedAt.toISOString(),
+    width: row.width,
+    height: row.height,
+    type: row.type,
+    status: row.status,
+    favorite: row.favorite,
+    duration: row.duration,
+    placeholderColor: row.placeholderColor,
+    livePhotoVideoId: row.livePhotoVideoId,
   }
 }
 

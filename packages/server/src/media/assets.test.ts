@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
 import { sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
-import { assets, users } from '../db/schema.ts'
+import { albumAssets, albums, assets, users } from '../db/schema.ts'
 import { createTestDatabase } from '../test/harness.ts'
 import { AssetService } from './assets.ts'
 
@@ -46,6 +46,23 @@ async function addAsset(overrides: Partial<typeof assets.$inferInsert> = {}) {
     })
     .returning()
   return row!
+}
+
+async function seed(owner: string, overridesList: Partial<typeof assets.$inferInsert>[]) {
+  const rows = []
+  for (const overrides of overridesList) {
+    rows.push(await addAsset({ ownerId: owner, ...overrides }))
+  }
+  return rows
+}
+
+async function seedAlbum(owner: string, overridesList: Partial<typeof assets.$inferInsert>[]) {
+  const [album] = await db.insert(albums).values({ ownerId: owner, name: 'Album' }).returning()
+  const assetRows = await seed(owner, overridesList)
+  await db
+    .insert(albumAssets)
+    .values(assetRows.map((row, position) => ({ albumId: album!.id, assetId: row.id, position })))
+  return album!.id
 }
 
 describe('listing', () => {
@@ -351,8 +368,8 @@ describe('timeline buckets', () => {
     const buckets = await service.timeline(ownerId)
 
     expect(buckets).toEqual([
-      { date: '2024-03-05', count: 1 },
-      { date: '2024-03-01', count: 2 },
+      { date: '2024-03-05', count: 1, coverAssetId: null },
+      { date: '2024-03-01', count: 2, coverAssetId: null },
     ])
   })
 
@@ -362,7 +379,94 @@ describe('timeline buckets', () => {
 
     const buckets = await service.timeline(ownerId)
 
-    expect(buckets).toEqual([{ date: '2024-03-01', count: 1 }])
+    expect(buckets).toEqual([{ date: '2024-03-01', count: 1, coverAssetId: null }])
+  })
+
+  test('a bucket carries every tile in its month, newest first', async () => {
+    await seed(ownerId, [
+      { capturedAt: new Date('2011-08-14T09:00:00Z') },
+      { capturedAt: new Date('2011-08-14T18:00:00Z') },
+      { capturedAt: new Date('2011-09-02T09:00:00Z') },
+    ])
+    const page = await service.bucket(ownerId, { period: '2011-08', limit: 5000 })
+    expect(page.items).toHaveLength(2)
+    expect(page.items[0]!.capturedAt).toBe('2011-08-14T18:00:00.000Z')
+    expect(page.total).toBe(2)
+    expect(page.nextCursor).toBeNull()
+  })
+
+  test('a bucket accepts a single day as well as a month', async () => {
+    await seed(ownerId, [
+      { capturedAt: new Date('2011-08-14T09:00:00Z') },
+      { capturedAt: new Date('2011-08-15T09:00:00Z') },
+    ])
+    const page = await service.bucket(ownerId, { period: '2011-08-14', limit: 5000 })
+    expect(page.items).toHaveLength(1)
+  })
+
+  test('a bucket pages when a period holds more than the limit', async () => {
+    await seed(
+      ownerId,
+      Array.from({ length: 5 }, (_, i) => ({
+        capturedAt: new Date(`2011-08-1${i}T09:00:00Z`),
+      })),
+    )
+    const first = await service.bucket(ownerId, { period: '2011-08', limit: 2 })
+    expect(first.items).toHaveLength(2)
+    expect(first.nextCursor).not.toBeNull()
+    const second = await service.bucket(ownerId, {
+      period: '2011-08',
+      limit: 2,
+      cursor: first.nextCursor!,
+    })
+    expect(second.items).toHaveLength(2)
+    expect(second.items[0]!.id).not.toBe(first.items[0]!.id)
+  })
+
+  test('period intersects takenAfter rather than widening it', async () => {
+    await seed(ownerId, [
+      { capturedAt: new Date('2011-08-05T09:00:00Z') },
+      { capturedAt: new Date('2011-08-25T09:00:00Z') },
+    ])
+    const page = await service.bucket(ownerId, {
+      period: '2011-08',
+      limit: 5000,
+      takenAfter: '2011-08-20T00:00:00.000Z',
+    })
+    expect(page.items).toHaveLength(1)
+  })
+
+  test('a bucket keeps the vault out, like every other listing', async () => {
+    await seed(ownerId, [{ capturedAt: new Date('2011-08-14T09:00:00Z'), vaultedAt: new Date() }])
+    const page = await service.bucket(ownerId, { period: '2011-08', limit: 5000 })
+    expect(page.items).toHaveLength(0)
+  })
+
+  test('buckets narrow to an album when asked', async () => {
+    const albumId = await seedAlbum(ownerId, [{ capturedAt: new Date('2011-08-14T09:00:00Z') }])
+    await seed(ownerId, [{ capturedAt: new Date('2011-08-15T09:00:00Z') }])
+    const buckets = await service.timeline(ownerId, { albumId })
+    expect(buckets).toEqual([{ date: '2011-08-14', count: 1, coverAssetId: null }])
+  })
+
+  test('covers name the newest ready asset, and nothing when none is ready', async () => {
+    await seed(ownerId, [
+      { capturedAt: new Date('2011-08-14T09:00:00Z'), status: 'ready' },
+      { capturedAt: new Date('2011-08-14T18:00:00Z'), status: 'processing' },
+    ])
+    const [bucket] = await service.timeline(ownerId, { covers: true })
+    expect(bucket!.coverAssetId).not.toBeNull()
+
+    await service.trash(ownerId, [bucket!.coverAssetId!])
+    const [afterwards] = await service.timeline(ownerId, { covers: true })
+    expect(afterwards!.coverAssetId).toBeNull()
+  })
+
+  test('a timeline with no filters answers exactly as it did before', async () => {
+    await seed(ownerId, [{ capturedAt: new Date('2011-08-14T09:00:00Z') }])
+    expect(await service.timeline(ownerId, {})).toEqual([
+      { date: '2011-08-14', count: 1, coverAssetId: null },
+    ])
   })
 })
 
