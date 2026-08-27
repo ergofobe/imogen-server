@@ -365,6 +365,37 @@ export const oauthTokens = pgTable(
   ],
 )
 
+/**
+ * One-time tickets that let a signed-in browser hand a device the server address and a
+ * grant in one gesture, rather than making somebody type a hostname on a phone.
+ *
+ * A ticket is not a credential: claiming one mints an ordinary authorization code bound
+ * to a PKCE challenge the device generated, so possession of the ticket alone — a
+ * photographed QR code, say — cannot be turned into a token.
+ */
+export const pairingTickets = pgTable(
+  'pairing_tickets',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    /** SHA-256 of the code. The code itself is legible once, when the ticket is made. */
+    codeHash: text('code_hash').notNull(),
+    /** Set when redeemed. A ticket is single-use, and this is what enforces it. */
+    claimedAt: timestamp('claimed_at', { withTimezone: true }),
+    /** What the device called itself, so the browser can say which one paired. */
+    deviceName: text('device_name'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    createdAt,
+  },
+  (t) => [
+    uniqueIndex('pairing_tickets_code_hash_key').on(t.codeHash),
+    index('pairing_tickets_user_idx').on(t.userId),
+    index('pairing_tickets_expires_idx').on(t.expiresAt),
+  ],
+)
+
 // --- Uploads and jobs ---
 
 export const uploadSessions = pgTable(

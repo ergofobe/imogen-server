@@ -2,6 +2,7 @@ import type { User } from '@imogen/shared'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
+import { PairDevice } from '../components/PairDevice.tsx'
 import { ProfileForm } from '../components/ProfileForm.tsx'
 import { signOut } from '../components/Shell.tsx'
 import { imogen } from '../lib/client.ts'
@@ -14,6 +15,7 @@ export function Settings({ user }: { user: User }) {
     queryFn: () => imogen.assets.stats(),
   })
 
+  const [pairing, setPairing] = useState(false)
   const [current, setCurrent] = useState('')
   const [next, setNext] = useState('')
   const [message, setMessage] = useState<string | null>(null)
@@ -92,6 +94,22 @@ export function Settings({ user }: { user: User }) {
         </Section>
       )}
 
+      <Section title="Devices">
+        <p className="pt-1 text-sm leading-relaxed text-muted">
+          The phone and tablet apps back up new photos as you take them. Pairing shows the app where
+          this server is and signs it in, so there is no address to type.
+        </p>
+        <div className="flex flex-wrap gap-2 pt-3">
+          <button
+            type="button"
+            onClick={() => setPairing(true)}
+            className="rounded-lg border border-line px-3 py-1.5 text-sm transition hover:bg-sunken"
+          >
+            Pair a device
+          </button>
+        </div>
+      </Section>
+
       <Section title="Developers">
         <p className="pt-1 text-sm leading-relaxed text-muted">
           imogen has a documented REST API, a TypeScript SDK, and an MCP endpoint your AI assistants
@@ -124,6 +142,8 @@ export function Settings({ user }: { user: User }) {
           </div>
         </Section>
       )}
+
+      {pairing && <PairDevice onClose={() => setPairing(false)} />}
 
       <div className="mt-8 border-t border-line pt-6">
         <button

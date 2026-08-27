@@ -240,6 +240,30 @@ the existing asset instead of storing a second copy, so a sync loop can be simpl
 still be correct. Pass `deviceAssetId` and a client knows what it has already sent
 without keeping its own ledger.
 
+#### Pairing, instead of asking for a hostname
+
+The flow above still needs the app to know which server to talk to, and a self-hosted
+library is at whatever address its owner chose. Typing that on a phone keyboard is the
+worst moment in installing one of these apps, so the browser does it instead.
+
+Settings → **Devices** → **Pair a device** makes a one-time ticket and renders it as a QR
+code carrying both the server URL and the code. The app reads the square and does the
+rest:
+
+```kotlin
+val invitation = parsePairingUri(scanned) ?: return
+val oauth = OAuthClient(invitation.serverUrl)
+val paired = oauth.pair(invitation.code, "imogen for Android", "imogen://oauth", Build.MODEL)
+```
+
+What crosses the camera is a ticket, not a token. It is single-use, lives five minutes,
+and buys exactly one authorization code — bound to a PKCE challenge that never left the
+device, so a photograph of somebody's screen is not enough. The grant that comes out is an
+ordinary one, and appears under connected applications like any other.
+
+The same page offers the ticket as a link, for a phone already reading the web interface:
+tapping it opens the app directly.
+
 ---
 
 ## Developing

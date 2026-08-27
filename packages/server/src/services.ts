@@ -3,6 +3,7 @@ import { SettingsService } from './admin/settings.ts'
 import { AccountService } from './auth/accounts.ts'
 import { OAuthService } from './auth/oauth.ts'
 import { OidcService } from './auth/oidc.ts'
+import { PairingService } from './auth/pairing.ts'
 import { SessionService } from './auth/sessions.ts'
 import { createDatabase, type Database } from './db/index.ts'
 import { FaceService } from './faces/faces.ts'
@@ -26,6 +27,7 @@ export type Services = {
   sessions: SessionService
   oauth: OAuthService
   oidc: OidcService | null
+  pairing: PairingService
   assets: AssetService
   admin: AdminService
   settings: SettingsService
@@ -61,6 +63,7 @@ export function createServices(config: Config, database?: Database): Services {
   const oidc = config.oidc
     ? new OidcService(config.oidc, `${config.publicUrl}/api/v1/auth/oidc/callback`)
     : null
+  const pairing = new PairingService(db, oauth, { publicUrl: config.publicUrl })
 
   const assets = new AssetService(db)
   const admin = new AdminService(db, settings)
@@ -96,6 +99,7 @@ export function createServices(config: Config, database?: Database): Services {
     sessions,
     oauth,
     oidc,
+    pairing,
     assets,
     admin,
     settings,

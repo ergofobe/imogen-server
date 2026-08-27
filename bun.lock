@@ -12,7 +12,7 @@
     },
     "packages/mcp": {
       "name": "@imogen/mcp",
-      "version": "0.1.0",
+      "version": "0.2.1",
       "bin": {
         "imogen-mcp": "./src/cli.ts",
       },
@@ -22,7 +22,7 @@
     },
     "packages/server": {
       "name": "@imogen/server",
-      "version": "0.1.0",
+      "version": "0.2.1",
       "dependencies": {
         "@hono/zod-openapi": "^1.6.1",
         "@imogen/shared": "^0.1.0",
@@ -43,11 +43,12 @@
     },
     "packages/web": {
       "name": "@imogen/web",
-      "version": "0.1.0",
+      "version": "0.2.1",
       "dependencies": {
         "@imogen/sdk": "^0.1.0",
         "@imogen/shared": "^0.1.0",
         "@tanstack/react-query": "^5.62.0",
+        "qrcode-generator": "^2.0.4",
         "react": "^19.2.0",
         "react-dom": "^19.2.0",
         "react-router": "^7.9.0",
@@ -1357,6 +1358,8 @@
     "property-information": ["property-information@7.2.0", "", {}, "sha512-IAtzIB6sUiWaJYrX9smp3V46pBGbBeLFRGdh25kg1334VcBlD8HzhPeNIWQH9zhGmo2itIe25EHt9dQP7G5hmg=="],
 
     "proxy-addr": ["proxy-addr@2.0.7", "", { "dependencies": { "forwarded": "0.2.0", "ipaddr.js": "1.9.1" } }, "sha512-llQsMLSUDUPT44jdrU/O37qlnifitDP+ZwrmmZcoSKyLKvtZxpyV0n2/bD/N4tBAAZ/gJEdZU7KMraoK1+XYAg=="],
+
+    "qrcode-generator": ["qrcode-generator@2.0.4", "", {}, "sha512-mZSiP6RnbHl4xL2Ap5HfkjLnmxfKcPWpWe/c+5XxCuetEenqmNFf1FH/ftXPCtFG5/TDobjsjz6sSNL0Sr8Z9g=="],
 
     "qs": ["qs@6.15.3", "", { "dependencies": { "es-define-property": "^1.0.1", "side-channel": "^1.1.1" } }, "sha512-O9gl3zCl5h5blw1KGUzQKhA5oUXSl8rwUIM5o0S3nCXMliSvy5Dzx7/DJcI+SwgICv+IneSZwhBh1oSyEHA71A=="],
 
