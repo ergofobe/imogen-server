@@ -45,8 +45,15 @@ export type LayoutOptions = {
  *
  * `measured` is both an input and where newly learned heights are recorded: a height is
  * derived once and kept for good, so a region visited once stays put when its tiles are
- * evicted and fetched again. It is keyed by date alone, so it holds only for the `width`
- * it was learned at — the caller must clear it when the container resizes.
+ * evicted and fetched again.
+ *
+ * Its keys are a layout signature — the date plus everything a stored height depends on —
+ * rather than the date alone. A height is only ever read back for the exact count and
+ * layout it was computed under, so a resize, a breakpoint change, or a day losing half its
+ * photographs to the trash cannot serve a stale height: the signature simply misses and the
+ * day is derived afresh. That makes the map safe to hold across renders and to write to
+ * during one, since an entry recorded by a render that is later discarded is still correct
+ * for its own signature. The caller passes the same map through and never reads it.
  */
 export function buildSegments(
   buckets: TimelineBucket[],
@@ -84,19 +91,34 @@ function resolveDayHeight(
   options: LayoutOptions,
   measured: Map<string, number>,
 ): { height: number; measured: boolean } {
-  const remembered = measured.get(bucket.date)
+  const key = layoutSignature(bucket, options)
+  const remembered = measured.get(key)
   if (remembered !== undefined) return { height: remembered, measured: true }
 
   const tiles = loaded.get(bucket.date)
-  // A half-fetched day would measure short and lock that in forever, so only a day whose
-  // tiles are all present counts as measured.
+  // A half-fetched day would measure short and lock that in, so only a day holding at least
+  // as many tiles as its count counts as measured. `>=` rather than `===` on purpose: a
+  // spine that is briefly behind an import reports a low count, and refusing to measure
+  // then would leave the day overlapping its neighbour.
   if (tiles && tiles.length >= bucket.count) {
     const height = measureDayHeight(tiles, options)
-    measured.set(bucket.date, height)
+    measured.set(key, height)
     return { height, measured: true }
   }
 
   return { height: estimateDayHeight(bucket.count, options), measured: false }
+}
+
+/**
+ * Everything a stored height depends on. Every field below is a summand or a divisor of the
+ * result, so a change in any of them makes a remembered height wrong; folding them all into
+ * the key retires stale entries by making them unreachable instead of relying on a caller to
+ * know when to clear the map. Unreachable entries are left to accumulate, which is bounded
+ * by how many distinct layouts a window is ever resized through.
+ */
+function layoutSignature(bucket: TimelineBucket, options: LayoutOptions): string {
+  const { width, targetHeight, gap, sectionGap, headerHeight } = options
+  return `${bucket.date}|${bucket.count}|${width}|${targetHeight}|${gap}|${sectionGap}|${headerHeight}`
 }
 
 /** The exact height of a day, through the same justify pass that draws it. */
@@ -110,10 +132,20 @@ function measureDayHeight(tiles: TimelineTile[], options: LayoutOptions): number
   return options.headerHeight + grid + options.sectionGap
 }
 
+/**
+ * What a day of `count` photographs will probably stand at, before any of them are fetched.
+ *
+ * The gap term is `rows - 1`, not `rows`: `justify` advances by `height + gap` per row and
+ * reports `last.top + last.height`, so there is no gap below the final row. Counting one
+ * anyway made every day a whole gap taller as an estimate than as a measurement, so each
+ * one twitched on resolving even when its row count had been predicted exactly — the very
+ * jitter this module exists to prevent.
+ */
 export function estimateDayHeight(count: number, options: LayoutOptions): number {
   const perRow = Math.max(1, Math.floor(options.width / (options.targetHeight * AVERAGE_ASPECT)))
   const rows = Math.max(1, Math.ceil(count / perRow))
-  return options.headerHeight + rows * (options.targetHeight + options.gap) + options.sectionGap
+  const grid = rows * options.targetHeight + (rows - 1) * options.gap
+  return options.headerHeight + grid + options.sectionGap
 }
 
 /** The days a window touches, in timeline order. */
@@ -129,35 +161,62 @@ export function segmentsInRange(table: SegmentTable, top: number, bottom: number
 }
 
 /**
- * How far to move the scroll position so the photograph under the reader's eye stays
- * there when a table is replaced.
+ * How far to move the scroll position so the photograph under the reader's eye stays there
+ * when one table replaces another.
  *
- * Only what sits *above* the viewport moves it: a day whose estimate is replaced by a
- * taller measurement pushes everything below it down, so the scroll position must grow
- * by the same amount to compensate. Hence `next - previous`, positive when the timeline
- * above grew, and hence the caller adding it to `scrollTop`. Changes below the reader
- * cost nothing, which is why they are skipped rather than merely cancelling out.
+ * It is the shift of a single anchor — the first day at or after `scrollTop` that exists in
+ * both tables — plus the reader's own fraction of that day's change in height. Anchoring
+ * one day rather than accumulating every change above the reader is what keeps the answer
+ * continuous: a day straddling the top of the viewport contributes only the share of itself
+ * that is actually above the eye, so resolving it moves the view by a pixel or two instead
+ * of by its whole growth. It also needs no separate reasoning for days that appear or
+ * disappear — an import above the reader or a day emptied into the trash both simply move
+ * the anchor, and they move it in the anchor's own coordinates, so several at once compose
+ * correctly where summing next-space tops would drop all but the first.
+ *
+ * Positive means the timeline above the reader grew and the scroll position must grow with
+ * it, so the caller adds: `scroller.scrollTop += delta`.
+ *
+ * Contract: the caller must clamp the result into `[0, totalHeight - viewportHeight]`. This
+ * module cannot — it does not know the viewport height — and a browser silently clamps an
+ * out-of-range `scrollTop` assignment, which would let the compensation half-fail with no
+ * signal at either end of the timeline.
  */
 export function scrollDelta(previous: SegmentTable, next: SegmentTable, scrollTop: number): number {
-  let delta = 0
+  const anchor = anchorSegment(previous, next, scrollTop)
+  if (!anchor) return 0
 
-  for (const segment of next.segments) {
-    const before = previous.byDate.get(segment.date)
-    // A day that did not exist before — an import landing at the top of the library —
-    // adds its whole height above the reader.
-    if (!before) {
-      if (segment.top < scrollTop) delta += segment.height
-      continue
-    }
-    if (before.top < scrollTop) delta += segment.height - before.height
+  const moved = next.byDate.get(anchor.date)!
+  const shift = moved.top - anchor.top
+  if (anchor.height <= 0) return shift
+
+  // Inside the anchor day, the reader is some fraction of the way down it, and keeps that
+  // fraction as the day resizes. Clamped because the fallback anchor can sit outside it.
+  const fraction = Math.min(1, Math.max(0, (scrollTop - anchor.top) / anchor.height))
+  return shift + fraction * (moved.height - anchor.height)
+}
+
+/** The day the reader is holding on to: at or after `scrollTop`, and still present in `next`. */
+function anchorSegment(
+  previous: SegmentTable,
+  next: SegmentTable,
+  scrollTop: number,
+): DaySegment | null {
+  const { segments } = previous
+  const start = firstSegmentEndingAfter(segments, scrollTop)
+
+  for (let i = start; i < segments.length; i++) {
+    const segment = segments[i]!
+    if (next.byDate.has(segment.date)) return segment
   }
-
-  // And a day that has gone — its last photograph trashed — takes its height with it.
-  for (const before of previous.segments) {
-    if (before.top < scrollTop && !next.byDate.has(before.date)) delta -= before.height
+  // Nothing at or below the reader survived — they are past the end of the timeline, or the
+  // days beneath them have all been trashed. The nearest surviving day above is the next
+  // best thing to hold on to.
+  for (let i = Math.min(start, segments.length) - 1; i >= 0; i--) {
+    const segment = segments[i]!
+    if (next.byDate.has(segment.date)) return segment
   }
-
-  return delta
+  return null
 }
 
 /** The day at a pixel offset, clamped to the ends rather than reporting nothing. */

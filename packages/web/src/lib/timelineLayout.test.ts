@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { TimelineBucket, TimelineTile } from '@imogen/shared'
+import { aspectOf, justify } from './justify.ts'
 import {
   buildSegments,
   dateAtOffset,
@@ -38,6 +39,18 @@ const tile = (id: string, capturedAt: string, width = 4032, height = 3024): Time
   placeholderColor: '#3b5f7a',
   livePhotoVideoId: null,
 })
+
+const photographs = (date: string, count: number, width?: number, height?: number) =>
+  Array.from({ length: count }, (_, i) =>
+    tile(`${date}-${i}`, `${date}T09:00:00.000Z`, width, height),
+  )
+
+/**
+ * A day of panoramas justifies to one photograph per row, so it measures far taller than an
+ * estimate built on an average aspect — the estimate-to-measurement jump this module exists
+ * to absorb, produced the way production produces it rather than by seeding a height.
+ */
+const panoramas = (date: string, count: number) => photographs(date, count, 6000, 1000)
 
 const DAY_IN_MILLISECONDS = 86_400_000
 
@@ -87,10 +100,17 @@ describe('buildSegments', () => {
   })
 
   test('a measured height survives its tiles being evicted', () => {
-    const measured = new Map([['2011-08-14', 517]])
-    const table = buildSegments([bucket('2011-08-14', 12)], new Map(), OPTIONS, measured)
-    expect(table.byDate.get('2011-08-14')!.height).toBe(517)
-    expect(table.byDate.get('2011-08-14')!.measured).toBe(true)
+    const measured = new Map<string, number>()
+    const loaded = new Map([['2011-08-14', photographs('2011-08-14', 12)]])
+    const withTiles = buildSegments([bucket('2011-08-14', 12)], loaded, OPTIONS, measured)
+    const evicted = buildSegments([bucket('2011-08-14', 12)], new Map(), OPTIONS, measured)
+
+    expect(evicted.byDate.get('2011-08-14')!.height).toBe(
+      withTiles.byDate.get('2011-08-14')!.height,
+    )
+    expect(evicted.byDate.get('2011-08-14')!.measured).toBe(true)
+    // And not merely because the estimate happens to agree with the measurement.
+    expect(evicted.byDate.get('2011-08-14')!.height).not.toBe(estimateDayHeight(12, OPTIONS))
   })
 
   test('an empty library has no height and no segments', () => {
@@ -122,6 +142,102 @@ describe('estimateDayHeight', () => {
       OPTIONS.headerHeight + OPTIONS.targetHeight,
     )
   })
+
+  // Pinned to the arithmetic, not to itself: at 1200 wide an average aspect of 1.4 fits four
+  // photographs to a row, so four is one row and five is two, and a row's worth of gap only
+  // ever appears *between* rows. Every one of those three claims can break silently.
+  test('is exactly a header, its rows, the gaps between them, and the section gap', () => {
+    expect(estimateDayHeight(1, OPTIONS)).toBe(40 + 208 + 44)
+    expect(estimateDayHeight(4, OPTIONS)).toBe(40 + 208 + 44)
+    expect(estimateDayHeight(5, OPTIONS)).toBe(40 + (2 * 208 + 4) + 44)
+    expect(estimateDayHeight(12, OPTIONS)).toBe(40 + (3 * 208 + 2 * 4) + 44)
+  })
+
+  test('does not count a gap below the final row, the way justify does not draw one', () => {
+    const oneRow = estimateDayHeight(4, OPTIONS)
+    const twoRows = estimateDayHeight(8, OPTIONS)
+    expect(twoRows - oneRow).toBe(OPTIONS.targetHeight + OPTIONS.gap)
+  })
+})
+
+describe('measuring a day', () => {
+  test('is exactly the justify pass that draws it, plus the header and the section gap', () => {
+    const tiles = photographs('2011-08-14', 12)
+    const rows = justify(
+      tiles.map((t) => ({ id: t.id, aspect: aspectOf(t) })),
+      { width: OPTIONS.width, targetHeight: OPTIONS.targetHeight, gap: OPTIONS.gap },
+    )
+    const last = rows.at(-1)!
+    const table = buildSegments(
+      [bucket('2011-08-14', 12)],
+      new Map([['2011-08-14', tiles]]),
+      OPTIONS,
+      new Map(),
+    )
+    expect(table.byDate.get('2011-08-14')!.height).toBe(
+      OPTIONS.headerHeight + last.top + last.height + OPTIONS.sectionGap,
+    )
+  })
+
+  test('a day fetched only in part stays an estimate rather than measuring short', () => {
+    const loaded = new Map([['2011-08-14', [tile('a', '2011-08-14T09:00:00.000Z')]]])
+    const table = buildSegments([bucket('2011-08-14', 60)], loaded, OPTIONS, new Map())
+    expect(table.byDate.get('2011-08-14')!.measured).toBe(false)
+    expect(table.byDate.get('2011-08-14')!.height).toBe(estimateDayHeight(60, OPTIONS))
+  })
+
+  test('a remembered height wins over the tiles currently in hand', () => {
+    const measured = new Map<string, number>()
+    const first = buildSegments(
+      [bucket('2011-08-14', 12)],
+      new Map([['2011-08-14', photographs('2011-08-14', 12)]]),
+      OPTIONS,
+      measured,
+    )
+    const second = buildSegments(
+      [bucket('2011-08-14', 12)],
+      new Map([['2011-08-14', panoramas('2011-08-14', 12)]]),
+      OPTIONS,
+      measured,
+    )
+    expect(second.byDate.get('2011-08-14')!.height).toBe(first.byDate.get('2011-08-14')!.height)
+  })
+
+  test('a day that loses half its photographs is measured afresh, not remembered', () => {
+    const measured = new Map<string, number>()
+    const sixty = photographs('2011-08-14', 60)
+    const before = buildSegments(
+      [bucket('2011-08-14', 60)],
+      new Map([['2011-08-14', sixty]]),
+      OPTIONS,
+      measured,
+    )
+    // The user trashes thirty; the spine comes back with a count of thirty and thirty tiles.
+    // Serving the remembered height here would leave a permanent blank band below them.
+    const after = buildSegments(
+      [bucket('2011-08-14', 30)],
+      new Map([['2011-08-14', sixty.slice(0, 30)]]),
+      OPTIONS,
+      measured,
+    )
+    expect(after.byDate.get('2011-08-14')!.height).toBeLessThan(
+      before.byDate.get('2011-08-14')!.height,
+    )
+  })
+
+  test('a resize re-derives rather than serving a height learned at another width', () => {
+    const measured = new Map<string, number>()
+    const loaded = new Map([['2011-08-14', photographs('2011-08-14', 12)]])
+    const wide = buildSegments([bucket('2011-08-14', 12)], loaded, OPTIONS, measured)
+    const narrow = buildSegments(
+      [bucket('2011-08-14', 12)],
+      loaded,
+      { ...OPTIONS, width: 600, targetHeight: 132 },
+      measured,
+    )
+    expect(narrow.byDate.get('2011-08-14')!.height).not.toBe(wide.byDate.get('2011-08-14')!.height)
+    expect(narrow.byDate.get('2011-08-14')!.measured).toBe(true)
+  })
 })
 
 describe('segmentsInRange', () => {
@@ -150,18 +266,30 @@ describe('segmentsInRange', () => {
 })
 
 describe('scrollDelta', () => {
+  const twoDays = [bucket('2011-08-15', 10), bucket('2011-08-14', 10)]
+
   test('is zero when what changed is below the viewport', () => {
-    const buckets = [bucket('2011-08-15', 10), bucket('2011-08-14', 10)]
-    const before = buildSegments(buckets, new Map(), OPTIONS, new Map())
-    const after = buildSegments(buckets, new Map(), OPTIONS, new Map([['2011-08-14', 900]]))
+    const before = buildSegments(twoDays, new Map(), OPTIONS, new Map())
+    const after = buildSegments(
+      twoDays,
+      new Map([['2011-08-14', panoramas('2011-08-14', 10)]]),
+      OPTIONS,
+      new Map(),
+    )
+    expect(after.byDate.get('2011-08-14')!.height).not.toBe(before.byDate.get('2011-08-14')!.height)
     expect(scrollDelta(before, after, 0)).toBe(0)
   })
 
   test('is the accumulated change when it happened above the viewport', () => {
-    const buckets = [bucket('2011-08-15', 10), bucket('2011-08-14', 10)]
-    const before = buildSegments(buckets, new Map(), OPTIONS, new Map())
-    const grew = 900 - before.byDate.get('2011-08-15')!.height
-    const after = buildSegments(buckets, new Map(), OPTIONS, new Map([['2011-08-15', 900]]))
+    const before = buildSegments(twoDays, new Map(), OPTIONS, new Map())
+    const after = buildSegments(
+      twoDays,
+      new Map([['2011-08-15', panoramas('2011-08-15', 10)]]),
+      OPTIONS,
+      new Map(),
+    )
+    const grew = after.byDate.get('2011-08-15')!.height - before.byDate.get('2011-08-15')!.height
+    expect(grew).toBeGreaterThan(0)
     expect(scrollDelta(before, after, 5000)).toBe(grew)
   })
 
@@ -174,6 +302,99 @@ describe('scrollDelta', () => {
       new Map(),
     )
     expect(scrollDelta(before, after, 5000)).toBe(after.byDate.get('2011-08-15')!.height)
+  })
+})
+
+describe('scrollDelta keeps the same photograph under the reader', () => {
+  const threeDays = [bucket('2011-08-15', 10), bucket('2011-08-14', 10), bucket('2011-08-13', 10)]
+  const twoDaysStraddle = [bucket('2011-08-15', 10), bucket('2011-08-14', 10)]
+
+  // The invariant the whole thing exists for: whatever the day being read moves by, the
+  // scroll position must move by the same amount and in the same direction. An inverted
+  // sign fails this even though its magnitude is right.
+  const shiftOfTheDayBeingRead = (topDay: TimelineTile[]) => {
+    const before = buildSegments(threeDays, new Map(), OPTIONS, new Map())
+    const scrollTop = before.byDate.get('2011-08-13')!.top + 10
+    const after = buildSegments(threeDays, new Map([['2011-08-15', topDay]]), OPTIONS, new Map())
+    const moved = after.byDate.get('2011-08-13')!.top - before.byDate.get('2011-08-13')!.top
+    return { moved, delta: scrollDelta(before, after, scrollTop) }
+  }
+
+  test('a day above growing pushes the reader down by exactly as much', () => {
+    const { moved, delta } = shiftOfTheDayBeingRead(panoramas('2011-08-15', 10))
+    expect(moved).toBeGreaterThan(0)
+    expect(delta).toBe(moved)
+  })
+
+  test('a day above shrinking pulls the reader up, not down', () => {
+    const { moved, delta } = shiftOfTheDayBeingRead(photographs('2011-08-15', 10))
+    expect(moved).toBeLessThan(0)
+    expect(delta).toBe(moved)
+  })
+
+  test('a day trashed above the viewport gives its height back', () => {
+    const before = buildSegments(threeDays, new Map(), OPTIONS, new Map())
+    const after = buildSegments(threeDays.slice(1), new Map(), OPTIONS, new Map())
+    expect(scrollDelta(before, after, 5000)).toBe(-before.byDate.get('2011-08-15')!.height)
+  })
+
+  test('two identical tables ask for no compensation at all', () => {
+    const before = buildSegments(threeDays, new Map(), OPTIONS, new Map())
+    const after = buildSegments(threeDays, new Map(), OPTIONS, new Map())
+    expect(scrollDelta(before, after, 5000)).toBe(0)
+  })
+
+  // The day at the top of the viewport resolving from estimate to measurement is the most
+  // common event in the system. The reader is ten pixels into it, so only ten pixels' worth
+  // of it is above their eye: they must move by their own share of its growth, not by all of
+  // it. Charging the whole day is a jump from nothing to hundreds of pixels across one pixel
+  // of scrolling.
+  test('a day straddling the top of the viewport moves the reader by their share of it', () => {
+    const before = buildSegments(twoDaysStraddle, new Map(), OPTIONS, new Map())
+    const estimated = before.byDate.get('2011-08-15')!.height
+    const after = buildSegments(
+      twoDaysStraddle,
+      new Map([['2011-08-15', panoramas('2011-08-15', 10)]]),
+      OPTIONS,
+      new Map(),
+    )
+    const grew = after.byDate.get('2011-08-15')!.height - estimated
+    const scrollTop = 10
+
+    expect(scrollDelta(before, after, scrollTop)).toBeCloseTo((scrollTop / estimated) * grew, 9)
+    expect(scrollDelta(before, after, scrollTop)).toBeLessThan(grew / 50)
+  })
+
+  test('and by all of it once they are past its bottom edge', () => {
+    const before = buildSegments(twoDaysStraddle, new Map(), OPTIONS, new Map())
+    const estimated = before.byDate.get('2011-08-15')!.height
+    const after = buildSegments(
+      twoDaysStraddle,
+      new Map([['2011-08-15', panoramas('2011-08-15', 10)]]),
+      OPTIONS,
+      new Map(),
+    )
+    const grew = after.byDate.get('2011-08-15')!.height - estimated
+    expect(scrollDelta(before, after, estimated)).toBe(grew)
+  })
+
+  // Each inserted day's position in the new table already includes the ones before it, so
+  // gating on next-space tops counts only the first and drops the rest.
+  test('three days of an import landing above the reader all count', () => {
+    const before = buildSegments([bucket('2011-08-14', 30)], new Map(), OPTIONS, new Map())
+    const arrived = ['2011-08-17', '2011-08-16', '2011-08-15']
+    const after = buildSegments(
+      [...arrived.map((date) => bucket(date, 30)), bucket('2011-08-14', 30)],
+      new Map(),
+      OPTIONS,
+      new Map(),
+    )
+    const wholeImport = arrived.reduce((sum, date) => sum + after.byDate.get(date)!.height, 0)
+
+    expect(scrollDelta(before, after, 10)).toBe(wholeImport)
+    expect(scrollDelta(before, after, 10)).toBe(
+      after.byDate.get('2011-08-14')!.top - before.byDate.get('2011-08-14')!.top,
+    )
   })
 })
 
@@ -205,95 +426,6 @@ describe('dateAtOffset and offsetForDate', () => {
 
   test('an empty table has no date anywhere', () => {
     expect(dateAtOffset(buildSegments([], new Map(), OPTIONS, new Map()), 0)).toBeNull()
-  })
-})
-
-describe('periodOf and groupTilesByDay', () => {
-  test('a date belongs to its month', () => {
-    expect(periodOf('2011-08-14')).toBe('2011-08')
-  })
-
-  test('tiles split by UTC day, matching how the server bucketed them', () => {
-    const grouped = groupTilesByDay([
-      tile('a', '2011-08-14T23:30:00.000Z'),
-      tile('b', '2011-08-15T00:30:00.000Z'),
-    ])
-    expect([...grouped.keys()]).toEqual(['2011-08-14', '2011-08-15'])
-  })
-})
-
-describe('scrollDelta keeps the same photograph under the reader', () => {
-  const buckets = [bucket('2011-08-15', 10), bucket('2011-08-14', 10), bucket('2011-08-13', 10)]
-
-  // The invariant the whole thing exists for: whatever the day being read moves by, the
-  // scroll position must move by the same amount and in the same direction. An inverted
-  // sign fails this even though its magnitude is right.
-  const shiftOfTheDayBeingRead = (height: number) => {
-    const before = buildSegments(buckets, new Map(), OPTIONS, new Map())
-    const scrollTop = before.byDate.get('2011-08-13')!.top + 10
-    const after = buildSegments(buckets, new Map(), OPTIONS, new Map([['2011-08-15', height]]))
-    const moved = after.byDate.get('2011-08-13')!.top - before.byDate.get('2011-08-13')!.top
-    return { moved, delta: scrollDelta(before, after, scrollTop) }
-  }
-
-  test('a day above growing pushes the reader down by exactly as much', () => {
-    const { moved, delta } = shiftOfTheDayBeingRead(900)
-    expect(moved).toBeGreaterThan(0)
-    expect(delta).toBe(moved)
-  })
-
-  test('a day above shrinking pulls the reader up, not down', () => {
-    const { moved, delta } = shiftOfTheDayBeingRead(120)
-    expect(moved).toBeLessThan(0)
-    expect(delta).toBe(moved)
-  })
-
-  test('a day trashed above the viewport gives its height back', () => {
-    const before = buildSegments(buckets, new Map(), OPTIONS, new Map())
-    const after = buildSegments(buckets.slice(1), new Map(), OPTIONS, new Map())
-    expect(scrollDelta(before, after, 5000)).toBe(-before.byDate.get('2011-08-15')!.height)
-  })
-
-  test('two identical tables ask for no compensation at all', () => {
-    const before = buildSegments(buckets, new Map(), OPTIONS, new Map())
-    const after = buildSegments(buckets, new Map(), OPTIONS, new Map())
-    expect(scrollDelta(before, after, 5000)).toBe(0)
-  })
-})
-
-describe('measuring a day', () => {
-  test('a day fetched only in part stays an estimate rather than measuring short', () => {
-    const loaded = new Map([['2011-08-14', [tile('a', '2011-08-14T09:00:00.000Z')]]])
-    const table = buildSegments([bucket('2011-08-14', 60)], loaded, OPTIONS, new Map())
-    expect(table.byDate.get('2011-08-14')!.measured).toBe(false)
-    expect(table.byDate.get('2011-08-14')!.height).toBe(estimateDayHeight(60, OPTIONS))
-  })
-
-  test('a height learned from tiles is kept, so evicting them does not move the day', () => {
-    const tiles = Array.from({ length: 12 }, (_, i) => tile(`p${i}`, '2011-08-14T09:00:00.000Z'))
-    const measured = new Map<string, number>()
-    const withTiles = buildSegments(
-      [bucket('2011-08-14', 12)],
-      new Map([['2011-08-14', tiles]]),
-      OPTIONS,
-      measured,
-    )
-    const afterEviction = buildSegments([bucket('2011-08-14', 12)], new Map(), OPTIONS, measured)
-    expect(afterEviction.byDate.get('2011-08-14')!.height).toBe(
-      withTiles.byDate.get('2011-08-14')!.height,
-    )
-    expect(afterEviction.byDate.get('2011-08-14')!.measured).toBe(true)
-  })
-
-  test('a remembered height wins over the tiles currently in hand', () => {
-    const loaded = new Map([['2011-08-14', [tile('a', '2011-08-14T09:00:00.000Z')]]])
-    const table = buildSegments(
-      [bucket('2011-08-14', 1)],
-      loaded,
-      OPTIONS,
-      new Map([['2011-08-14', 517]]),
-    )
-    expect(table.byDate.get('2011-08-14')!.height).toBe(517)
   })
 })
 
@@ -333,7 +465,19 @@ describe('searching a twenty-year library', () => {
   })
 })
 
-describe('groupTilesByDay', () => {
+describe('periodOf and groupTilesByDay', () => {
+  test('a date belongs to its month', () => {
+    expect(periodOf('2011-08-14')).toBe('2011-08')
+  })
+
+  test('tiles split by UTC day, matching how the server bucketed them', () => {
+    const grouped = groupTilesByDay([
+      tile('a', '2011-08-14T23:30:00.000Z'),
+      tile('b', '2011-08-15T00:30:00.000Z'),
+    ])
+    expect([...grouped.keys()]).toEqual(['2011-08-14', '2011-08-15'])
+  })
+
   test('keeps every tile of a day together, in the order it arrived', () => {
     const grouped = groupTilesByDay([
       tile('a', '2011-08-15T10:00:00.000Z'),
