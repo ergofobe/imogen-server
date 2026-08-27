@@ -1,12 +1,12 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import { TimelineBucketQuery, TimelineQuery } from '@imogen/shared'
-import { and, eq, isNull } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { getCookie, setCookie } from 'hono/cookie'
 import type { AppEnv } from '../auth/middleware.ts'
 import { albumAssets, assetFiles, assets } from '../db/schema.ts'
 import { badRequest, notFound, unauthorized } from '../lib/errors.ts'
-import type { OpenedShare } from '../media/albums.ts'
+import { inAlbum, type OpenedShare } from '../media/albums.ts'
 import type { Services } from '../services.ts'
 
 const UNLOCK_TTL_MS = 12 * 60 * 60 * 1000
@@ -125,6 +125,26 @@ export function createShareRoutes() {
     })
   })
 
+  /*
+   * One photograph, whole, for the viewer.
+   *
+   * The page used to open a photograph out of `share.album.assets`, which is a capped
+   * cover sample — so once the grid windows over the whole album, anything past the sample
+   * had a tile and no asset behind it. Guarded by the same membership predicate as the
+   * file routes: a valid slug is a key to one album, never to the library.
+   */
+  app.get('/:slug/assets/:assetId', async (c) => {
+    const services = c.get('services')
+    const share = await open(services, c.req.param('slug'), c)
+    if (share === 'locked') throw unauthorized('This album is locked')
+
+    const assetId = c.req.param('assetId')
+    if (!(await isMemberOfShare(services, share, assetId))) {
+      throw notFound('That photo is not part of this album')
+    }
+    return c.json(await services.assets.get(share.album.ownerId, assetId), 200)
+  })
+
   app.get('/:slug/timeline', async (c) => {
     const services = c.get('services')
     const share = await open(services, c.req.param('slug'), c)
@@ -199,12 +219,11 @@ async function isMemberOfShare(
     .from(albumAssets)
     .innerJoin(assets, eq(assets.id, albumAssets.assetId))
     .where(
-      and(
-        eq(albumAssets.albumId, share.album.id),
-        eq(albumAssets.assetId, assetId),
-        isNull(assets.deletedAt),
-        isNull(assets.vaultedAt),
-      ),
+      // `inAlbum` rather than a fourth hand-written copy of the same predicate: the
+      // share's own timeline endpoints select through `buildFilters`, so anything this
+      // guard admits that they do not list is a photograph the page can never show but
+      // can still fetch, and anything they list that this refuses is a broken tile.
+      and(inAlbum(share.album.id), eq(albumAssets.assetId, assetId)),
     )
     .limit(1)
   return member !== undefined

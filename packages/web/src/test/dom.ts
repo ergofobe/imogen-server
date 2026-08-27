@@ -20,22 +20,55 @@ import type { ReactElement } from 'react'
  */
 
 let registered = false
+let measured: { width: number; height: number } | null = null
+
+/**
+ * Makes every observed element report this size, for a test whose subject cannot render
+ * until it has been measured. Set it before rendering; clear it with `null` afterwards so
+ * the next file gets the unmeasured default back.
+ */
+export function measureAs(size: { width: number; height: number } | null): void {
+  measured = size
+}
 
 export function startDom(): void {
   if (registered) return
   GlobalRegistrator.register()
   registered = true
-
-  // happy-dom does not implement it, and a component that measures itself constructs one
-  // in a layout effect. A stub that never fires is the honest default: it puts the
-  // component in exactly the state this harness exists to inspect — mounted, unmeasured.
-  if (!('ResizeObserver' in globalThis)) {
-    ;(globalThis as Record<string, unknown>).ResizeObserver = class {
-      observe() {}
-      unobserve() {}
-      disconnect() {}
+  ;(globalThis as Record<string, unknown>).ResizeObserver = class {
+    constructor(private readonly report: (entries: unknown[]) => void) {}
+    observe(target: Element) {
+      if (!measured) return
+      // Asynchronously, as a real observer reports: synchronously inside `observe` would
+      // set state during the layout effect that created it.
+      queueMicrotask(() => this.report([{ target, contentRect: measured }]))
+    }
+    unobserve() {}
+    disconnect() {}
+  }
+  /*
+   * happy-dom lays nothing out, so every element is zero by zero. A windowed grid asks its
+   * scroller how tall the viewport is and draws the days inside it — against a zero it
+   * draws an empty band, decides no month is on screen, and fetches nothing. So the same
+   * `measureAs` size answers here too, and the unmeasured default stays zero.
+   */
+  // Both prototypes: happy-dom defines these on `HTMLElement`, which would shadow an
+  // override placed only on `Element` — and `document.scrollingElement`, the one whose
+  // height decides how much of the grid is on screen, is an `HTMLElement`.
+  for (const prototype of [Element.prototype, HTMLElement.prototype]) {
+    for (const [property, side] of [
+      ['clientWidth', 'width'],
+      ['offsetWidth', 'width'],
+      ['clientHeight', 'height'],
+      ['offsetHeight', 'height'],
+    ] as const) {
+      Object.defineProperty(prototype, property, {
+        configurable: true,
+        get: () => measured?.[side] ?? 0,
+      })
     }
   }
+
   ;(globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true
 }
 

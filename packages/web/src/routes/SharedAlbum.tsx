@@ -2,13 +2,16 @@ import type { Album, Asset } from '@imogen/shared'
 import { useQuery } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import { useParams } from 'react-router'
-import { PhotoGrid } from '../components/PhotoGrid.tsx'
+import { TimelineBody, TimelineCount } from '../components/TimelineBody.tsx'
 import { Viewer } from '../components/Viewer.tsx'
 import { Wordmark } from '../components/Wordmark.tsx'
-import { useGridLayout } from '../hooks/useGridLayout.ts'
-import { useAssetTable } from '../hooks/useTimeline.ts'
-import { useViewerParam } from '../hooks/useViewerParam.ts'
+import type { TimelineSource } from '../hooks/useTimeline.ts'
+import { useTimelineGrid } from '../hooks/useTimelineGrid.ts'
+import { useTimelineViewer } from '../hooks/useTimelineViewer.ts'
 import { ShareAssetUrls } from '../lib/assetUrls.tsx'
+
+/** A share is one album by construction, so it is asked for with no filter of its own. */
+const NO_FILTER = {}
 
 type ShareResponse =
   | { locked: true }
@@ -19,12 +22,40 @@ type ShareResponse =
       allowDownload: boolean
     }
 
+/**
+ * Everything this page fetches, through the slug and nothing else.
+ *
+ * A visitor has no session, so every one of these has to be a share-scoped URL: the
+ * album is fixed server-side from the link, and there is no request any of them could
+ * carry that would widen it. Reaching an authenticated endpoint from here would not
+ * merely fail — it would mean the page had been built to expect a session it must never
+ * have — so the fetches live in one place where that can be seen at a glance.
+ */
+export function shareSource(slug: string): TimelineSource {
+  const get = async <T,>(path: string, query: Record<string, string> = {}): Promise<T> => {
+    const search = new URLSearchParams(query).toString()
+    const response = await fetch(`/api/v1/share/${slug}${path}${search ? `?${search}` : ''}`)
+    if (!response.ok) throw new Error('That link is not valid, or it has expired')
+    return response.json() as Promise<T>
+  }
+  return {
+    key: `share:${slug}`,
+    timeline: (query) => get('/timeline', query.covers ? { covers: 'true' } : {}),
+    bucket: (query) =>
+      get('/timeline/bucket', {
+        period: query.period,
+        ...(query.cursor ? { cursor: query.cursor } : {}),
+      }),
+    // No `stats`: there is no public library count to watch, and asking for one would be
+    // an authenticated request from a page that has no business making any.
+  }
+}
+
 /** A public album. No account, no session — the slug is the only credential. */
 export function SharedAlbum() {
   const { slug = '' } = useParams()
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const { openId, open: openPhoto, replace: showPhoto, close: closePhoto } = useViewerParam()
 
   const { data, refetch, isPending } = useQuery<ShareResponse>({
     queryKey: ['share', slug],
@@ -37,9 +68,30 @@ export function SharedAlbum() {
     retry: false,
   })
 
-  const { attachContainer, options } = useGridLayout()
-  const photographs = useMemo(() => (data && !data.locked ? data.album.assets : []), [data])
-  const { table, tiles } = useAssetTable(photographs, options)
+  const source = useMemo(() => shareSource(slug), [slug])
+  /*
+   * The grid is the share's own timeline, not `album.assets`.
+   *
+   * That array is a capped cover sample, and the subtitle used to be `assets.length` — so
+   * a shared album of thirty thousand photographs read "60 photos" over sixty tiles and
+   * was perfectly self-consistent about it. Neither the recipient nor the sender had
+   * anything to notice. The count now comes from the spine, which counts the album.
+   */
+  const grid = useTimelineGrid(NO_FILTER, {
+    source,
+    // A locked album has a password prompt where its grid goes, and nothing to fetch until
+    // that is answered.
+    enabled: Boolean(data) && data?.locked === false,
+  })
+  const viewer = useTimelineViewer({
+    ...grid,
+    scope: source.key,
+    fetchAsset: async (id) => {
+      const response = await fetch(`/api/v1/share/${slug}/assets/${id}`)
+      if (!response.ok) throw new Error('That photo is not part of this album')
+      return response.json() as Promise<Asset>
+    },
+  })
 
   async function unlock(event: React.FormEvent) {
     event.preventDefault()
@@ -87,7 +139,6 @@ export function SharedAlbum() {
   }
 
   const assets = data.album.assets
-  const openIndex = openId ? assets.findIndex((a) => a.id === openId) : -1
 
   // A filename is an identifier, not a title. Whatever the owner wrote about the
   // photograph is the better thing to lead with when there is one.
@@ -99,7 +150,7 @@ export function SharedAlbum() {
         month: 'long',
         day: 'numeric',
       })
-    : `${assets.length} ${assets.length === 1 ? 'photo' : 'photos'}`
+    : null
 
   return (
     <ShareAssetUrls slug={slug} allowDownload={data.allowDownload}>
@@ -119,9 +170,16 @@ export function SharedAlbum() {
         </header>
 
         <main className="mx-auto w-full max-w-[1600px] flex-1 px-4 py-8 md:px-8">
-          <div className="mb-7">
+          <div className="mb-7 pr-11">
             <h1 className="heading-display text-2xl md:text-[28px]">{title}</h1>
-            {subtitle && <p className="label-micro mt-1">{subtitle}</p>}
+            {subtitle ? (
+              <p className="label-micro mt-1">{subtitle}</p>
+            ) : (
+              <TimelineCount
+                totalCount={grid.totalCount}
+                onShowOverview={() => grid.setShowingOverview(true)}
+              />
+            )}
           </div>
 
           {/*
@@ -132,7 +190,7 @@ export function SharedAlbum() {
           {data.kind === 'photo' && assets[0] ? (
             <button
               type="button"
-              onClick={() => openPhoto(assets[0]!.id)}
+              onClick={() => viewer.open(assets[0]!.id)}
               className="block w-full max-w-3xl overflow-hidden rounded-xl border border-line bg-sunken"
             >
               <img
@@ -142,13 +200,15 @@ export function SharedAlbum() {
               />
             </button>
           ) : (
-            <PhotoGrid
-              table={table}
-              tiles={tiles}
-              options={options}
-              attachContainer={attachContainer}
-              onOpen={(tile) => openPhoto(tile.id)}
-              onToggleSelect={() => {}}
+            <TimelineBody
+              grid={grid}
+              filter={NO_FILTER}
+              source={source}
+              empty={{
+                headline: 'Nothing here yet',
+                body: 'This album has no photos in it.',
+              }}
+              onOpen={(tile) => viewer.open(tile.id)}
               // A visitor has nothing to do with a selection: there is no bar to act on it.
               selectable={false}
             />
@@ -170,14 +230,14 @@ export function SharedAlbum() {
           </div>
         </footer>
 
-        {openIndex >= 0 && assets[openIndex] && (
+        {viewer.asset && (
           <Viewer
-            asset={assets[openIndex]}
-            hasPrevious={openIndex > 0}
-            hasNext={openIndex < assets.length - 1}
-            onClose={() => closePhoto()}
-            onPrevious={() => showPhoto(assets[openIndex - 1]?.id ?? '')}
-            onNext={() => showPhoto(assets[openIndex + 1]?.id ?? '')}
+            asset={viewer.asset}
+            hasPrevious={viewer.hasPrevious}
+            hasNext={viewer.hasNext}
+            onClose={viewer.close}
+            onPrevious={() => viewer.step(-1)}
+            onNext={() => viewer.step(1)}
             onToggleFavorite={() => {}}
             onTrash={() => {}}
             editable={false}

@@ -57,14 +57,33 @@ export function AlbumPicker({
    * select-all cannot be expressed in it — the album is made empty and then filled through
    * the endpoint that does understand a filter. The alternative was resolving the filter to
    * ids in the browser, which is the request this whole selection shape exists to avoid.
+   *
+   * The pair is not atomic and cannot be made so from here, so the failure is handled
+   * rather than hidden. If the fill fails, the empty album it just made is removed again:
+   * an album the user never asked for, left behind under a name they typed, is worse than
+   * the error itself — they would go looking for their photographs inside it. If even the
+   * removal fails the album survives, and the message says so, because the one thing this
+   * must not do is claim a tidy failure it did not achieve.
    */
   const createWith = useMutation({
     mutationFn: async () => {
       const album = await imogen.albums.create({ name: name.trim() })
-      const result = await imogen.albums.addAssets(album.id, selection)
-      return { album, result }
+      try {
+        return { album, result: await imogen.albums.addAssets(album.id, selection) }
+      } catch (cause) {
+        try {
+          await imogen.albums.remove(album.id)
+        } catch {
+          throw new Error(
+            `Those photos could not be added, and the empty "${album.name}" album could not be removed again. It is on your Albums page.`,
+          )
+        }
+        throw cause
+      }
     },
     onSuccess: ({ album, result }) => finish(result.added, result.skipped, album.name),
+    // Whatever happened, the album list may have changed under us.
+    onError: () => void queryClient.invalidateQueries({ queryKey: ['albums'] }),
   })
 
   // Escape closes, like every other transient thing in this app.

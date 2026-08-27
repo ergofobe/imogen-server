@@ -112,6 +112,16 @@ export type SelectionState = {
   selecting: boolean
   isSelected: (id: string) => boolean
   toggle: (id: string, shiftKey?: boolean) => void
+  /**
+   * False when "select all" could not honestly mean all of them.
+   *
+   * A view with a filter can always say everything in one request. A view without one —
+   * the vault — can only name the ids it is holding, and now that the vault windows, the
+   * ids it is holding are the months on screen rather than its contents. Offering a
+   * button that selects three hundred of two thousand, under a header that says two
+   * thousand, is the same defect as a grid that draws sixty of thirty thousand.
+   */
+  canSelectAll: boolean
   selectAll: () => void
   clear: () => void
   toRequest: () => AssetSelection
@@ -179,6 +189,7 @@ export function useSelection(options: {
   const count = useMemo(() => resolvedCount(selection, totalCount), [selection, totalCount])
 
   return {
+    canSelectAll: query !== null || orderedIds.length === totalCount,
     selection,
     count,
     // Under select-all with everything unticked there is nothing selected and no bar, even

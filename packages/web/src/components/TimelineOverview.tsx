@@ -1,8 +1,8 @@
 import type { AssetFilter } from '@imogen/shared'
 import { useQuery } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { LIBRARY_SOURCE, type TimelineSource } from '../hooks/useTimeline.ts'
 import { useAssetUrls } from '../lib/assetUrls.tsx'
-import { imogen } from '../lib/client.ts'
 import { formatMonthKey } from '../lib/format.ts'
 import { scrollGridTo } from '../lib/scroller.ts'
 import { offsetForDate, type SegmentTable } from '../lib/timelineLayout.ts'
@@ -26,6 +26,8 @@ type Props = {
   table: SegmentTable
   /** The filter the timeline is showing, so the covers spine describes the same library. */
   filter: Partial<AssetFilter>
+  /** And the same scope: the vault and a shared link are not the signed-in library. */
+  source?: TimelineSource
   /** The grid, so landing on a month writes the same scroll position `PhotoGrid` reads. */
   grid: HTMLElement | null
   onClose: () => void
@@ -45,7 +47,7 @@ type Props = {
  * load, on every device, carry a payload for a panel most loads never open. Deferring the
  * cost to the moment someone asks for it is the whole trade.
  */
-export function TimelineOverview({ table, filter, grid, onClose }: Props) {
+export function TimelineOverview({ table, filter, source = LIBRARY_SOURCE, grid, onClose }: Props) {
   const { url } = useAssetUrls()
   const [year, setYear] = useState<string | null>(null)
   const closeButton = useRef<HTMLButtonElement>(null)
@@ -76,8 +78,8 @@ export function TimelineOverview({ table, filter, grid, onClose }: Props) {
    * is.
    */
   const covers = useQuery({
-    queryKey: ['timelineCovers', filter],
-    queryFn: () => imogen.assets.timeline({ ...filter, covers: true }),
+    queryKey: ['timelineCovers', source.key, filter],
+    queryFn: () => source.timeline({ ...filter, covers: true }),
     staleTime: 30_000,
   })
 

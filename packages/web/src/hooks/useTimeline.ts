@@ -4,7 +4,6 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { imogen } from '../lib/client.ts'
 import {
   buildSegments,
-  groupTilesByDay,
   type LayoutOptions,
   periodOf,
   type SegmentTable,
@@ -77,18 +76,73 @@ type LoadedTiles = {
 const NOTHING_LOADED: LoadedTiles = { byDay: new Map(), periods: [] }
 const NO_BUCKETS: TimelineBucket[] = []
 
-export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions): TimelineWindow {
+/**
+ * Where a timeline's two calls go.
+ *
+ * Almost every view is the library under a filter and uses the default below. Two are
+ * not, and cannot be, because their scope is exactly the thing `AssetFilter` refuses to
+ * express: the vault, which no filter may reach, and a public share, which has no session
+ * to filter with. Both are scoped server-side instead — by the unlock, by the slug — and
+ * both then want the same windowed grid as everything else. Handing the hook its two
+ * fetches is what lets them have it without the filter growing a field that would undo the
+ * guarantee it is making.
+ *
+ * `key` separates one scope's cache from another's, since two sources can be asked the
+ * same (empty) filter and must not share an answer.
+ *
+ * `stats` is optional and is what drives the library-count watch. A share has no
+ * authenticated stats endpoint to poll — asking would be a 401 every thirty seconds — and
+ * the vault's contents are deliberately absent from the library count, so neither
+ * supplies one and neither polls.
+ */
+export type TimelineSource = {
+  key: string
+  timeline: (query: Partial<AssetFilter> & { covers?: boolean }) => Promise<{
+    buckets: TimelineBucket[]
+  }>
+  bucket: (
+    query: Partial<AssetFilter> & { period: string; cursor?: string },
+  ) => Promise<{ items: TimelineTile[]; nextCursor: string | null }>
+  stats?: () => Promise<{ assetCount: number }>
+}
+
+/** The signed-in library under whatever filter the caller passes. */
+export const LIBRARY_SOURCE: TimelineSource = {
+  key: 'library',
+  timeline: (query) => imogen.assets.timeline(query),
+  bucket: (query) => imogen.assets.timelineBucket(query),
+  stats: () => imogen.assets.stats(),
+}
+
+export type TimelineOptions = {
+  source?: TimelineSource
+  /**
+   * False while the view has no right to ask yet — a locked vault, a share still behind
+   * its password. Hooks cannot be called conditionally, so the question is asked here
+   * rather than by not calling the hook, and nothing is fetched until it is true.
+   */
+  enabled?: boolean
+}
+
+export function useTimeline(
+  filter: Partial<AssetFilter>,
+  options: LayoutOptions,
+  { source = LIBRARY_SOURCE, enabled = true }: TimelineOptions = {},
+): TimelineWindow {
   const queryClient = useQueryClient()
 
   // Routes build their filter inline, so it is a new object on every render even when
   // nothing about it changed. Everything below keys on its content, not on its identity.
-  const filterKey = JSON.stringify(filter)
+  // The source's key rides along, because two scopes asked the same filter are two
+  // different questions with two different answers.
+  const filterKey = JSON.stringify([source.key, filter])
   // biome-ignore lint/correctness/useExhaustiveDependencies: keyed on the filter's content
   const query = useMemo(() => filter, [filterKey])
 
   const spine = useQuery({
-    queryKey: ['timeline', query],
-    queryFn: () => imogen.assets.timeline(query),
+    queryKey: ['timeline', source.key, query],
+    queryFn: () => source.timeline(query),
+    enabled,
     staleTime: 30_000,
   })
 
@@ -156,12 +210,12 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
         // follows the cursor to the end before any of it lands.
         fetchPeriod: (period) =>
           collectPeriod((cursor) =>
-            imogen.assets.timelineBucket({ ...query, period, ...(cursor ? { cursor } : {}) }),
+            source.bucket({ ...query, period, ...(cursor ? { cursor } : {}) }),
           ),
         deliver: (period, tiles) =>
           setLoaded((current) => absorb(current, period, tiles, pinned.current)),
       }),
-    [filterKey, query],
+    [filterKey, query, source],
   )
 
   // Rebuilt when the filter changes, which discards what the old one was tracking. Anything
@@ -175,12 +229,12 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
   )
 
   useEffect(() => {
-    if (suspended) return
+    if (suspended || !enabled) return
     for (const period of wanted) {
       if (loaded.periods.includes(period)) continue
       void periods.load(period)
     }
-  }, [wanted, suspended, loaded.periods, periods])
+  }, [wanted, suspended, enabled, loaded.periods, periods])
 
   /*
    * The tile map is not a query, so nothing invalidates it. When a fresh spine disagrees with
@@ -268,9 +322,14 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
    * cheap way to learn WHICH days moved, and a total that has moved is enough to know that
    * some did.
    */
+  const watchCount = source.stats
   const stats = useQuery({
     queryKey: ['stats'],
-    queryFn: () => imogen.assets.stats(),
+    queryFn: () => (watchCount as () => Promise<{ assetCount: number }>)(),
+    // A source with no stats endpoint does not poll one. A public share has no
+    // authenticated stats to ask for, and the vault's contents are deliberately absent
+    // from the library count, so a tick there would answer a question about somewhere else.
+    enabled: enabled && watchCount !== undefined,
     refetchInterval: STATS_POLL_MS,
     // Both set against this app's defaults, which turn focus refetching off and hold
     // everything for thirty seconds. Coming back to the tab after an import ran is exactly
@@ -306,36 +365,14 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
   return {
     table,
     tiles: loaded.byDay,
-    isPending: spine.isPending,
+    // A disabled query reports `isPending` forever, which would hold a skeleton on screen
+    // over a locked vault instead of its passphrase prompt.
+    isPending: enabled && spine.isPending,
     totalCount,
     requestPeriods,
     suspendFetching,
     reload,
   }
-}
-
-/**
- * The same table, for a view that already holds every photograph it will ever show — an
- * album, a person, the vault, a shared link. Those are bounded by construction, so there is
- * nothing to window and nothing to fetch: they want the geometry, not the machinery.
- */
-export function useAssetTable(
-  assets: TimelineTile[],
-  options: LayoutOptions,
-): { table: SegmentTable; tiles: Map<string, TimelineTile[]> } {
-  const measured = useRef(new Map<string, number>())
-
-  const tiles = useMemo(() => groupTilesByDay(assets), [assets])
-  const table = useMemo(() => {
-    const buckets = [...tiles].map(([date, dayTiles]) => ({
-      date,
-      count: dayTiles.length,
-      coverAssetId: null,
-    }))
-    return buildSegments(buckets, tiles, options, measured.current)
-  }, [tiles, options])
-
-  return { table, tiles }
 }
 
 function absorb(

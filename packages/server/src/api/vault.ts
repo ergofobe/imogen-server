@@ -1,5 +1,12 @@
 import { createRoute, OpenAPIHono, z } from '@hono/zod-openapi'
-import { Asset, AssetSelection, pageOf } from '@imogen/shared'
+import {
+  Asset,
+  AssetSelection,
+  pageOf,
+  TimelineBucket,
+  TimelineBucketQuery,
+  TimelineTile,
+} from '@imogen/shared'
 import type { Context } from 'hono'
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie'
 import { type AppEnv, requireAuth } from '../auth/middleware.ts'
@@ -150,7 +157,16 @@ export function createVaultRoutes() {
 
   // --- Everything past here needs the vault actually open ---
 
-  app.use('/assets', async (c, next) => {
+  /*
+   * Every path below, not just `/assets`.
+   *
+   * This used to name one path, which was correct while `/assets` was the only thing under
+   * here that revealed anything. Adding `/timeline` under a gate spelled as a literal path
+   * added an unlocked way to read the vault's shape — its day counts, its tiles, its ids —
+   * and the gate said nothing, because it had been asked about a different URL. A wildcard
+   * cannot be outrun by the next route somebody adds.
+   */
+  app.use('*', async (c, next) => {
     if (!vaultIsOpen(c)) throw forbidden('The vault is locked')
     await next()
   })
@@ -160,19 +176,94 @@ export function createVaultRoutes() {
       method: 'get',
       path: '/assets',
       tags: ['Vault'],
-      summary: 'What is in the vault',
+      summary: 'A sample of what is in the vault, newest first',
+      description:
+        'Capped at `limit`. `total` is the true size, so a caller can tell the two apart. ' +
+        'The vault page itself reads `/vault/timeline` and windows over it; this is for ' +
+        'anything that wants a handful of recent rows without laying out a grid.',
       security: security(),
       request: { query: z.object({ limit: z.coerce.number().int().min(1).max(500).default(200) }) },
       responses: { ...ok(pageOf(Asset), 'Assets in the vault'), ...ERROR_RESPONSES },
     }),
     async (c) => {
       const services = c.get('services')
-      const page = await services.vault.list(c.get('principal').user.id, {
+      const ownerId = c.get('principal').user.id
+      const page = await services.vault.list(ownerId, {
         limit: c.req.valid('query').limit,
         sort: 'capturedAt',
         order: 'desc',
       })
-      return c.json({ items: page.items, nextCursor: null, total: null }, 200)
+      /*
+       * `total` rather than the null this used to send. A null cursor beside a null total
+       * says "that is all of them", and for a vault holding more than `limit` that was
+       * simply untrue — the page drew two hundred photographs out of however many there
+       * were and nothing anywhere contradicted it. The cursor stays null because this
+       * endpoint does not page; `total` is what makes the cap visible instead of silent.
+       */
+      return c.json(
+        { items: page.items, nextCursor: null, total: await services.vault.count(ownerId) },
+        200,
+      )
+    },
+  )
+
+  /*
+   * The vault gets a spine of its own rather than a cursor on `/vault/assets`.
+   *
+   * A cursor would have made the listing complete, but it would have left the vault the
+   * one page in the application that cannot be scrubbed, cannot be zoomed out of, and has
+   * to be walked from the top to reach anything old. The vault is where somebody puts what
+   * they most need to find again, so it is the last place that should be a list you page
+   * through. A spine and a bucket endpoint are the same two calls every other view already
+   * makes, and they hand the vault the windowed grid, the rail and the overview for free.
+   *
+   * Nothing here reads a filter from the request. `AssetFilter` cannot express the vault
+   * by design, so the scoping is the separate `{ vaulted: true }` argument, applied after
+   * the unlock gate above — the same shape the share routes use to fix `albumId` from the
+   * link rather than from whoever is holding the URL.
+   */
+  app.openapi(
+    createRoute({
+      method: 'get',
+      path: '/timeline',
+      tags: ['Vault'],
+      summary: 'One row per day in the vault, for sizing the grid before tiles arrive',
+      security: security(),
+      request: { query: z.object({ covers: z.coerce.boolean().optional() }) },
+      responses: {
+        ...ok(z.object({ buckets: z.array(TimelineBucket) }), 'Day counts, newest first'),
+        ...ERROR_RESPONSES,
+      },
+    }),
+    async (c) => {
+      const services = c.get('services')
+      const buckets = await services.assets.timeline(
+        c.get('principal').user.id,
+        { covers: c.req.valid('query').covers },
+        { vaulted: true },
+      )
+      return c.json({ buckets }, 200)
+    },
+  )
+
+  app.openapi(
+    createRoute({
+      method: 'get',
+      path: '/timeline/bucket',
+      tags: ['Vault'],
+      summary: 'Every tile in one period of the vault',
+      security: security(),
+      request: {
+        query: TimelineBucketQuery.pick({ period: true, cursor: true, limit: true }),
+      },
+      responses: { ...ok(pageOf(TimelineTile), 'Tiles, newest first'), ...ERROR_RESPONSES },
+    }),
+    async (c) => {
+      const services = c.get('services')
+      const page = await services.assets.bucket(c.get('principal').user.id, c.req.valid('query'), {
+        vaulted: true,
+      })
+      return c.json(page, 200)
     },
   )
 

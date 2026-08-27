@@ -60,6 +60,16 @@ function decodeCursor(raw: string): Cursor | null {
   }
 }
 
+/**
+ * Scoping the caller supplies rather than the request does.
+ *
+ * `AssetFilter` is parsed from a query string, so anything expressible in it is
+ * expressible by whoever is holding the URL. The vault must never be one of those
+ * things — that is the whole of what the vault is — so "look inside the vault" lives
+ * here instead, where only server code that has already checked the unlock can say it.
+ */
+export type AssetScope = { vaulted?: boolean }
+
 export class AssetService {
   constructor(private readonly db: Database) {}
 
@@ -120,18 +130,27 @@ export class AssetService {
     return date.toISOString()
   }
 
-  private buildFilters(ownerId: string, query: AssetFilter): SQL[] {
+  private buildFilters(ownerId: string, query: AssetFilter, scope: AssetScope = {}): SQL[] {
     // The vault is not a filter anyone can turn off. Assets inside it are excluded from
-    // every ordinary listing, search, and count; the only way to see them is through
-    // VaultService, which requires a freshly unlocked session.
-    const conditions: SQL[] = [eq(assets.ownerId, ownerId), isNull(assets.vaultedAt)]
+    // every ordinary listing, search, and count; the only way to see them is through a
+    // caller that asks for `scope.vaulted`, which is a SEPARATE ARGUMENT and not a field
+    // of `AssetFilter` — so no request body can ever reach it, however it is parsed. The
+    // vault's own routes set it after their own gate, the way the share routes fix
+    // `albumId` from the link rather than from the request.
+    const conditions: SQL[] = [
+      eq(assets.ownerId, ownerId),
+      scope.vaulted ? isNotNull(assets.vaultedAt) : isNull(assets.vaultedAt),
+    ]
 
     conditions.push(query.trashed ? isNotNull(assets.deletedAt) : isNull(assets.deletedAt))
 
-    // Archived photos stay out of the timeline unless explicitly requested.
+    // Archived photos stay out of the timeline unless explicitly requested. The vault is
+    // not a timeline: it is everything you put there, and `VaultService.list` never made
+    // the distinction, so a vaulted photograph that was archived on its way in must not
+    // vanish from the one place its owner went looking for it.
     if (query.archived !== undefined) {
       conditions.push(eq(assets.archived, query.archived))
-    } else if (!query.trashed) {
+    } else if (!query.trashed && !scope.vaulted) {
       conditions.push(eq(assets.archived, false))
     }
 
@@ -312,8 +331,12 @@ export class AssetService {
     return rows.map((r) => r.id)
   }
 
-  async timeline(ownerId: string, query: TimelineQuery = {}): Promise<TimelineBucket[]> {
-    const conditions = this.buildFilters(ownerId, query)
+  async timeline(
+    ownerId: string,
+    query: TimelineQuery = {},
+    scope: AssetScope = {},
+  ): Promise<TimelineBucket[]> {
+    const conditions = this.buildFilters(ownerId, query, scope)
     const day = sql<string>`to_char(${assets.capturedAt} at time zone 'UTC', 'YYYY-MM-DD')`
 
     const rows = await this.db
@@ -348,14 +371,14 @@ export class AssetService {
    * ten fields and an `Asset` carries twenty-five, and over a heavy month that is the
    * difference between one round trip and several.
    */
-  async bucket(ownerId: string, query: TimelineBucketQuery) {
+  async bucket(ownerId: string, query: TimelineBucketQuery, scope: AssetScope = {}) {
     const { start, end } = periodBounds(query.period)
     // The condition set every query in this method starts from. A cursor predicate is
     // added only for the page query, below — never mutated onto this array — so the
     // count query can reuse it unmodified and stay the period total rather than
     // shrinking as the caller pages through.
     const base = [
-      ...this.buildFilters(ownerId, query),
+      ...this.buildFilters(ownerId, query, scope),
       gte(assets.capturedAt, start),
       lt(assets.capturedAt, end),
     ]

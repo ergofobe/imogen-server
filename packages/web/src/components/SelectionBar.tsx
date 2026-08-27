@@ -15,10 +15,13 @@ export function SelectionBar({
   onSelectAll,
   actions,
   refusal = null,
+  canSelectAll = true,
 }: {
   count: number
   onClear: () => void
   onSelectAll: () => void
+  /** When false the button is not offered, because it could not select all of them. */
+  canSelectAll?: boolean
   actions: Action[]
   /** Why the server would refuse this selection. Said plainly, and the actions go dead. */
   refusal?: string | null
@@ -41,13 +44,15 @@ export function SelectionBar({
 
         <span aria-hidden="true" className="mx-1 h-5 w-px bg-line" />
 
-        <button
-          type="button"
-          onClick={onSelectAll}
-          className="rounded-full px-3 py-1.5 text-sm text-muted transition hover:bg-sunken hover:text-ink"
-        >
-          Select all
-        </button>
+        {canSelectAll && (
+          <button
+            type="button"
+            onClick={onSelectAll}
+            className="rounded-full px-3 py-1.5 text-sm text-muted transition hover:bg-sunken hover:text-ink"
+          >
+            Select all
+          </button>
+        )}
 
         {actions.map((action) => (
           <button

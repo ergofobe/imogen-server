@@ -41,6 +41,41 @@ function toShareLink(row: typeof shareLinks.$inferSelect, publicUrl: string): Sh
   }
 }
 
+/**
+ * What it means for a photograph to be in an album, stated once.
+ *
+ * The `album_assets` row is not the answer on its own. Trashing a photograph only sets
+ * `deletedAt` and leaves the membership row behind; vaulting removes it today but as a
+ * side effect of `VaultService.moveIn` rather than as a promise; archiving touches
+ * neither. So a raw `count(album_assets)` is the number of rows, not the number of
+ * photographs anybody can see.
+ *
+ * These are exactly the terms `AssetService.buildFilters` selects an `albumId` under,
+ * and they have to stay exactly those. The album page now reads its grid from the
+ * timeline under an `albumId` filter and resolves a select-all through the same filter,
+ * so a count that disagreed would put one number in the header, a different number of
+ * tiles under it, and a third in the confirmation before a destructive action. That is
+ * the failure this constant exists to make impossible: three definitions of "in this
+ * album" is three chances to disagree.
+ */
+export function inAlbum(albumId: string) {
+  return and(
+    eq(albumAssets.albumId, albumId),
+    isNull(assets.deletedAt),
+    isNull(assets.vaultedAt),
+    eq(assets.archived, false),
+  )
+}
+
+/** The membership count above, as one number. */
+function countIn(db: Database, albumId: string) {
+  return db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(albumAssets)
+    .innerJoin(assets, eq(assets.id, albumAssets.assetId))
+    .where(inAlbum(albumId))
+}
+
 const SHARE_PASSWORD_HASH = { algorithm: 'argon2id', memoryCost: 19456, timeCost: 2 } as const
 
 function hashSharePassword(password: string): Promise<string> {
@@ -84,12 +119,21 @@ export class AlbumService {
     const rows = await this.db
       .select({
         album: albums,
-        assetCount: sql<number>`count(${albumAssets.assetId})::int`,
+        // Counted through the join, not off `album_assets` alone — see `inAlbum`. The
+        // filter lives in the aggregate because this is a LEFT join: moving it into the
+        // WHERE clause would drop every empty album from the listing entirely.
+        assetCount: sql<number>`count(*) filter (
+          where ${albumAssets.assetId} is not null
+            and ${assets.deletedAt} is null
+            and ${assets.vaultedAt} is null
+            and ${assets.archived} = false
+        )::int`,
         shareSlug: sql<string | null>`max(${shareLinks.slug})`,
         cover: coverAssetId,
       })
       .from(albums)
       .leftJoin(albumAssets, eq(albumAssets.albumId, albums.id))
+      .leftJoin(assets, eq(assets.id, albumAssets.assetId))
       .leftJoin(shareLinks, and(eq(shareLinks.albumId, albums.id), isNull(shareLinks.revokedAt)))
       .where(eq(albums.ownerId, ownerId))
       .groupBy(albums.id)
@@ -109,10 +153,7 @@ export class AlbumService {
     if (!row) throw notFound('No such album')
     if (row.ownerId !== ownerId) throw forbidden('That album belongs to someone else')
 
-    const [counted] = await this.db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(albumAssets)
-      .where(eq(albumAssets.albumId, albumId))
+    const [counted] = await countIn(this.db, albumId)
     const [share] = await this.db
       .select({ slug: shareLinks.slug })
       .from(shareLinks)
@@ -128,9 +169,7 @@ export class AlbumService {
       .select({ asset: assets })
       .from(albumAssets)
       .innerJoin(assets, eq(assets.id, albumAssets.assetId))
-      .where(
-        and(eq(albumAssets.albumId, albumId), isNull(assets.deletedAt), isNull(assets.vaultedAt)),
-      )
+      .where(inAlbum(albumId))
       /*
        * Newest first, the same as the timeline, and capped to `COVER_SAMPLE`.
        *
@@ -228,10 +267,7 @@ export class AlbumService {
 
     await this.db.update(albums).set({ updatedAt: new Date() }).where(eq(albums.id, albumId))
 
-    const [counted] = await this.db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(albumAssets)
-      .where(eq(albumAssets.albumId, albumId))
+    const [counted] = await countIn(this.db, albumId)
 
     return {
       added,
@@ -406,11 +442,7 @@ export class AlbumService {
     const [album] = await this.db.select().from(albums).where(eq(albums.id, link.albumId)).limit(1)
     if (!album) return null
 
-    const membership = and(
-      eq(albumAssets.albumId, link.albumId),
-      isNull(assets.deletedAt),
-      isNull(assets.vaultedAt),
-    )
+    const membership = inAlbum(link.albumId)
     // Same cap as `getWithAssets`: the public page is a cover, not a full download —
     // and `getWithAssets(...).assets` used to be this route's only defence against a
     // 24 MB reply too. The count below stays the true total; only the array is capped.
@@ -421,11 +453,7 @@ export class AlbumService {
       .where(membership)
       .orderBy(desc(assets.capturedAt), desc(assets.id))
       .limit(COVER_SAMPLE)
-    const [counted] = await this.db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(albumAssets)
-      .innerJoin(assets, eq(assets.id, albumAssets.assetId))
-      .where(membership)
+    const [counted] = await countIn(this.db, link.albumId)
 
     return {
       link,

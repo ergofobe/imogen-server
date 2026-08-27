@@ -1,24 +1,41 @@
-import type { Asset, AssetSelection } from '@imogen/shared'
+import type { AssetSelection } from '@imogen/shared'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useMemo, useState } from 'react'
-import { EmptyState } from '../components/EmptyState.tsx'
-import { PhotoGrid } from '../components/PhotoGrid.tsx'
+import { useState } from 'react'
 import { SelectionBar } from '../components/SelectionBar.tsx'
+import { TimelineBody, TimelineCount } from '../components/TimelineBody.tsx'
+import { TimelineSkeleton } from '../components/TimelineSkeleton.tsx'
 import { Viewer } from '../components/Viewer.tsx'
-import { useGridLayout } from '../hooks/useGridLayout.ts'
+import { useOverviewKey } from '../hooks/useOverviewKey.ts'
 import { useSelection } from '../hooks/useSelection.ts'
-import { useAssetTable } from '../hooks/useTimeline.ts'
-import { useViewerParam } from '../hooks/useViewerParam.ts'
+import type { TimelineSource } from '../hooks/useTimeline.ts'
+import { useTimelineGrid } from '../hooks/useTimelineGrid.ts'
+import { useTimelineViewer } from '../hooks/useTimelineViewer.ts'
 import { imogen } from '../lib/client.ts'
 
 /**
- * The vault. Photographs in here are absent from the timeline, from search, from albums,
- * from shared links, and from anything an AI assistant can reach — and getting in means
- * entering the vault passphrase again, even though you are already signed in.
+ * The vault's own spine.
+ *
+ * `AssetFilter` deliberately cannot express "inside the vault" — that refusal is what the
+ * vault IS — so the vault cannot be a filter on the library's timeline and has to be its
+ * own source instead, scoped server-side behind the unlock. No `stats`, because the
+ * library count the timeline watches excludes vaulted photographs on purpose: a tick here
+ * would be asking a question about somewhere else.
  */
+const VAULT_SOURCE: TimelineSource = {
+  key: 'vault',
+  timeline: (query) => imogen.vault.timeline({ covers: query.covers }),
+  bucket: (query) =>
+    imogen.vault.timelineBucket({
+      period: query.period,
+      ...(query.cursor ? { cursor: query.cursor } : {}),
+    }),
+}
+
+/** Nothing about the vault is a filter, so its timeline is asked for with no filter at all. */
+const NO_FILTER = {}
+
 export function VaultRoute() {
   const queryClient = useQueryClient()
-  const { openId, open: openPhoto, replace: showPhoto, close: closePhoto } = useViewerParam()
 
   const { data: status, isPending } = useQuery({
     queryKey: ['vault-status'],
@@ -27,36 +44,47 @@ export function VaultRoute() {
     staleTime: 0,
   })
 
-  const { data: assets } = useQuery({
-    queryKey: ['vault-assets'],
-    queryFn: () => imogen.vault.list(),
-    enabled: status?.unlocked === true,
-  })
+  const unlocked = status?.unlocked === true
+  // Nothing is asked for until the vault is actually open: its endpoints refuse a
+  // locked session, and a refusal is not a thing to go and collect on every mount.
+  const grid = useTimelineGrid(NO_FILTER, { source: VAULT_SOURCE, enabled: unlocked })
+  const viewer = useTimelineViewer({ ...grid, scope: 'vault' })
+  useOverviewKey(grid, viewer.openId)
 
-  const ids = useMemo(() => assets?.map((asset) => asset.id) ?? [], [assets])
   /*
-   * `query: null`, because the vault is deliberately absent from every filter there is —
-   * that absence is the feature. So select-all here names its ids, which is honest for a page
-   * the endpoint caps at a couple of hundred and which never windows.
+   * `query: null`, because the vault is deliberately absent from every filter there is.
+   * So select-all here names its ids rather than a filter — which is honest, and is why
+   * the ids come from the spine's own count of what is loaded rather than from a
+   * server-side resolve that no filter could perform.
    */
-  const { count, selecting, isSelected, toggle, clear, selectAll, toRequest, refusal } =
-    useSelection({ query: null, orderedIds: ids, totalCount: ids.length })
-
-  const { attachContainer, options } = useGridLayout()
-  const photographs = useMemo(() => assets ?? [], [assets])
-  const { table, tiles } = useAssetTable(photographs, options)
+  const selection = useSelection({
+    query: null,
+    orderedIds: grid.ids,
+    // The spine's own count, not the loaded ids' — which is what lets `canSelectAll`
+    // notice when the two differ and stop offering a select-all that would not be one.
+    totalCount: grid.totalCount,
+  })
 
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ['vault-status'] })
-    void queryClient.invalidateQueries({ queryKey: ['vault-assets'] })
+    void queryClient.invalidateQueries({ queryKey: ['asset'] })
     void queryClient.invalidateQueries({ queryKey: ['assets'] })
     void queryClient.invalidateQueries({ queryKey: ['timeline'] })
+    grid.reload()
   }
 
   const moveOut = useMutation({
-    mutationFn: (selection: AssetSelection) => imogen.vault.moveOut(selection),
+    mutationFn: (request: AssetSelection) => imogen.vault.moveOut(request),
     onSuccess: () => {
-      clear()
+      selection.clear()
+      refresh()
+    },
+  })
+
+  const trash = useMutation({
+    mutationFn: (request: AssetSelection) => imogen.assets.trash(request),
+    onSuccess: () => {
+      selection.clear()
       refresh()
     },
   })
@@ -66,19 +94,27 @@ export function VaultRoute() {
     onSuccess: refresh,
   })
 
-  if (isPending) return <div className="h-40 animate-pulse rounded-lg bg-sunken" />
+  if (isPending) return <TimelineSkeleton />
 
   if (!status?.configured) return <VaultSetup onDone={refresh} />
-  if (!status.unlocked) return <VaultLocked onUnlocked={refresh} />
-
-  const openIndex = openId && assets ? assets.findIndex((a) => a.id === openId) : -1
+  if (!unlocked) return <VaultLocked onUnlocked={refresh} />
 
   return (
     <>
-      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+      <div className="mb-5 flex flex-wrap items-center justify-between gap-3 pr-11">
         <div className="flex items-center gap-2.5">
           <LockIcon open />
           <h1 className="heading-display text-2xl md:text-[28px]">Vault</h1>
+          {/*
+            The count that was missing entirely. The vault page used to draw two hundred
+            photographs with nothing anywhere on it saying how many there were, so a vault
+            holding two thousand looked exactly like a vault holding two hundred — the
+            worst of the four, because nothing contradicted it.
+          */}
+          <TimelineCount
+            totalCount={grid.totalCount}
+            onShowOverview={() => grid.setShowingOverview(true)}
+          />
         </div>
         <div className="flex items-center gap-3">
           <span className="label-micro">Locks itself after 15 minutes</span>
@@ -92,52 +128,49 @@ export function VaultRoute() {
         </div>
       </div>
 
-      {assets && assets.length > 0 ? (
-        <PhotoGrid
-          table={table}
-          tiles={tiles}
-          options={options}
-          attachContainer={attachContainer}
-          isSelected={isSelected}
-          selecting={selecting}
-          onOpen={(tile) => openPhoto(tile.id)}
-          onToggleSelect={(tile, shiftKey) => toggle(tile.id, shiftKey)}
-        />
-      ) : (
-        <EmptyState
-          headline="The vault is empty"
-          body="Select photos in your library and choose Move to vault. They disappear from the timeline, from search, and from your assistants."
-        />
-      )}
+      <TimelineBody
+        grid={grid}
+        filter={NO_FILTER}
+        source={VAULT_SOURCE}
+        empty={{
+          headline: 'The vault is empty',
+          body: 'Select photos in your library and choose Move to vault. They disappear from the timeline, from search, and from your assistants.',
+        }}
+        isSelected={selection.isSelected}
+        selecting={selection.selecting}
+        onOpen={(tile) => viewer.open(tile.id)}
+        onToggleSelect={(tile, shiftKey) => selection.toggle(tile.id, shiftKey)}
+      />
 
-      {selecting && (
+      {selection.selecting && (
         <SelectionBar
-          count={count}
-          onClear={clear}
-          onSelectAll={selectAll}
-          refusal={refusal}
+          count={selection.count}
+          onClear={selection.clear}
+          onSelectAll={selection.selectAll}
+          canSelectAll={selection.canSelectAll}
+          refusal={selection.refusal}
           actions={[
             {
               label: 'Move out of vault',
-              onClick: () => moveOut.mutate(toRequest()),
+              onClick: () => moveOut.mutate(selection.toRequest()),
               icon: 'M12 15V5m0 0 4 4m-4-4-4 4M5 19h14',
             },
           ]}
         />
       )}
 
-      {openIndex >= 0 && assets?.[openIndex] && (
+      {viewer.asset && (
         <Viewer
-          asset={assets[openIndex] as Asset}
-          hasPrevious={openIndex > 0}
-          hasNext={openIndex < assets.length - 1}
-          onClose={() => closePhoto()}
-          onPrevious={() => showPhoto(assets[openIndex - 1]?.id ?? '')}
-          onNext={() => showPhoto(assets[openIndex + 1]?.id ?? '')}
+          asset={viewer.asset}
+          hasPrevious={viewer.hasPrevious}
+          hasNext={viewer.hasNext}
+          onClose={viewer.close}
+          onPrevious={() => viewer.step(-1)}
+          onNext={() => viewer.step(1)}
           onToggleFavorite={() => {}}
           onTrash={(asset) => {
-            closePhoto()
-            void imogen.assets.trash({ assetIds: [asset.id] }).then(refresh)
+            viewer.close()
+            trash.mutate({ assetIds: [asset.id] })
           }}
         />
       )}

@@ -25,11 +25,40 @@ describe('SelectionBar', () => {
     expect(container.textContent).toContain('12,431 selected')
   })
 
-  test('does not pluralise one photograph into many', async () => {
+  test('leaves a small count alone rather than grouping it', async () => {
     const container = await render(
       <SelectionBar count={1} onClear={noop} onSelectAll={noop} actions={[TRASH]} />,
     )
     expect(container.textContent).toContain('1 selected')
+    expect(container.textContent).not.toContain('1.000')
+  })
+
+  /*
+   * The vault is the reason this exists. It cannot say "everything" as a filter, so its
+   * select-all can only name the months it happens to be holding — and a button that
+   * selects three hundred of two thousand under a header reading two thousand is the same
+   * defect as a grid that draws sixty of thirty thousand.
+   */
+  test('does not offer a select-all that could not select all of them', async () => {
+    const container = await render(
+      <SelectionBar
+        count={3}
+        onClear={noop}
+        onSelectAll={noop}
+        actions={[TRASH]}
+        canSelectAll={false}
+      />,
+    )
+    expect([...container.querySelectorAll('button')].map((b) => b.textContent)).not.toContain(
+      'Select all',
+    )
+    // The rest of the bar is untouched: this is a missing button, not a disabled bar.
+    expect(container.textContent).toContain('3 selected')
+    expect(
+      [...container.querySelectorAll('button')].some((b) =>
+        b.textContent?.includes('Move to trash'),
+      ),
+    ).toBe(true)
   })
 
   /*
