@@ -24,7 +24,15 @@ type Props = {
    * observer looking for it then would never find it.
    */
   attachContainer: (element: HTMLDivElement | null) => void
-  selected: Set<string>
+  /**
+   * A predicate rather than a set, because select-all is stored as the filter minus what was
+   * unticked. Under it every photograph in the library is selected and only a handful are
+   * named, so a set of the selected ids would be the very list that shape exists to avoid
+   * building.
+   */
+  isSelected?: (id: string) => boolean
+  /** Whether anything is selected at all, which is what puts a tile into selecting mode. */
+  selecting?: boolean
   onOpen: (tile: TimelineTile) => void
   onToggleSelect: (tile: TimelineTile, shiftKey: boolean) => void
   /** In grid coordinates, so the caller can turn it into the months worth fetching. */
@@ -48,6 +56,9 @@ const OVERSCAN = 1200
  */
 const BAND = OVERSCAN / 2
 
+/** A page with no selection needs one stable predicate rather than a new one every render. */
+const NOTHING_SELECTED = () => false
+
 /**
  * A window over the timeline: an element as tall as the whole library, with only the days
  * the viewport touches inside it.
@@ -61,7 +72,8 @@ export function PhotoGrid({
   tiles,
   options,
   attachContainer,
-  selected,
+  isSelected = NOTHING_SELECTED,
+  selecting = false,
   onOpen,
   onToggleSelect,
   onVisibleRangeChange,
@@ -158,8 +170,6 @@ export function PhotoGrid({
     [table, band],
   )
 
-  const selecting = selected.size > 0
-
   return (
     <div
       ref={attach}
@@ -182,7 +192,7 @@ export function PhotoGrid({
               <LoadedDay
                 tiles={dayTiles}
                 options={options}
-                selected={selected}
+                isSelected={isSelected}
                 selecting={selecting}
                 selectable={selectable}
                 onOpen={onOpen}
@@ -201,7 +211,7 @@ export function PhotoGrid({
 function LoadedDay({
   tiles,
   options,
-  selected,
+  isSelected,
   selecting,
   selectable,
   onOpen,
@@ -209,7 +219,7 @@ function LoadedDay({
 }: {
   tiles: TimelineTile[]
   options: LayoutOptions
-  selected: Set<string>
+  isSelected: (id: string) => boolean
   selecting: boolean
   selectable: boolean
   onOpen: (tile: TimelineTile) => void
@@ -244,7 +254,7 @@ function LoadedDay({
                 asset={tile}
                 width={item.width}
                 height={item.height}
-                selected={selected.has(item.id)}
+                selected={isSelected(item.id)}
                 selecting={selecting}
                 selectable={selectable}
                 onOpen={onOpen}

@@ -1,3 +1,4 @@
+import type { AssetSelection } from '@imogen/shared'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 import { imogen } from '../lib/client.ts'
@@ -14,11 +15,15 @@ import { imogen } from '../lib/client.ts'
  * already holding the rest.
  */
 export function AlbumPicker({
-  assetIds,
+  selection,
+  count,
   onClose,
   onDone,
 }: {
-  assetIds: string[]
+  /** Either the ids, or the filter the reader was looking at minus what they unticked. */
+  selection: AssetSelection
+  /** Resolved against the whole filter, so the heading is a number under select-all too. */
+  count: number
   onClose: () => void
   onDone: (message: string) => void
 }) {
@@ -43,13 +48,23 @@ export function AlbumPicker({
 
   const addToExisting = useMutation({
     mutationFn: (album: { id: string; name: string }) =>
-      imogen.albums.addAssets(album.id, assetIds).then((result) => ({ result, album })),
+      imogen.albums.addAssets(album.id, selection).then((result) => ({ result, album })),
     onSuccess: ({ result, album }) => finish(result.added, result.skipped, album.name),
   })
 
+  /*
+   * Two calls rather than one. `POST /albums` takes an id list and nothing else, so a
+   * select-all cannot be expressed in it — the album is made empty and then filled through
+   * the endpoint that does understand a filter. The alternative was resolving the filter to
+   * ids in the browser, which is the request this whole selection shape exists to avoid.
+   */
   const createWith = useMutation({
-    mutationFn: () => imogen.albums.create({ name: name.trim(), assetIds }),
-    onSuccess: (album) => finish(assetIds.length, 0, album.name),
+    mutationFn: async () => {
+      const album = await imogen.albums.create({ name: name.trim() })
+      const result = await imogen.albums.addAssets(album.id, selection)
+      return { album, result }
+    },
+    onSuccess: ({ album, result }) => finish(result.added, result.skipped, album.name),
   })
 
   // Escape closes, like every other transient thing in this app.
@@ -76,7 +91,7 @@ export function AlbumPicker({
       >
         <div className="mb-3 flex items-baseline justify-between gap-3">
           <h2 className="heading-display text-base">
-            Add {assetIds.length} {assetIds.length === 1 ? 'photo' : 'photos'} to
+            Add {count.toLocaleString()} {count === 1 ? 'photo' : 'photos'} to
           </h2>
           <button
             type="button"

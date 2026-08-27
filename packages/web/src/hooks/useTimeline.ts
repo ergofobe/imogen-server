@@ -16,6 +16,7 @@ import {
   evictPeriods,
   mergeDays,
   periodsOutOfDate,
+  periodsSettling,
   periodsToFetch,
 } from './timelineWindow.ts'
 
@@ -26,10 +27,22 @@ export {
   createPeriodLoader,
   evictPeriods,
   MAX_LOADED_PERIODS,
+  MAX_SETTLING_PERIODS,
   mergeDays,
   periodsOutOfDate,
+  periodsSettling,
   periodsToFetch,
 } from './timelineWindow.ts'
+
+/** Fast enough that a thumbnail appearing feels immediate, slow enough to be nearly free. */
+const SETTLING_POLL_MS = 2000
+
+/**
+ * A backfill takes hours and nobody watches it. Half a minute between counts is soon enough
+ * to notice, and thirty seconds of a few dozen bytes is not traffic anybody has to think
+ * about.
+ */
+const STATS_POLL_MS = 30_000
 
 /**
  * The timeline as a window rather than as a list.
@@ -185,9 +198,31 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
    * re-run this on its own result, and only a fresh spine can make a loaded month stale.
    */
   useEffect(() => {
+    /*
+     * Held off while the rail is being dragged. A spine reply that was already in the air
+     * when the drag began lands mid-drag, and the repair it triggers is a bucket request per
+     * stale month during a gesture whose whole promise is that it makes none.
+     *
+     * `suspended` is a dependency rather than a bare read, and that is the part that makes
+     * deferring safe: lifting the drag re-runs this effect against the same `buckets`, and
+     * `periodsOutOfDate` recomputes from the map as it stands then. A deferred repair with
+     * nothing to re-trigger it would be worse than the request it saved — the spine does not
+     * change a second time, so the disagreement would simply stand.
+     */
+    if (suspended) return
     for (const period of periodsOutOfDate(buckets, loadedNow.current)) void periods.reload(period)
-  }, [buckets, periods])
+  }, [buckets, periods, suspended])
 
+  /*
+   * After a mutation. The prefix matches every filter's spine and that is deliberate: trashing
+   * a photograph changes what All, Favourites and Trash each select, so all of their cached
+   * day counts are wrong now. React Query refetches only the active one and marks the rest
+   * stale, which costs one spine.
+   *
+   * This is affordable because it is rare. It used to be called by a two-second timer, at
+   * which point "one spine per call" became a 69KB refetch every two seconds during exactly
+   * the import it was meant to follow. Nothing calls it on a timer any more.
+   */
   const reload = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ['timeline'] })
     for (const period of loadedNow.current.periods) void periods.reload(period)
@@ -195,22 +230,67 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
 
   /*
    * An upload lands as `pending` and a background worker thumbnails it, so the timeline has
-   * to find out when that finishes. Polling runs only while something in hand is actually
-   * in flight and stops the moment it settles — no upload, no traffic.
+   * to find out when that finishes and nothing tells it. It asks the months holding
+   * unfinished work, at most two of them, and asks nothing at all when there are none — so a
+   * library that is not importing anything is a library making no requests.
    */
-  const settling = useMemo(
-    () =>
-      [...loaded.byDay.values()].some((day) =>
-        day.some((tile) => tile.status === 'pending' || tile.status === 'processing'),
-      ),
-    [loaded.byDay],
-  )
+  const settling = useMemo(() => periodsSettling(loaded), [loaded])
+  const settlingKey = settling.join(',')
+
+  // Read through a ref rather than closed over, so a month settling out of the set changes
+  // what the next tick asks for without tearing the interval down and restarting its two
+  // seconds. The key above is what decides whether the interval itself has to be rebuilt.
+  const settlingNow = useRef(settling)
+  settlingNow.current = settling
 
   useEffect(() => {
-    if (!settling || suspended) return
-    const timer = setInterval(reload, 2000)
+    if (settlingKey === '' || suspended) return
+    const timer = setInterval(() => {
+      // `load` rather than `reload`: a tick arriving while that month is still being fetched
+      // is a duplicate, and the flight already in the air is answering the current question.
+      // `reload` is for a mutation, where the flight in the air predates it.
+      for (const period of settlingNow.current) void periods.load(period)
+    }, SETTLING_POLL_MS)
     return () => clearInterval(timer)
-  }, [settling, suspended, reload])
+  }, [settlingKey, suspended, periods])
+
+  /*
+   * Whether the library has changed under us, asked as a count rather than as a spine.
+   *
+   * The spine is the expensive thing here — one row per day over twenty years, 69KB today
+   * and projected past 370KB at this library's eventual size — and refetching it on a timer
+   * to find out whether it changed is most of the traffic this hook used to generate. The
+   * stats endpoint answers the same question in a few dozen bytes.
+   *
+   * The count and not the head, and the whole spine and not one month, because a backfill
+   * does not land at the head: importing an old shoebox of scans puts photographs in 1997,
+   * so the day counts move all over the timeline rather than at the top of it. There is no
+   * cheap way to learn WHICH days moved, and a total that has moved is enough to know that
+   * some did.
+   */
+  const stats = useQuery({
+    queryKey: ['stats'],
+    queryFn: () => imogen.assets.stats(),
+    refetchInterval: STATS_POLL_MS,
+    // Both set against this app's defaults, which turn focus refetching off and hold
+    // everything for thirty seconds. Coming back to the tab after an import ran is exactly
+    // when this question is worth asking.
+    refetchOnWindowFocus: true,
+    staleTime: 0,
+  })
+
+  const lastSeenAssetCount = useRef<number | null>(null)
+  const assetCount = stats.data?.assetCount ?? null
+
+  useEffect(() => {
+    if (assetCount === null) return
+    const before = lastSeenAssetCount.current
+    lastSeenAssetCount.current = assetCount
+    // The first reading is a baseline rather than a change. Invalidating on it would have
+    // every mount refetch the spine it has only just fetched.
+    if (before === null || before === assetCount) return
+    void queryClient.invalidateQueries({ queryKey: ['timeline'] })
+  }, [assetCount, queryClient])
 
   const table = useMemo(
     () => buildSegments(buckets, loaded.byDay, options, measured.current),

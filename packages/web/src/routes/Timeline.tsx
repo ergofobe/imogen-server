@@ -1,4 +1,4 @@
-import type { Asset, AssetFilter, TimelineTile } from '@imogen/shared'
+import type { Asset, AssetFilter, AssetSelection, TimelineTile } from '@imogen/shared'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
@@ -54,10 +54,24 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
   /** Only the loaded months, but in true timeline order rather than in arrival order. */
   const ordered = useMemo(() => tilesInTimelineOrder(table, tiles), [table, tiles])
   const ids = useMemo(() => ordered.map((tile) => tile.id), [ordered])
-  const { selected, toggle, clear, selectAll } = useSelection(ids)
+  /*
+   * The selection is a view of the FILTER, not of the loaded ids. `ids` is only the months in
+   * hand, which is what shift-clicking a range walks along and nothing else; `totalCount` is
+   * the spine's, so select-all resolves against the whole library rather than the window.
+   */
+  const { count, selecting, isSelected, toggle, clear, selectAll, toRequest, refusal } =
+    useSelection({ query, orderedIds: ids, totalCount })
 
   const [pickingAlbum, setPickingAlbum] = useState(false)
-  const [confirmingTrash, setConfirmingTrash] = useState<string[] | null>(null)
+  /*
+   * The request and its count are taken when the dialog opens rather than read when it is
+   * confirmed. What the reader agreed to is the number they were shown, and a selection that
+   * changed behind an open dialog would make the two different things.
+   */
+  const [confirmingTrash, setConfirmingTrash] = useState<{
+    request: AssetSelection
+    count: number
+  } | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
 
   // The confirmation says what happened and then gets out of the way.
@@ -98,7 +112,7 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
   })
 
   const trash = useMutation({
-    mutationFn: (assetIds: string[]) => imogen.assets.trash(assetIds),
+    mutationFn: (selection: AssetSelection) => imogen.assets.trash(selection),
     onSuccess: () => {
       clear()
       refresh()
@@ -111,13 +125,13 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
    */
   const navigate = useNavigate()
   const toVault = useMutation({
-    mutationFn: async (assetIds: string[]) => {
+    mutationFn: async (selection: AssetSelection) => {
       const status = await imogen.vault.status()
       if (!status.configured || !status.unlocked) {
         navigate('/vault')
         return { moved: 0 }
       }
-      return imogen.vault.moveIn(assetIds)
+      return imogen.vault.moveIn(selection)
     },
     onSuccess: () => {
       clear()
@@ -126,7 +140,7 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
   })
 
   const restore = useMutation({
-    mutationFn: (assetIds: string[]) => imogen.assets.restore(assetIds),
+    mutationFn: (selection: AssetSelection) => imogen.assets.restore(selection),
     onSuccess: () => {
       clear()
       refresh()
@@ -235,7 +249,8 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
           tiles={tiles}
           options={options}
           attachContainer={attachGrid}
-          selected={selected}
+          isSelected={isSelected}
+          selecting={selecting}
           onOpen={(tile) => openPhoto(tile.id)}
           onToggleSelect={(tile, shiftKey) => toggle(tile.id, shiftKey)}
           onVisibleRangeChange={onVisibleRangeChange}
@@ -255,17 +270,18 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
         />
       )}
 
-      {selected.size > 0 && (
+      {selecting && (
         <SelectionBar
-          count={selected.size}
+          count={count}
           onClear={clear}
           onSelectAll={selectAll}
+          refusal={refusal}
           actions={
             mode === 'trash'
               ? [
                   {
                     label: 'Restore',
-                    onClick: () => restore.mutate([...selected]),
+                    onClick: () => restore.mutate(toRequest()),
                     icon: 'M4 12a8 8 0 1 0 2.3-5.6M4 4v4h4',
                   },
                 ]
@@ -277,12 +293,12 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
                   },
                   {
                     label: 'Move to vault',
-                    onClick: () => toVault.mutate([...selected]),
+                    onClick: () => toVault.mutate(toRequest()),
                     icon: 'M4 11h16v9H4zM8 11V7a4 4 0 0 1 8 0v4',
                   },
                   {
                     label: 'Move to trash',
-                    onClick: () => setConfirmingTrash([...selected]),
+                    onClick: () => setConfirmingTrash({ request: toRequest(), count }),
                     icon: 'M5 7h14M9 7V5h6v2M7 7l1 12h8l1-12',
                   },
                 ]
@@ -292,23 +308,29 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
 
       {confirmingTrash && (
         <ConfirmDialog
+          /*
+           * The resolved figure, always. Under select-all this is the one place the reader
+           * finds out whether "everything" is the twelve photographs on screen or ninety
+           * thousand across twenty years, and a dialog that says "all photos" is asking them
+           * to agree to a number it declined to tell them.
+           */
           title={
-            confirmingTrash.length === 1
+            confirmingTrash.count === 1
               ? 'Move this photo to the trash?'
-              : `Move ${confirmingTrash.length} photos to the trash?`
+              : `Move ${confirmingTrash.count.toLocaleString()} photos to the trash?`
           }
           body={
-            confirmingTrash.length === 1
+            confirmingTrash.count === 1
               ? 'It leaves the timeline and every album. You can put it back from the trash until it is swept.'
               : 'They leave the timeline and every album. You can put them back from the trash until it is swept.'
           }
           confirmLabel="Move to trash"
           destructive
           onConfirm={() => {
-            const ids = confirmingTrash
+            const { request } = confirmingTrash
             setConfirmingTrash(null)
             closePhoto()
-            trash.mutate(ids)
+            trash.mutate(request)
           }}
           onCancel={() => setConfirmingTrash(null)}
         />
@@ -316,7 +338,8 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
 
       {pickingAlbum && (
         <AlbumPicker
-          assetIds={[...selected]}
+          selection={toRequest()}
+          count={count}
           onClose={() => setPickingAlbum(false)}
           onDone={(message) => {
             setPickingAlbum(false)
@@ -343,7 +366,7 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
           onToggleFavorite={(asset) => favourite.mutate(asset)}
           onTrash={(asset) => {
             closePhoto()
-            trash.mutate([asset.id])
+            trash.mutate({ assetIds: [asset.id] })
           }}
         />
       )}

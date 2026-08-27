@@ -9,9 +9,6 @@ import { useAssetTable } from '../hooks/useTimeline.ts'
 import { useViewerParam } from '../hooks/useViewerParam.ts'
 import { imogen } from '../lib/client.ts'
 
-/** A page with no selection still needs one object rather than a new Set every render. */
-const EMPTY_SELECTION = new Set<string>()
-
 export function PersonDetail() {
   const { id = '' } = useParams()
   const navigate = useNavigate()
@@ -150,7 +147,6 @@ export function PersonDetail() {
           tiles={tiles}
           options={options}
           attachContainer={attachContainer}
-          selected={EMPTY_SELECTION}
           onOpen={(tile) => openPhoto(tile.id)}
           onToggleSelect={() => {}}
         />
@@ -169,7 +165,7 @@ export function PersonDetail() {
           }}
           onTrash={(asset) => {
             closePhoto()
-            void imogen.assets.trash([asset.id]).then(refresh)
+            void imogen.assets.trash({ assetIds: [asset.id] }).then(refresh)
           }}
         />
       )}

@@ -8,9 +8,11 @@ import {
   createPeriodLoader,
   evictPeriods,
   MAX_LOADED_PERIODS,
+  MAX_SETTLING_PERIODS,
   mergeDays,
   neighbouringPeriod,
   periodsOutOfDate,
+  periodsSettling,
   periodsToFetch,
   tilesInTimelineOrder,
 } from './timelineWindow.ts'
@@ -810,5 +812,101 @@ describe('createGuardedPeriodFetch keys on what the filter says, not on the obje
     land([tile('a')])
     await inFlight
     expect(delivered).toEqual([['a']])
+  })
+})
+
+describe('periodsSettling', () => {
+  const tile = (id: string, status: TimelineTile['status']): TimelineTile => ({
+    id,
+    capturedAt: '2011-08-14T09:00:00.000Z',
+    width: 4032,
+    height: 3024,
+    type: 'image',
+    status,
+    favorite: false,
+    duration: null,
+    placeholderColor: null,
+    livePhotoVideoId: null,
+  })
+
+  const loaded = (periods: string[], byDay: Array<[string, TimelineTile[]]>) => ({
+    periods,
+    byDay: new Map(byDay),
+  })
+
+  test('a library with nothing unfinished has nothing to poll for', () => {
+    expect(
+      periodsSettling(
+        loaded(
+          ['2011-07', '2011-08'],
+          [
+            ['2011-07-02', [tile('a', 'ready')]],
+            ['2011-08-14', [tile('b', 'ready')]],
+          ],
+        ),
+      ),
+    ).toEqual([])
+  })
+
+  test('finds the period holding an upload that has not been thumbnailed', () => {
+    expect(
+      periodsSettling(
+        loaded(
+          ['2011-07', '2011-08'],
+          [
+            ['2011-07-02', [tile('a', 'ready')]],
+            ['2011-08-14', [tile('b', 'ready'), tile('c', 'pending')]],
+          ],
+        ),
+      ),
+    ).toEqual(['2011-08'])
+  })
+
+  test('counts a photograph mid-processing as unfinished too', () => {
+    expect(
+      periodsSettling(loaded(['2011-08'], [['2011-08-14', [tile('c', 'processing')]]])),
+    ).toEqual(['2011-08'])
+  })
+
+  /*
+   * The cap is what keeps a backfill from turning the poll back into a whole-library
+   * refetch: an import landing photographs across fifteen years leaves every loaded month
+   * unfinished at once, and asking for all of them every two seconds is the traffic this
+   * poll was narrowed to avoid.
+   */
+  test('asks for at most two months however many are unfinished', () => {
+    const periods = ['2011-05', '2011-06', '2011-07', '2011-08']
+    const days = periods.map(
+      (period) => [`${period}-14`, [tile(period, 'pending')]] as [string, TimelineTile[]],
+    )
+    expect(periodsSettling(loaded(periods, days))).toHaveLength(MAX_SETTLING_PERIODS)
+  })
+
+  /*
+   * `periods` is least-recently-used first, so the tail is what the reader has just been
+   * looking at. When the cap has to choose, it should choose the months on the reader's
+   * screen — those are the ones whose blank tiles they are waiting to see fill in.
+   */
+  test('chooses the months nearest the reader when it has to choose', () => {
+    const periods = ['2011-05', '2011-06', '2011-07', '2011-08']
+    const days = periods.map(
+      (period) => [`${period}-14`, [tile(period, 'pending')]] as [string, TimelineTile[]],
+    )
+    expect(periodsSettling(loaded(periods, days))).toEqual(['2011-07', '2011-08'])
+  })
+
+  test('skips a month that is loaded but has nothing unfinished in it', () => {
+    expect(
+      periodsSettling(
+        loaded(
+          ['2011-06', '2011-07', '2011-08'],
+          [
+            ['2011-06-02', [tile('a', 'pending')]],
+            ['2011-07-02', [tile('b', 'ready')]],
+            ['2011-08-14', [tile('c', 'pending')]],
+          ],
+        ),
+      ),
+    ).toEqual(['2011-06', '2011-08'])
   })
 })

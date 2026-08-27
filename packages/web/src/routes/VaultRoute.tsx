@@ -1,4 +1,4 @@
-import type { Asset } from '@imogen/shared'
+import type { Asset, AssetSelection } from '@imogen/shared'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import { EmptyState } from '../components/EmptyState.tsx'
@@ -33,8 +33,14 @@ export function VaultRoute() {
     enabled: status?.unlocked === true,
   })
 
-  const ids = assets?.map((a) => a.id) ?? []
-  const { selected, toggle, clear, selectAll } = useSelection(ids)
+  const ids = useMemo(() => assets?.map((asset) => asset.id) ?? [], [assets])
+  /*
+   * `query: null`, because the vault is deliberately absent from every filter there is —
+   * that absence is the feature. So select-all here names its ids, which is honest for a page
+   * the endpoint caps at a couple of hundred and which never windows.
+   */
+  const { count, selecting, isSelected, toggle, clear, selectAll, toRequest, refusal } =
+    useSelection({ query: null, orderedIds: ids, totalCount: ids.length })
 
   const { attachContainer, options } = useGridLayout()
   const photographs = useMemo(() => assets ?? [], [assets])
@@ -48,7 +54,7 @@ export function VaultRoute() {
   }
 
   const moveOut = useMutation({
-    mutationFn: (assetIds: string[]) => imogen.vault.moveOut(assetIds),
+    mutationFn: (selection: AssetSelection) => imogen.vault.moveOut(selection),
     onSuccess: () => {
       clear()
       refresh()
@@ -92,7 +98,8 @@ export function VaultRoute() {
           tiles={tiles}
           options={options}
           attachContainer={attachContainer}
-          selected={selected}
+          isSelected={isSelected}
+          selecting={selecting}
           onOpen={(tile) => openPhoto(tile.id)}
           onToggleSelect={(tile, shiftKey) => toggle(tile.id, shiftKey)}
         />
@@ -103,15 +110,16 @@ export function VaultRoute() {
         />
       )}
 
-      {selected.size > 0 && (
+      {selecting && (
         <SelectionBar
-          count={selected.size}
+          count={count}
           onClear={clear}
           onSelectAll={selectAll}
+          refusal={refusal}
           actions={[
             {
               label: 'Move out of vault',
-              onClick: () => moveOut.mutate([...selected]),
+              onClick: () => moveOut.mutate(toRequest()),
               icon: 'M12 15V5m0 0 4 4m-4-4-4 4M5 19h14',
             },
           ]}
@@ -129,7 +137,7 @@ export function VaultRoute() {
           onToggleFavorite={() => {}}
           onTrash={(asset) => {
             closePhoto()
-            void imogen.assets.trash([asset.id]).then(refresh)
+            void imogen.assets.trash({ assetIds: [asset.id] }).then(refresh)
           }}
         />
       )}

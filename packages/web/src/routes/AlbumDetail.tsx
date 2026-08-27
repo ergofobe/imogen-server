@@ -1,3 +1,4 @@
+import type { AssetSelection } from '@imogen/shared'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
@@ -19,7 +20,11 @@ export function AlbumDetail() {
   const queryClient = useQueryClient()
   const { openId, open: openPhoto, replace: showPhoto, close: closePhoto } = useViewerParam()
   const [sharing, setSharing] = useState(false)
-  const [confirmingTrash, setConfirmingTrash] = useState<string[] | null>(null)
+  // Taken when the dialog opens, so the reader confirms the number they were shown.
+  const [confirmingTrash, setConfirmingTrash] = useState<{
+    request: AssetSelection
+    count: number
+  } | null>(null)
 
   const { data: album, isPending } = useQuery({
     queryKey: ['album', id],
@@ -28,7 +33,13 @@ export function AlbumDetail() {
 
   // Hooks cannot wait for the album to arrive, so the ids are read defensively.
   const ids = useMemo(() => album?.assets.map((asset) => asset.id) ?? [], [album])
-  const { selected, toggle, clear, selectAll } = useSelection(ids)
+  /*
+   * `{ albumId }` is what this page is a view of, so select-all here is that filter rather
+   * than a list — which matters for an album past the thousand ids a request will carry, and
+   * for one whose assets the endpoint has not sent in full.
+   */
+  const { count, selecting, isSelected, toggle, clear, selectAll, toRequest, refusal } =
+    useSelection({ query: { albumId: id }, orderedIds: ids, totalCount: album?.assetCount ?? 0 })
 
   // The album is fetched whole, so the grid gets its geometry rather than its machinery.
   const { attachContainer, options } = useGridLayout()
@@ -42,7 +53,7 @@ export function AlbumDetail() {
 
   /** Takes photographs out of the album. They stay in the library. */
   const removeFromAlbum = useMutation({
-    mutationFn: (assetIds: string[]) => imogen.albums.removeAssets(id, assetIds),
+    mutationFn: (selection: AssetSelection) => imogen.albums.removeAssets(id, selection),
     onSuccess: () => {
       clear()
       refresh()
@@ -50,7 +61,7 @@ export function AlbumDetail() {
   })
 
   const trash = useMutation({
-    mutationFn: (assetIds: string[]) => imogen.assets.trash(assetIds),
+    mutationFn: (selection: AssetSelection) => imogen.assets.trash(selection),
     onSuccess: () => {
       clear()
       setConfirmingTrash(null)
@@ -137,26 +148,28 @@ export function AlbumDetail() {
           tiles={tiles}
           options={options}
           attachContainer={attachContainer}
-          selected={selected}
+          isSelected={isSelected}
+          selecting={selecting}
           onOpen={(tile) => openPhoto(tile.id)}
           onToggleSelect={(tile, shiftKey) => toggle(tile.id, shiftKey)}
         />
       )}
 
-      {selected.size > 0 && (
+      {selecting && (
         <SelectionBar
-          count={selected.size}
+          count={count}
           onClear={clear}
           onSelectAll={selectAll}
+          refusal={refusal}
           actions={[
             {
               label: 'Remove from album',
-              onClick: () => removeFromAlbum.mutate([...selected]),
+              onClick: () => removeFromAlbum.mutate(toRequest()),
               icon: 'M5 12h14',
             },
             {
               label: 'Move to trash',
-              onClick: () => setConfirmingTrash([...selected]),
+              onClick: () => setConfirmingTrash({ request: toRequest(), count }),
               icon: 'M5 7h14M9 7V5h6v2M7 7l1 12h8l1-12',
             },
           ]}
@@ -166,18 +179,18 @@ export function AlbumDetail() {
       {confirmingTrash && (
         <ConfirmDialog
           title={
-            confirmingTrash.length === 1
+            confirmingTrash.count === 1
               ? 'Move this photo to the trash?'
-              : `Move ${confirmingTrash.length} photos to the trash?`
+              : `Move ${confirmingTrash.count.toLocaleString()} photos to the trash?`
           }
           body={
-            confirmingTrash.length === 1
+            confirmingTrash.count === 1
               ? 'It leaves the timeline and every album. You can put it back from the trash until it is swept.'
               : 'They leave the timeline and every album. You can put them back from the trash until it is swept.'
           }
           confirmLabel="Move to trash"
           destructive
-          onConfirm={() => trash.mutate(confirmingTrash)}
+          onConfirm={() => trash.mutate(confirmingTrash.request)}
           onCancel={() => setConfirmingTrash(null)}
         />
       )}
@@ -198,7 +211,7 @@ export function AlbumDetail() {
           onTrash={(asset) => {
             closePhoto()
             void imogen.assets
-              .trash([asset.id])
+              .trash({ assetIds: [asset.id] })
               .then(() => queryClient.invalidateQueries({ queryKey: ['album', id] }))
           }}
         />

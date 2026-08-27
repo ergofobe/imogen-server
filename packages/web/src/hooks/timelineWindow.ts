@@ -53,6 +53,50 @@ export function evictPeriods(usedInOrder: string[], pinned: string[]): string[] 
   return usedInOrder.filter((period) => keep.has(period))
 }
 
+/**
+ * At most two months are polled while an import runs.
+ *
+ * The cap is the point of the narrowing rather than a detail of it. A backfill lands
+ * photographs across fifteen years at once, so "every month holding something unfinished"
+ * is, during exactly the import this matters for, every month loaded — and asking for all
+ * of them every two seconds is the whole-library refetch this replaced, wearing a filter.
+ */
+export const MAX_SETTLING_PERIODS = 2
+
+/**
+ * The months worth asking about again while an upload finishes.
+ *
+ * An upload lands as `pending` and a background worker thumbnails it, so the timeline has to
+ * find out when that finishes and nothing tells it. Polling is the only way, and the only
+ * thing worth polling is a month with something unfinished in it: a month of settled
+ * photographs cannot change without a mutation, and a mutation invalidates the spine anyway.
+ *
+ * `periods` is least-recently-used first, so this walks it backwards — when the cap has to
+ * choose between months it chooses the ones nearest the reader, whose blank tiles are the
+ * ones they are waiting to see fill in. An empty result means no traffic at all, which is
+ * the state a library that is not importing anything should sit in.
+ */
+export function periodsSettling(loaded: {
+  byDay: Map<string, TimelineTile[]>
+  periods: string[]
+}): string[] {
+  const unfinished = new Set<string>()
+  for (const [day, tiles] of loaded.byDay) {
+    if (tiles.some((tile) => tile.status === 'pending' || tile.status === 'processing')) {
+      unfinished.add(periodOf(day))
+    }
+  }
+
+  const chosen: string[] = []
+  for (let i = loaded.periods.length - 1; i >= 0 && chosen.length < MAX_SETTLING_PERIODS; i--) {
+    const period = loaded.periods[i]!
+    if (unfinished.has(period)) chosen.push(period)
+  }
+  // Back into the order the months are held in, so the same set always produces the same
+  // list and the poll's own restart check does not see a change where there was none.
+  return chosen.reverse()
+}
+
 /** One page of the bucket endpoint: the shape `imogen.assets.timelineBucket` answers with. */
 export type TilePage = { items: TimelineTile[]; nextCursor: string | null }
 

@@ -19,9 +19,6 @@ type ShareResponse =
       allowDownload: boolean
     }
 
-/** A page with no selection still needs one object rather than a new Set every render. */
-const EMPTY_SELECTION = new Set<string>()
-
 /** A public album. No account, no session — the slug is the only credential. */
 export function SharedAlbum() {
   const { slug = '' } = useParams()
@@ -150,7 +147,6 @@ export function SharedAlbum() {
               tiles={tiles}
               options={options}
               attachContainer={attachContainer}
-              selected={EMPTY_SELECTION}
               onOpen={(tile) => openPhoto(tile.id)}
               onToggleSelect={() => {}}
               // A visitor has nothing to do with a selection: there is no bar to act on it.
