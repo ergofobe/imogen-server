@@ -4,6 +4,7 @@ import { buildSegments, type LayoutOptions } from '../lib/timelineLayout.ts'
 import {
   anchoredScrollTop,
   collectPeriod,
+  createGuardedPeriodFetch,
   createPeriodLoader,
   evictPeriods,
   MAX_LOADED_PERIODS,
@@ -554,5 +555,170 @@ describe('createPeriodLoader', () => {
     await loader.load('2011-08').catch(() => {})
     await loader.load('2011-08').catch(() => {})
     expect(attempts).toBe(2)
+  })
+})
+
+describe('createGuardedPeriodFetch', () => {
+  const tile = (id: string): TimelineTile => ({
+    id,
+    capturedAt: '2011-08-14T09:00:00.000Z',
+    width: 4032,
+    height: 3024,
+    type: 'image',
+    status: 'ready',
+    favorite: false,
+    duration: null,
+    placeholderColor: null,
+    livePhotoVideoId: null,
+  })
+
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+  /** The filter on screen, and a fetch that can be finished on demand. */
+  const rig = (askedUnder: string) => {
+    const question = { current: askedUnder }
+    const delivered: Array<{ period: string; ids: string[] }> = []
+    const requests: string[] = []
+    let finish: ((tiles: TimelineTile[]) => void) | null = null
+
+    const fetch = createGuardedPeriodFetch({
+      askedUnder,
+      currentQuestion: () => question.current,
+      fetchPeriod: (period) =>
+        new Promise<TimelineTile[]>((resolve) => {
+          requests.push(period)
+          finish = resolve
+        }),
+      deliver: (period, tiles) => delivered.push({ period, ids: tiles.map((t) => t.id) }),
+    })
+
+    return {
+      question,
+      delivered,
+      requests,
+      fetch,
+      land: (ids: string[]) => {
+        const done = finish
+        finish = null
+        done?.(ids.map(tile))
+      },
+    }
+  }
+
+  test('an answer to the question still being asked is delivered', async () => {
+    const { fetch, land, delivered } = rig('photos')
+    const inFlight = fetch('2011-08')
+    land(['a', 'b'])
+    await inFlight
+    expect(delivered).toEqual([{ period: '2011-08', ids: ['a', 'b'] }])
+  })
+
+  /*
+   * The defect this exists for. A reload is queued behind a flight — by the settling poll or
+   * by the reconciliation — and the reader switches scope before the flight lands. The queued
+   * run begins AFTER the filter changed, so a counter read at that moment has already settled
+   * and says nothing has changed: it lets a month of non-favourites into a favourites-only
+   * map, and nothing corrects it, because the spine does not change a second time.
+   */
+  test('a reload queued behind a flight cannot deliver under a filter that has moved on', async () => {
+    const { fetch, question, land, delivered, requests } = rig('photos')
+    const loader = createPeriodLoader(fetch)
+
+    const inFlight = loader.load('2011-08')
+    await loader.reload('2011-08')
+
+    question.current = 'favourites'
+    land(['a', 'b'])
+    await inFlight
+    await tick()
+
+    expect(delivered).toEqual([])
+    // And the queued run does not spend a round trip on an answer nobody could use.
+    expect(requests).toEqual(['2011-08'])
+  })
+
+  test('an answer that races a filter change is dropped on arrival', async () => {
+    const { fetch, question, land, delivered } = rig('photos')
+    const inFlight = fetch('2011-08')
+    question.current = 'favourites'
+    land(['a'])
+    await inFlight
+    expect(delivered).toEqual([])
+  })
+
+  test('a fetch made under the filter that is back on screen is delivered again', async () => {
+    const { fetch, question, land, delivered } = rig('photos')
+    question.current = 'favourites'
+    const skipped = fetch('2011-08')
+    await skipped
+    question.current = 'photos'
+    const inFlight = fetch('2011-08')
+    land(['a'])
+    await inFlight
+    expect(delivered).toEqual([{ period: '2011-08', ids: ['a'] }])
+  })
+})
+
+describe('createPeriodLoader when a fetch fails', () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+  /*
+   * A reload queued behind a flight that then fails must not go down with it. The mark means
+   * the map is known to be holding tiles from before a mutation; a request that failed has not
+   * made that less true, and clearing it turns one dropped request — an ordinary event on a
+   * home network — into staleness with nothing left to trigger another attempt.
+   */
+  test('a queued reload outlives a failed flight', async () => {
+    const attempts: number[] = []
+    let attempt = 0
+    let finish: (failed: boolean) => void = () => {}
+    const loader = createPeriodLoader(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          attempts.push(++attempt)
+          finish = (failed) => (failed ? reject(new Error('offline')) : resolve())
+        }),
+    )
+
+    const inFlight = loader.load('2011-08').catch(() => {})
+    await loader.reload('2011-08')
+    expect(attempts).toEqual([1])
+
+    finish(true)
+    await tick()
+    expect(attempts).toEqual([1, 2])
+
+    finish(false)
+    await inFlight
+    await tick()
+    expect(attempts).toEqual([1, 2])
+  })
+
+  test('a failure with nothing queued behind it is not retried, and still rejects', async () => {
+    let attempts = 0
+    const loader = createPeriodLoader(async () => {
+      attempts++
+      throw new Error('offline')
+    })
+    await expect(loader.load('2011-08')).rejects.toThrow('offline')
+    expect(attempts).toBe(1)
+  })
+
+  test('a failure on the repeat run rejects rather than being swallowed', async () => {
+    let attempt = 0
+    let finish: (failed: boolean) => void = () => {}
+    const loader = createPeriodLoader(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          attempt++
+          finish = (failed) => (failed ? reject(new Error(`offline ${attempt}`)) : resolve())
+        }),
+    )
+    const inFlight = loader.load('2011-08')
+    await loader.reload('2011-08')
+    finish(false)
+    await tick()
+    finish(true)
+    await expect(inFlight).rejects.toThrow('offline 2')
   })
 })

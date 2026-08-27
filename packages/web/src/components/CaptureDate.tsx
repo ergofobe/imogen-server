@@ -11,8 +11,11 @@ import { formatExact } from '../lib/format.ts'
  * photograph the viewer fetches for itself. A correction that carries a photograph across a
  * UTC midnight changes two days' counts, and the grid's tile map notices that on its own and
  * refetches both months. A correction within the same UTC day changes no count, so the grid
- * keeps the tile it already has — same picture, same place, but its accessible name still
- * reads the old time until that month is fetched again for some other reason.
+ * keeps the tile it already has and two things stay wrong until that month is fetched again
+ * for some other reason: the tile's accessible name still reads the old time, and the tile
+ * still sits where the old time put it, because a day is drawn in the `capturedAt desc` order
+ * it was fetched in. Moving a photograph earlier in the afternoon leaves it among the wrong
+ * neighbours, which is the more visible of the two.
  */
 const ASSET_QUERIES = new Set(['assets', 'album', 'person', 'vault-assets', 'timeline', 'asset'])
 

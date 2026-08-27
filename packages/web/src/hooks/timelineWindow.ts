@@ -177,6 +177,41 @@ export function neighbouringPeriod(
   return neighbour ? periodOf(neighbour.date) : null
 }
 
+/**
+ * A period fetch tied to the question it was asked under, whose answer is delivered only
+ * while that is still the question being asked.
+ *
+ * A counter bumped on every filter change cannot do this job, because the loader may re-run a
+ * fetch long after it was created: a reload queued behind a flight runs when that flight
+ * lands. A counter read at that moment answers "has anything changed since I started", and the
+ * re-run started late — after the filter change it was supposed to notice — so it sees a
+ * counter that has already settled and lets tiles from the previous filter into the map.
+ * Switch to Favourites while a reload is queued and non-favourites arrive; nothing corrects it,
+ * because the spine does not change again.
+ *
+ * `askedUnder` is the question THIS fetch was made under, captured with the fetch rather than
+ * read from anywhere, so the comparison is exact no matter when or how often it runs. What it
+ * guarantees is precisely that: an answer reaches `deliver` only while the question that
+ * produced it is still the current one. It says nothing about the answer being fresh — a
+ * mutation during the flight is the loader's problem, not this one's.
+ */
+export function createGuardedPeriodFetch<Question>(options: {
+  askedUnder: Question
+  currentQuestion: () => Question
+  fetchPeriod: (period: string) => Promise<TimelineTile[]>
+  deliver: (period: string, tiles: TimelineTile[]) => void
+}): (period: string) => Promise<void> {
+  const { askedUnder, currentQuestion, fetchPeriod, deliver } = options
+  return async (period) => {
+    // Checked before the request as well as after it: a re-run that begins after the question
+    // has moved on should not spend a round trip on an answer nobody can use.
+    if (askedUnder !== currentQuestion()) return
+    const tiles = await fetchPeriod(period)
+    if (askedUnder !== currentQuestion()) return
+    deliver(period, tiles)
+  }
+}
+
 export type PeriodLoader = {
   /** Fetches a period unless one is already being fetched for it. */
   load: (period: string) => Promise<void>
@@ -205,12 +240,26 @@ export function createPeriodLoader(fetchPeriod: (period: string) => Promise<void
   const run = async (period: string) => {
     running.add(period)
     try {
+      let failed = false
+      let failure: unknown
       do {
         // Cleared before the fetch, not after: anything arriving while it is in the air has
         // to count, and clearing afterwards would swallow exactly those.
         stale.delete(period)
-        await fetchPeriod(period)
+        failed = false
+        try {
+          await fetchPeriod(period)
+        } catch (error) {
+          // A request queued behind a failed flight is still worth making. The mark means the
+          // map is known to hold tiles from before a mutation, and a request that failed has
+          // not made that any less true — letting the failure carry the mark out with it would
+          // turn one dropped request into permanent staleness, with nothing left to ask again.
+          // At most one further attempt follows, because the mark is consumed before it.
+          failed = true
+          failure = error
+        }
       } while (stale.has(period))
+      if (failed) throw failure
     } finally {
       running.delete(period)
       stale.delete(period)

@@ -11,6 +11,7 @@ import {
 } from '../lib/timelineLayout.ts'
 import {
   collectPeriod,
+  createGuardedPeriodFetch,
   createPeriodLoader,
   evictPeriods,
   mergeDays,
@@ -21,6 +22,7 @@ import {
 export {
   anchoredScrollTop,
   collectPeriod,
+  createGuardedPeriodFetch,
   createPeriodLoader,
   evictPeriods,
   MAX_LOADED_PERIODS,
@@ -101,8 +103,8 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
 
   const pinned = useRef<string[]>([])
   const loadedNow = useRef<LoadedTiles>(NOTHING_LOADED)
-  /** Bumped when the filter changes, so a reply to the old question is dropped. */
-  const generation = useRef(0)
+  /** The filter on screen. A reply to any other one is dropped rather than absorbed. */
+  const currentQuery = useRef(query)
 
   useLayoutEffect(() => {
     pinned.current = visiblePeriods
@@ -112,29 +114,38 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
     loadedNow.current = loaded
   }, [loaded])
 
+  // On commit rather than during render: a render React abandons must not be able to declare
+  // a filter current that never reached the screen, which would discard the real one's replies.
+  useLayoutEffect(() => {
+    currentQuery.current = query
+  }, [query])
+
   // biome-ignore lint/correctness/useExhaustiveDependencies: a filter change is the one thing that invalidates everything held
   useEffect(() => {
-    generation.current += 1
     measured.current = new Map()
     setLoaded(NOTHING_LOADED)
   }, [filterKey])
 
-  const fetchPeriod = useCallback(
-    async (period: string) => {
-      const era = generation.current
-      // The endpoint pages at 5000 and a heavy month runs well past that; `collectPeriod`
-      // follows the cursor to the end before any of it lands.
-      const collected = await collectPeriod((cursor) =>
-        imogen.assets.timelineBucket({ ...query, period, ...(cursor ? { cursor } : {}) }),
-      )
-      if (era !== generation.current) return
-      setLoaded((current) => absorb(current, period, collected, pinned.current))
-    },
+  const fetchPeriod = useMemo(
+    () =>
+      createGuardedPeriodFetch({
+        askedUnder: query,
+        currentQuestion: () => currentQuery.current,
+        // The endpoint pages at 5000 and a heavy month runs well past that; `collectPeriod`
+        // follows the cursor to the end before any of it lands.
+        fetchPeriod: (period) =>
+          collectPeriod((cursor) =>
+            imogen.assets.timelineBucket({ ...query, period, ...(cursor ? { cursor } : {}) }),
+          ),
+        deliver: (period, tiles) =>
+          setLoaded((current) => absorb(current, period, tiles, pinned.current)),
+      }),
     [query],
   )
 
   // Rebuilt when the filter changes, which discards what the old one was tracking. Anything
-  // still in the air from it is dropped on arrival by the generation check above.
+  // still in the air from it — including a reload it had queued — is dropped on arrival,
+  // because the fetch carries the filter it was made under and compares that, not a counter.
   const periods = useMemo(() => createPeriodLoader(fetchPeriod), [fetchPeriod])
 
   const wanted = useMemo(
