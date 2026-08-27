@@ -64,12 +64,17 @@ describe('a truncated jpeg', () => {
     expect(decoded!.height).toBe(1200)
   })
 
-  test('is salvaged by sharp itself, without spawning ffmpeg', async () => {
+  /*
+   * ffmpeg, not libvips, decides what a damaged jpeg is worth. It recovers more of a
+   * partial scan than libvips does, and it refuses outright once there is nothing left
+   * to recover — which is what keeps a header-only upload out of the library.
+   */
+  test('is recovered by ffmpeg rather than by libvips', async () => {
     const path = await truncatedJpeg('cut-native.jpg')
 
     const decoded = await decodeImage(path, options)
 
-    expect(decoded!.via).toBe('sharp')
+    expect(decoded!.via).toBe('ffmpeg')
   })
 
   test('renders, rather than throwing partway through', async () => {
@@ -83,7 +88,13 @@ describe('a truncated jpeg', () => {
 })
 
 describe('a truncated png', () => {
-  test('is salvaged by sharp itself, without spawning ffmpeg', async () => {
+  /*
+   * Known gap, and the price of letting ffmpeg arbitrate: ffmpeg cannot decode a partial
+   * PNG at all, so a half-uploaded one is refused even though libvips would have rendered
+   * the rows that arrived. Photographs are overwhelmingly JPEG and HEIC, so this is rare
+   * enough to leave alone rather than pay for with a guessed-at "enough arrived" threshold.
+   */
+  test('is refused, because ffmpeg cannot recover one', async () => {
     // The same half-uploaded file, in the other format the browser uploader produces.
     const raw = Buffer.alloc(1200 * 900 * 3)
     for (let i = 0; i < raw.length; i++) raw[i] = ((i * 2654435761) >>> 13) & 0xff
@@ -93,10 +104,7 @@ describe('a truncated png', () => {
     const path = join(workDir, 'cut.png')
     writeFileSync(path, full.subarray(0, Math.floor(full.length * 0.7)))
 
-    const decoded = await decodeImage(path, options)
-
-    expect(decoded!.via).toBe('sharp')
-    expect(decoded!.width).toBe(1200)
+    expect(await decodeImage(path, options)).toBeNull()
   })
 })
 
@@ -123,7 +131,22 @@ describe('opening an original', () => {
     const path = join(workDir, 'prose.jpg')
     writeFileSync(path, Buffer.from('this is not a photograph, it is prose'))
 
-    expect(openOriginal(path).metadata()).rejects.toThrow()
+    await expect(openOriginal(path).metadata()).rejects.toThrow()
+  })
+})
+
+describe('a jpeg that is barely more than its header', () => {
+  /*
+   * An upload that dies in its first few hundred bytes still declares its full size in
+   * the header, and a tolerant decoder will happily hand back that many pixels — almost
+   * all of them the flat grey libvips fills unarrived rows with. Importing that as a
+   * healthy photograph is worse than refusing it: the owner sees a blank rectangle in
+   * the grid and nothing tells them the upload failed.
+   */
+  test('is refused rather than imported as a blank rectangle', async () => {
+    const path = await truncatedJpeg('header-only.jpg', 0.007)
+
+    expect(await decodeImage(path, options)).toBeNull()
   })
 })
 

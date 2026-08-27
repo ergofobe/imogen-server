@@ -19,14 +19,19 @@ export type DecodeOptions = {
 const HEIF_EXTENSIONS = new Set(['.heic', '.heif', '.hif', '.avci'])
 
 /**
- * Opens a stored original. Every read of a file in the library goes through here.
+ * Opens a stored original for a reader that has no fallback of its own — face detection,
+ * alignment, and the face-crop endpoint, all of which go straight to the library file.
  *
  * `failOn: 'none'` because an upload that dies mid-transfer leaves a valid header
- * followed by a partial scan, and libvips calls that fatal at every other level — a
- * three-quarters-arrived photograph came back as "VipsJpeg: premature end of JPEG image"
- * rather than as its first three quarters. Only recoverable damage is tolerated: a file
- * with no decodable image in it still refuses to open, so the fallback chain below and
- * every caller's error path stay exactly as they were.
+ * followed by a partial scan, and libvips calls that fatal at every other level. Such a
+ * photograph reached those callers as a raw "VipsJpeg: premature end of JPEG image" —
+ * a 500 from the crop endpoint — when the rows that did arrive were perfectly usable.
+ *
+ * This tolerates damage; it does not judge it. libvips fills the rows that never arrived
+ * with a flat grey, so a file that is all header decodes to a full-size blank rather than
+ * failing. That is acceptable here — a blank face crop is a cosmetic disappointment —
+ * but it is why `decodeImage` below does NOT open originals this way: deciding whether a
+ * damaged file is worth importing at all needs a second opinion, not a lenient one.
  */
 export function openOriginal(path: string): Sharp {
   return sharp(path, { failOn: 'none' })
@@ -60,7 +65,7 @@ function isPlausible(
 export async function decodeImage(path: string, options: DecodeOptions): Promise<Decoded | null> {
   // Metadata usually survives even when the pixels cannot be decoded, so it is the
   // yardstick for judging whether a decode came back complete.
-  const declared = await openOriginal(path)
+  const declared = await sharp(path)
     .metadata()
     .catch(() => ({}) as { width?: number; height?: number })
 
@@ -90,9 +95,17 @@ async function wrap(buffer: Buffer, via: Decoded['via']): Promise<Decoded | null
   return { source, width: meta.width, height: meta.height, via }
 }
 
+/**
+ * Deliberately strict. A tolerant open would accept any file with a readable header,
+ * including one whose scan data never arrived, and import it as a full-size flat grey.
+ * Failing here instead hands the file to ffmpeg, which recovers more of a partial scan
+ * than libvips does and refuses outright when there is nothing left to recover — so the
+ * decision about whether a damaged photograph is worth keeping is made by the decoder
+ * that can actually tell, rather than by a threshold guessed at here.
+ */
 async function tryNative(path: string): Promise<Decoded | null> {
   try {
-    const source = openOriginal(path)
+    const source = sharp(path, { failOn: 'error' })
     const meta = await source.metadata()
     if (!meta.width || !meta.height) return null
     // Decode one pixel. Cheap, and it proves the codec is actually available.
