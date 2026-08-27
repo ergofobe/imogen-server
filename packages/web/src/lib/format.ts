@@ -24,6 +24,7 @@ const CAPTURE_MOMENT = new Intl.DateTimeFormat(undefined, {
   timeZone: 'UTC',
 })
 const MONTH_YEAR = new Intl.DateTimeFormat(undefined, { month: 'short', year: 'numeric' })
+const MONTH_UTC = new Intl.DateTimeFormat(undefined, { month: 'long', timeZone: 'UTC' })
 const EXACT = new Intl.DateTimeFormat(undefined, { dateStyle: 'full', timeStyle: 'short' })
 
 /** Omits the year for photos from this year, the way a person would say the date aloud. */
@@ -56,6 +57,14 @@ export function formatDayKeyHeading(day: string): string {
 export const formatCaptureMoment = (iso: string) => CAPTURE_MOMENT.format(new Date(iso))
 
 export const formatMonthYear = (iso: string) => MONTH_YEAR.format(new Date(iso))
+
+/**
+ * '2012-06' -> 'June'. Read in UTC like every other date the timeline speaks: the month
+ * key comes from a UTC day key, and formatting it behind UTC would name the month before
+ * it for anything captured on the first.
+ */
+export const formatMonthKey = (month: string) =>
+  MONTH_UTC.format(new Date(`${month}-01T00:00:00.000Z`))
 export const formatExact = (iso: string) => EXACT.format(new Date(iso))
 
 export function formatBytes(bytes: number): string {

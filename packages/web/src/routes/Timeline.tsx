@@ -7,6 +7,8 @@ import { ConfirmDialog } from '../components/ConfirmDialog.tsx'
 import { EmptyState } from '../components/EmptyState.tsx'
 import { PhotoGrid } from '../components/PhotoGrid.tsx'
 import { SelectionBar } from '../components/SelectionBar.tsx'
+import { TimelineOverview } from '../components/TimelineOverview.tsx'
+import { TimelineRail } from '../components/TimelineRail.tsx'
 import { Viewer } from '../components/Viewer.tsx'
 import { neighbouringPeriod, tilesInTimelineOrder } from '../hooks/timelineWindow.ts'
 import { useGridLayout } from '../hooks/useGridLayout.ts'
@@ -29,10 +31,25 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
   const { openId, open: openPhoto, replace: showPhoto, close: closePhoto } = useViewerParam()
 
   const { attachContainer, options } = useGridLayout()
-  const { table, tiles, isPending, totalCount, requestPeriods, reload } = useTimeline(
-    query,
-    options,
+  const { table, tiles, isPending, totalCount, requestPeriods, suspendFetching, reload } =
+    useTimeline(query, options)
+
+  /**
+   * The grid element, held here as well as inside `PhotoGrid`, because the rail and the
+   * overview both write the scroll position the grid reads and need its coordinate space
+   * to do it. State rather than a ref: the rail has to render again once the element
+   * exists, and a ref would not tell it that it does.
+   */
+  const [grid, setGrid] = useState<HTMLDivElement | null>(null)
+  const attachGrid = useCallback(
+    (element: HTMLDivElement | null) => {
+      setGrid(element)
+      attachContainer(element)
+    },
+    [attachContainer],
   )
+
+  const [showingOverview, setShowingOverview] = useState(false)
 
   /** Only the loaded months, but in true timeline order rather than in arrival order. */
   const ordered = useMemo(() => tilesInTimelineOrder(table, tiles), [table, tiles])
@@ -49,6 +66,25 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
     const timer = setTimeout(() => setNotice(null), 4000)
     return () => clearTimeout(timer)
   }, [notice])
+
+  /**
+   * `z` for the overview — zoom out. Guarded rather than bound bare: the viewer owns the
+   * keyboard while it is open, and a letter typed into a search field or a description is
+   * a letter, not a shortcut.
+   */
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'z' || event.metaKey || event.ctrlKey || event.altKey) return
+      if (openId) return
+      const target = event.target
+      if (target instanceof HTMLElement && target.closest('input, textarea, [contenteditable]')) {
+        return
+      }
+      setShowingOverview((open) => !open)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [openId])
 
   const refresh = useCallback(() => {
     // The open photograph is fetched whole and separately, so it has its own copy to update.
@@ -166,14 +202,29 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
 
   return (
     <>
-      <div className="mb-5 flex items-baseline justify-between gap-4">
+      {/* `pr-11` clears the rail, which is fixed over the right edge of the viewport. The
+          grid is left to slide under it — a translucent scrubber over the last inch is the
+          conventional shape for one — but a control the reader has to hit is not. */}
+      <div className="mb-5 flex items-baseline justify-between gap-4 pr-11">
         <h1 className="heading-display text-2xl md:text-[28px]">{title}</h1>
-        {/* The spine counts every day the filter matches, so this is the number, not a floor. */}
-        {totalCount > 0 && (
-          <span className="label-micro">
-            {totalCount} {totalCount === 1 ? 'photo' : 'photos'}
-          </span>
-        )}
+        <div className="flex items-baseline gap-4">
+          {/* The spine counts every day the filter matches, so this is the number, not a floor. */}
+          {totalCount > 0 && (
+            <span className="label-micro">
+              {totalCount} {totalCount === 1 ? 'photo' : 'photos'}
+            </span>
+          )}
+          {totalCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowingOverview(true)}
+              className="rounded-lg border border-line px-2.5 py-1 text-sm transition hover:bg-sunken"
+            >
+              Overview
+              <kbd className="label-micro ml-2 text-muted">z</kbd>
+            </button>
+          )}
+        </div>
       </div>
 
       {totalCount === 0 ? (
@@ -183,11 +234,24 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
           table={table}
           tiles={tiles}
           options={options}
-          attachContainer={attachContainer}
+          attachContainer={attachGrid}
           selected={selected}
           onOpen={(tile) => openPhoto(tile.id)}
           onToggleSelect={(tile, shiftKey) => toggle(tile.id, shiftKey)}
           onVisibleRangeChange={onVisibleRangeChange}
+        />
+      )}
+
+      {totalCount > 0 && (
+        <TimelineRail table={table} grid={grid} suspendFetching={suspendFetching} />
+      )}
+
+      {showingOverview && (
+        <TimelineOverview
+          table={table}
+          filter={query}
+          grid={grid}
+          onClose={() => setShowingOverview(false)}
         />
       )}
 

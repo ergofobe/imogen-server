@@ -4,6 +4,7 @@ import { anchoredScrollTop } from '../hooks/timelineWindow.ts'
 import { DAY_HEADER_CLASS, DAY_HEADING_CLASS } from '../hooks/useGridLayout.ts'
 import { formatDayKeyHeading } from '../lib/format.ts'
 import { aspectOf, justify } from '../lib/justify.ts'
+import { gridOffsetWithin, scrollEventSourceFor, scrollingAncestorOf } from '../lib/scroller.ts'
 import {
   estimateRowLayout,
   type LayoutOptions,
@@ -108,9 +109,7 @@ export function PhotoGrid({
     }
     read()
 
-    // The document is the scroller on every page in this app today, and it reports its
-    // scrolling through `window` rather than through the element.
-    const source: EventTarget = scroller === document.scrollingElement ? window : scroller
+    const source = scrollEventSourceFor(scroller)
     source.addEventListener('scroll', schedule, { passive: true })
     window.addEventListener('resize', schedule, { passive: true })
     return () => {
@@ -304,24 +303,4 @@ function PlaceholderDay({
       {/* biome-ignore-end lint/suspicious/noArrayIndexKey: a grid of blanks has nothing else to be keyed by */}
     </div>
   )
-}
-
-/**
- * The element that actually scrolls this grid. Today that is always the document, but
- * finding it rather than assuming it means a grid dropped inside a panel or a dialog
- * measures the thing it is really inside.
- */
-function scrollingAncestorOf(element: HTMLElement): Element {
-  for (let node = element.parentElement; node; node = node.parentElement) {
-    const overflow = getComputedStyle(node).overflowY
-    if (overflow === 'auto' || overflow === 'scroll') return node
-  }
-  return document.scrollingElement ?? document.documentElement
-}
-
-/** Where the grid's own top sits in the scroller's content, page furniture included. */
-function gridOffsetWithin(container: HTMLElement, scroller: Element): number {
-  const scrollerTop =
-    scroller === document.scrollingElement ? 0 : scroller.getBoundingClientRect().top
-  return container.getBoundingClientRect().top - scrollerTop + scroller.scrollTop
 }
