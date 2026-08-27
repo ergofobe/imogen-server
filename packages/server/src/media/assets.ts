@@ -293,6 +293,14 @@ export class AssetService {
    * running that list past a vault-exclusive filter would silently resolve to nothing.
    * The caller already owns the ownership and vault checks that matter for its own
    * operation (`addAssets`, `moveIn`, `moveOut`), the same as before this existed.
+   *
+   * Ordered `capturedAt desc, id desc` — the same order as every other listing here,
+   * matching `assets_timeline_idx`. A caller that chunks this result (album membership,
+   * vault move-in) relies on that: each batch is a contiguous slice of the same order,
+   * so the newest matched asset always lands in the first batch, whatever the batch
+   * size. Without it, an album's derived cover — the lowest `album_assets.position`,
+   * assigned in the order batches are processed — would point at "newest within an
+   * arbitrary slice" instead of newest overall for any selection over one batch.
    */
   async resolveSelection(ownerId: string, selection: AssetSelection): Promise<string[]> {
     if (selection.assetIds) return selection.assetIds
@@ -300,6 +308,7 @@ export class AssetService {
       .select({ id: assets.id })
       .from(assets)
       .where(and(...this.selectionConditions(ownerId, selection)))
+      .orderBy(desc(assets.capturedAt), desc(assets.id))
     return rows.map((r) => r.id)
   }
 

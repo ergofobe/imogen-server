@@ -5,8 +5,12 @@
  * statement bound to more than 65,535 parameters.
  */
 export function chunk<T>(items: T[], size: number): T[][] {
+  // A size below 1 would loop forever slicing an empty range. Only reachable today
+  // through a test-only constructor override, but a shared helper should not have a
+  // silent infinite loop as a failure mode.
+  const step = Math.max(1, size)
   const batches: T[][] = []
-  for (let i = 0; i < items.length; i += size) batches.push(items.slice(i, i + size))
+  for (let i = 0; i < items.length; i += step) batches.push(items.slice(i, i + step))
   return batches
 }
 

@@ -196,12 +196,12 @@ export function createVaultRoutes() {
       const assetIds = await services.assets.resolveSelection(ownerId, c.req.valid('json'))
       const movedIds = await services.vault.moveIn(ownerId, assetIds)
 
-      // Faces found in a vaulted photo stop existing. Leaving them would let a vaulted
-      // photo keep contributing to a named person's thumbnail and count. One call, not
-      // one per photo — a selection can run to tens of thousands. Scoped to what actually
-      // moved, not what was requested: an id that failed its ownership or vault check
-      // inside `moveIn` should not have its faces forgotten either.
-      await services.faces.forgetAssets(movedIds, ownerId)
+      // Faces found in a vaulted photo already stopped existing — `moveIn` deletes them
+      // in the same transaction as the vaulting itself, batch by batch, so a failure
+      // partway through can never leave a vaulted photo with its faces rows surviving.
+      // All that is left is the aggregate people/count recount, once for the whole
+      // request rather than once per photo.
+      if (movedIds.length > 0) await services.faces.refreshCounts(ownerId)
       return c.json({ moved: movedIds.length }, 200)
     },
   )

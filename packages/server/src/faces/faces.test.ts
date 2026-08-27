@@ -151,13 +151,17 @@ describe('forgetting a set of assets', () => {
     await addFace(b.id, person!.id)
     const recounts = spyOn(service, 'refreshCounts')
 
-    await service.forgetAssets([a.id, b.id], ownerId)
+    try {
+      await service.forgetAssets([a.id, b.id], ownerId)
 
-    expect(await db.select().from(faces)).toBeEmpty()
-    // The person existed only in those photos, so recounting removes them too.
-    expect(await db.select().from(people)).toBeEmpty()
-    // Not once per asset — a selection can run to tens of thousands of them.
-    expect(recounts).toHaveBeenCalledTimes(1)
+      expect(await db.select().from(faces)).toBeEmpty()
+      // The person existed only in those photos, so recounting removes them too.
+      expect(await db.select().from(people)).toBeEmpty()
+      // Not once per asset — a selection can run to tens of thousands of them.
+      expect(recounts).toHaveBeenCalledTimes(1)
+    } finally {
+      recounts.mockRestore()
+    }
   })
 
   /**

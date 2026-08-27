@@ -1,7 +1,7 @@
-import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
+import { afterAll, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { eq, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
-import { assets, users } from '../db/schema.ts'
+import { assets, faces, people, users } from '../db/schema.ts'
 import { createTestDatabase } from '../test/harness.ts'
 import { VaultService } from './vault.ts'
 
@@ -46,6 +46,20 @@ async function addAsset(ownerId = userId) {
     })
     .returning()
   return row!
+}
+
+async function addFace(assetId: string, personId: string, faceOwnerId = userId) {
+  await db.insert(faces).values({
+    assetId,
+    ownerId: faceOwnerId,
+    personId,
+    x: 0,
+    y: 0,
+    width: 10,
+    height: 10,
+    score: 0.9,
+    embedding: Array(512).fill(0),
+  })
 }
 
 const SESSION = 'session-abc'
@@ -171,6 +185,63 @@ describe('moving assets in and out', () => {
     expect(new Set(moved)).toEqual(new Set(seeded.map((a) => a.id)))
     const rows = await db.select().from(assets)
     expect(rows.every((r) => r.vaultedAt !== null)).toBe(true)
+  })
+
+  /**
+   * Each batch is its own transaction specifically so that a failure partway through a
+   * multi-batch move-in cannot leave a photograph vaulted while its face embeddings
+   * survive with no way for a retry to reach them. Five assets at a batch size of 2 make
+   * three transactions; the third is made to throw after the first two have committed,
+   * simulating a crash between batches rather than within one (which the database's own
+   * atomicity already covers).
+   */
+  test('a failure partway through never leaves a vaulted asset carrying faces', async () => {
+    const batched = new VaultService(db, { secret: SECRET, batchSize: 2 })
+    const [person] = await db
+      .insert(people)
+      .values({ ownerId: userId, name: 'Someone' })
+      .returning()
+    const seeded = await Promise.all(Array.from({ length: 5 }, () => addAsset()))
+    for (const asset of seeded) await addFace(asset.id, person!.id)
+
+    const realTransaction = db.transaction.bind(db)
+    let calls = 0
+    // biome-ignore lint/suspicious/noExplicitAny: matching drizzle's own generic transaction() signature isn't worth it for a test-only spy.
+    const txSpy = spyOn(db, 'transaction').mockImplementation(((fn: any) => {
+      calls++
+      if (calls === 3) throw new Error('simulated failure between batches')
+      return realTransaction(fn)
+    }) as typeof db.transaction)
+
+    try {
+      await expect(
+        batched.moveIn(
+          userId,
+          seeded.map((a) => a.id),
+        ),
+      ).rejects.toThrow('simulated failure between batches')
+    } finally {
+      txSpy.mockRestore()
+    }
+
+    // The invariant: no asset is both vaulted and still carrying faces rows. The first
+    // two batches committed (vaulted, faces gone); the third never committed at all
+    // (not vaulted, faces untouched) — either way, nothing is caught in between.
+    const rows = await db.select({ id: assets.id, vaultedAt: assets.vaultedAt }).from(assets)
+    for (const row of rows) {
+      if (row.vaultedAt === null) continue
+      const remaining = await db.select().from(faces).where(eq(faces.assetId, row.id))
+      expect(remaining).toBeEmpty()
+    }
+    // And a retry over the untouched remainder can still reach it: whatever did not
+    // get vaulted the first time still matches `isNull(assets.vaultedAt)`.
+    const stillLoose = rows.filter((r) => r.vaultedAt === null)
+    expect(stillLoose.length).toBeGreaterThan(0)
+    const retried = await batched.moveIn(
+      userId,
+      stillLoose.map((r) => r.id),
+    )
+    expect(retried).toHaveLength(stillLoose.length)
   })
 
   test('moves an asset into the vault', async () => {
