@@ -61,7 +61,7 @@ export function createAlbumRoutes() {
       method: 'get',
       path: '/{id}',
       tags: ['Albums'],
-      summary: 'One album, with its photos',
+      summary: 'One album, with a cover sample of its photos',
       security: security(),
       middleware: [requireScope('albums:read')] as const,
       request: { params: IdParam },

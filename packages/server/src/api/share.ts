@@ -1,10 +1,10 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import { TimelineBucketQuery, TimelineQuery } from '@imogen/shared'
-import { and, eq } from 'drizzle-orm'
+import { and, eq, isNull } from 'drizzle-orm'
 import { Hono } from 'hono'
 import { getCookie, setCookie } from 'hono/cookie'
 import type { AppEnv } from '../auth/middleware.ts'
-import { albumAssets, assetFiles } from '../db/schema.ts'
+import { albumAssets, assetFiles, assets } from '../db/schema.ts'
 import { badRequest, notFound, unauthorized } from '../lib/errors.ts'
 import type { OpenedShare } from '../media/albums.ts'
 import type { Services } from '../services.ts'
@@ -171,7 +171,21 @@ export function createShareRoutes() {
  *
  * A photo share (`share.link.assetId` set) dresses a single asset as an album of one;
  * `share.album.id` there is the share link's own id, not a row in `albums`, so a photo
- * share is checked directly rather than against `album_assets`.
+ * share is checked directly rather than against `album_assets`. It needs no deletedAt
+ * or vaultedAt check of its own: `openShare` re-resolves a photo share on every
+ * request through `openPhotoShare`, which already excludes a trashed or vaulted
+ * asset — a trashed shared photo dissolves the share itself before `open()` below
+ * ever reaches this guard.
+ *
+ * An album share has no such protection. Trashing a photo (`AssetService.trash`) only
+ * sets `deletedAt` — the `album_assets` row survives, and so does `asset_files` until
+ * the retention sweep runs, often weeks later. Vaulting happens to remove the
+ * `album_assets` row today, in the same transaction, but that is `VaultService.moveIn`'s
+ * behaviour, not something this guard should assume without checking. So membership
+ * is judged against the same predicate `openShare` builds `share.album.assets` from
+ * (see the `membership` condition in `AlbumService.openShare`), not against
+ * `album_assets` alone: a row that points at a trashed or vaulted asset is not really
+ * a member any more.
  */
 async function isMemberOfShare(
   services: Services,
@@ -183,7 +197,15 @@ async function isMemberOfShare(
   const [member] = await services.db
     .select({ id: albumAssets.assetId })
     .from(albumAssets)
-    .where(and(eq(albumAssets.albumId, share.album.id), eq(albumAssets.assetId, assetId)))
+    .innerJoin(assets, eq(assets.id, albumAssets.assetId))
+    .where(
+      and(
+        eq(albumAssets.albumId, share.album.id),
+        eq(albumAssets.assetId, assetId),
+        isNull(assets.deletedAt),
+        isNull(assets.vaultedAt),
+      ),
+    )
     .limit(1)
   return member !== undefined
 }

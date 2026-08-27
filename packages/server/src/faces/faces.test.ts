@@ -234,6 +234,22 @@ describe('the cover sample', () => {
     expect(photos[0]!.id).toBe(seeded[0]!.id)
   })
 
+  /** The `id` half of `order by capturedAt desc, id desc` — never exercised by two
+   * photographs a second apart, since `capturedAt` alone would already order them. */
+  test('two photographs taken at the same instant break their tie on id, descending', async () => {
+    const [person] = await db.insert(people).values({ ownerId, name: 'Tied' }).returning()
+    const sharedTime = new Date()
+    const a = await addBareAsset({ capturedAt: sharedTime })
+    const b = await addBareAsset({ capturedAt: sharedTime })
+    await addFace(a.id, person!.id)
+    await addFace(b.id, person!.id)
+
+    const photos = await service.photosOf(ownerId, person!.id)
+
+    const expected = [a.id, b.id].sort((x, y) => (x > y ? -1 : x < y ? 1 : 0))
+    expect(photos.map((p) => p.id)).toEqual(expected)
+  })
+
   /**
    * A person can have more than one face in the same photograph (a mistaken split, a
    * photo of them in a mirror). `selectDistinctOn` must dedupe by photograph, not

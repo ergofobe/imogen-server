@@ -105,7 +105,7 @@ export function createFaceRoutes() {
       method: 'get',
       path: '/{id}',
       tags: ['People'],
-      summary: 'One person and the photos they appear in',
+      summary: 'One person and a cover sample of the photos they appear in',
       security: security(),
       middleware: [requireScope('library:read')] as const,
       request: { params: IdParam },
@@ -117,13 +117,18 @@ export function createFaceRoutes() {
       const id = c.req.valid('param').id
 
       const person = await services.faces.getPerson(ownerId, id)
+      // `photos` is now a capped cover sample (`FaceService.photosOf`), so its length
+      // is not this person's true photo count once they pass the cap — the same
+      // mistake already fixed for `openShare`'s `assetCount`. `faceCount` is the real
+      // figure, maintained by `refreshCounts`, and is what the list route above
+      // already reports for the same person.
       const photos = await services.faces.photosOf(ownerId, id)
       return c.json(
         {
           id: person.id,
           name: person.name,
           coverFaceId: person.coverFaceId,
-          photoCount: photos.length,
+          photoCount: person.faceCount,
           hidden: person.hidden,
           photos: photos.map(toAsset),
         },

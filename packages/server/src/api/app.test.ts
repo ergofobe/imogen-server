@@ -597,8 +597,79 @@ describe('albums and sharing', () => {
     expect(outsideAlbum.status).toBe(404)
   })
 
+  /**
+   * `AssetService.trash` only sets `deletedAt` — the `album_assets` row survives, and
+   * so does the thumbnail file until the retention sweep runs, often weeks later. The
+   * guard has to check the asset's own state, not just that a membership row exists.
+   */
+  test('a shared album refuses a photo that has since been trashed', async () => {
+    const { cookie, albumId, assetId } = await setup()
+    const link = (await (
+      await jsonRequest(`/api/v1/albums/${albumId}/share`, 'POST', { allowDownload: true }, cookie)
+    ).json()) as { slug: string }
+
+    // Reachable before trashing, so the assertion below is about the trash, not a
+    // fixture mistake.
+    expect((await request(`/api/v1/share/${link.slug}/assets/${assetId}/thumbnail`)).status).toBe(
+      200,
+    )
+
+    await harness.db.execute(sql`update assets set deleted_at = now() where id = ${assetId}`)
+
+    const response = await request(`/api/v1/share/${link.slug}/assets/${assetId}/thumbnail`)
+    expect(response.status).toBe(404)
+  })
+
+  /**
+   * Vaulting an asset normally also deletes its `album_assets` row (`VaultService.moveIn`,
+   * same transaction), so this asset is set vaulted directly rather than through the
+   * vault — proving the guard itself refuses a vaulted photo, not that `moveIn` happened
+   * to clean up before the guard ever ran.
+   */
+  test('a shared album refuses a photo that has since been vaulted', async () => {
+    const { cookie, albumId, assetId } = await setup()
+    const link = (await (
+      await jsonRequest(`/api/v1/albums/${albumId}/share`, 'POST', { allowDownload: true }, cookie)
+    ).json()) as { slug: string }
+
+    expect((await request(`/api/v1/share/${link.slug}/assets/${assetId}/thumbnail`)).status).toBe(
+      200,
+    )
+
+    await harness.db.execute(sql`update assets set vaulted_at = now() where id = ${assetId}`)
+
+    const response = await request(`/api/v1/share/${link.slug}/assets/${assetId}/thumbnail`)
+    expect(response.status).toBe(404)
+  })
+
+  /**
+   * A one-asset library in a one-asset album (plain `setup()`) would sum to 1 whether
+   * or not the `albumId` filter or the `ownerId` scope was actually applied — so both
+   * a second album for the same owner and a second owner's own photograph are seeded,
+   * neither reachable through this slug. A missing `albumId` filter would sweep in the
+   * first; a wrong or missing `ownerId` scope would sweep in the second.
+   */
   test('a shared album has its own timeline, scoped to its own photos', async () => {
     const { cookie, albumId, assetId } = await setup()
+
+    const second = (await (
+      await jsonRequest('/api/v1/albums', 'POST', { name: 'Elsewhere' }, cookie)
+    ).json()) as { id: string }
+    const elsewhere = (await (await upload(cookie, await makePhoto('elsewhere.jpg'))).json()) as {
+      asset: { id: string }
+    }
+    await services.queue.drain()
+    await jsonRequest(
+      `/api/v1/albums/${second.id}/assets`,
+      'POST',
+      { assetIds: [elsewhere.asset.id] },
+      cookie,
+    )
+
+    const stranger = await signUp('stranger-timeline@example.com')
+    await upload(stranger.cookie, await makePhoto('stranger.jpg'))
+    await services.queue.drain()
+
     const link = (await (
       await jsonRequest(`/api/v1/albums/${albumId}/share`, 'POST', { allowDownload: true }, cookie)
     ).json()) as { slug: string }
