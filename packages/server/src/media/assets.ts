@@ -28,7 +28,7 @@ import {
 } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { albumAssets, assets, faces } from '../db/schema.ts'
-import { forbidden, notFound } from '../lib/errors.ts'
+import { badRequest, forbidden, notFound } from '../lib/errors.ts'
 import { toAsset } from './serialize.ts'
 
 /** Kept identical to the translate() in the generated search vector. */
@@ -467,9 +467,35 @@ export class AssetService {
   }
 }
 
-/** `2011-08` is a month; `2011-08-14` is a day. Both are half-open, both in UTC. */
+const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+
+const isLeapYear = (year: number) => (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0
+
+const daysInMonth = (year: number, month: number) =>
+  month === 2 && isLeapYear(year) ? 29 : DAYS_IN_MONTH[month - 1]!
+
+/**
+ * `2011-08` is a month; `2011-08-14` is a day. Both are half-open, both in UTC.
+ *
+ * The range check is here rather than on the schema because `TimelineBucketQuery` lives in
+ * the SDK and its regex only counts digits: `2011-13` and `2011-02-30` both satisfy it.
+ * `Date.UTC` then rolls them over silently, so the endpoint answered 200 with January
+ * 2012's tiles and a total to match — a client's off-by-one turned into wrong data rather
+ * than a rejected request, which is the one outcome worth ruling out. A 400 here reads on
+ * the wire exactly like the zod failures `defaultHook` produces.
+ */
 function periodBounds(period: string): { start: Date; end: Date } {
   const [year, month, day] = period.split('-').map(Number)
+  const inRange =
+    Number.isInteger(year) &&
+    Number.isInteger(month) &&
+    month! >= 1 &&
+    month! <= 12 &&
+    (day === undefined || (Number.isInteger(day) && day >= 1 && day <= daysInMonth(year!, month!)))
+  if (!inRange) {
+    throw badRequest(`"${period}" is not a month or a day that exists`)
+  }
+
   if (day === undefined) {
     return {
       start: new Date(Date.UTC(year!, month! - 1, 1)),

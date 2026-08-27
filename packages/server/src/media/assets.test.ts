@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { eq, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { albumAssets, albums, assets, faces, people, users } from '../db/schema.ts'
+import { HttpError } from '../lib/errors.ts'
 import { createTestDatabase } from '../test/harness.ts'
 import { AssetService } from './assets.ts'
 
@@ -626,6 +627,57 @@ describe('timeline buckets', () => {
     ])
     const page = await service.bucket(ownerId, { period: '2011-08-14', limit: 5000 })
     expect(page.items).toHaveLength(1)
+  })
+
+  /**
+   * `TimelineBucketQuery`'s regex is happy with any two digits and `Date.UTC` rolls the
+   * out-of-range ones over rather than complaining, so `2011-13` used to answer 200 with
+   * January 2012's tiles and a total to match: a client's off-by-one became wrong data
+   * instead of a rejected request. Each of these seeds the period it would have rolled
+   * into, so a rollover that survives would answer with a photograph rather than nothing.
+   */
+  const impossiblePeriods = [
+    ['2011-13', new Date('2012-01-14T09:00:00Z')],
+    ['2011-00', new Date('2010-12-14T09:00:00Z')],
+    ['2011-02-30', new Date('2011-03-02T09:00:00Z')],
+    ['2011-04-31', new Date('2011-05-01T09:00:00Z')],
+    ['2011-08-00', new Date('2011-07-31T09:00:00Z')],
+    ['2023-02-29', new Date('2023-03-01T09:00:00Z')],
+  ] as const
+
+  for (const [period, wouldHaveRolledInto] of impossiblePeriods) {
+    test(`refuses ${period} rather than rolling it over`, async () => {
+      await seed(ownerId, [{ capturedAt: wouldHaveRolledInto }])
+      const thrown = await service
+        .bucket(ownerId, { period, limit: 5000 })
+        .catch((error: unknown) => error)
+      expect(thrown).toBeInstanceOf(HttpError)
+      // 400, the same as every other rejected request — not a 500 and not a 200.
+      expect((thrown as HttpError).status).toBe(400)
+    })
+  }
+
+  test('29 February in a leap year is a real day', async () => {
+    await seed(ownerId, [
+      { capturedAt: new Date('2024-02-29T09:00:00Z') },
+      { capturedAt: new Date('2024-02-28T09:00:00Z') },
+    ])
+    const page = await service.bucket(ownerId, { period: '2024-02-29', limit: 5000 })
+    expect(page.items).toHaveLength(1)
+    expect(page.total).toBe(1)
+  })
+
+  test('the last day of a 31-day month, and the twelfth month, are both still fine', async () => {
+    await seed(ownerId, [{ capturedAt: new Date('2011-12-31T09:00:00Z') }])
+    expect(
+      (await service.bucket(ownerId, { period: '2011-12-31', limit: 5000 })).items,
+    ).toHaveLength(1)
+    expect((await service.bucket(ownerId, { period: '2011-12', limit: 5000 })).items).toHaveLength(
+      1,
+    )
+    expect((await service.bucket(ownerId, { period: '2011-01', limit: 5000 })).items).toHaveLength(
+      0,
+    )
   })
 
   test('a bucket pages when a period holds more than the limit', async () => {
