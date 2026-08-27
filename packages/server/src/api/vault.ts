@@ -1,5 +1,5 @@
 import { createRoute, OpenAPIHono, z } from '@hono/zod-openapi'
-import { Asset, pageOf } from '@imogen/shared'
+import { Asset, AssetSelection, pageOf } from '@imogen/shared'
 import type { Context } from 'hono'
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie'
 import { type AppEnv, requireAuth } from '../auth/middleware.ts'
@@ -12,7 +12,6 @@ import { ERROR_RESPONSES, NO_CONTENT, ok, security } from './openapi.ts'
 export const VAULT_COOKIE = 'imogen_vault'
 
 const Passphrase = z.object({ passphrase: z.string().min(8).max(1024) })
-const AssetIds = z.object({ assetIds: z.array(z.uuid()).min(1).max(1000) })
 
 const VaultStatus = z.object({
   configured: z.boolean(),
@@ -185,7 +184,7 @@ export function createVaultRoutes() {
       summary: 'Move photos into the vault',
       description: 'They leave every album on the way in, since an album can be shared.',
       security: security(),
-      request: { body: { content: { 'application/json': { schema: AssetIds } } } },
+      request: { body: { content: { 'application/json': { schema: AssetSelection } } } },
       responses: {
         ...ok(z.object({ moved: z.number().int().nonnegative() }), 'How many moved'),
         ...ERROR_RESPONSES,
@@ -194,12 +193,13 @@ export function createVaultRoutes() {
     async (c) => {
       const services = c.get('services')
       const ownerId = c.get('principal').user.id
-      const assetIds = c.req.valid('json').assetIds
+      const assetIds = await services.assets.resolveSelection(ownerId, c.req.valid('json'))
       const moved = await services.vault.moveIn(ownerId, assetIds)
 
       // Faces found in a vaulted photo stop existing. Leaving them would let a vaulted
-      // photo keep contributing to a named person's thumbnail and count.
-      for (const assetId of assetIds) await services.faces.forgetAsset(assetId, ownerId)
+      // photo keep contributing to a named person's thumbnail and count. One call, not
+      // one per photo — a selection can run to tens of thousands.
+      await services.faces.forgetAssets(assetIds, ownerId)
       return c.json({ moved }, 200)
     },
   )
@@ -211,7 +211,7 @@ export function createVaultRoutes() {
       tags: ['Vault'],
       summary: 'Move photos back into the library',
       security: security(),
-      request: { body: { content: { 'application/json': { schema: AssetIds } } } },
+      request: { body: { content: { 'application/json': { schema: AssetSelection } } } },
       responses: {
         ...ok(z.object({ moved: z.number().int().nonnegative() }), 'How many moved back'),
         ...ERROR_RESPONSES,
@@ -220,7 +220,7 @@ export function createVaultRoutes() {
     async (c) => {
       const services = c.get('services')
       const ownerId = c.get('principal').user.id
-      const assetIds = c.req.valid('json').assetIds
+      const assetIds = await services.assets.resolveSelection(ownerId, c.req.valid('json'))
       const moved = await services.vault.moveOut(ownerId, assetIds)
 
       // Out of the vault, a photo rejoins the library and is scanned again.

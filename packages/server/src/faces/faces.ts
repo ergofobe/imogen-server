@@ -257,6 +257,15 @@ export class FaceService {
     await this.refreshCounts(ownerId)
   }
 
+  /** The same as forgetting one, for a selection that may run to tens of thousands. */
+  async forgetAssets(assetIds: string[], ownerId: string): Promise<void> {
+    if (assetIds.length === 0) return
+    await this.db
+      .delete(faces)
+      .where(and(eq(faces.ownerId, ownerId), inArray(faces.assetId, assetIds)))
+    await this.refreshCounts(ownerId)
+  }
+
   async listPeople(ownerId: string, includeHidden = false) {
     const rows = await this.db
       .select({

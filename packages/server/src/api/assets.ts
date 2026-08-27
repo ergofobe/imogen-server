@@ -4,6 +4,7 @@ import { createRoute, OpenAPIHono, z } from '@hono/zod-openapi'
 import {
   Asset,
   AssetQuery,
+  AssetSelection,
   AssetUpdate,
   AssetUploadMetadata,
   AssetUploadResult,
@@ -25,7 +26,6 @@ import { created, ERROR_RESPONSES, NO_CONTENT, ok, security } from './openapi.ts
 import { assertVaultAccess, vaultIsOpen } from './vault.ts'
 
 const IdParam = z.object({ id: z.uuid() })
-const IdsBody = z.object({ assetIds: z.array(z.uuid()).min(1).max(1000) })
 const CountResult = z.object({ count: z.number().int().nonnegative() })
 
 export function createAssetRoutes() {
@@ -234,13 +234,13 @@ export function createAssetRoutes() {
       description: 'Reversible. Assets are destroyed only after the retention window.',
       security: security(),
       middleware: [requireScope('library:write')] as const,
-      request: { body: { content: { 'application/json': { schema: IdsBody } } } },
+      request: { body: { content: { 'application/json': { schema: AssetSelection } } } },
       responses: { ...ok(CountResult, 'How many moved'), ...ERROR_RESPONSES },
     }),
     async (c) => {
       const services = c.get('services')
       const ownerId = c.get('principal').user.id
-      const count = await services.assets.trash(ownerId, c.req.valid('json').assetIds)
+      const count = await services.assets.trashSelection(ownerId, c.req.valid('json'))
       // A trashed photo is recoverable, so its faces stay — but they stop counting.
       await services.faces.refreshFor(ownerId)
       return c.json({ count }, 200)
@@ -255,13 +255,13 @@ export function createAssetRoutes() {
       summary: 'Restore assets from the trash',
       security: security(),
       middleware: [requireScope('library:write')] as const,
-      request: { body: { content: { 'application/json': { schema: IdsBody } } } },
+      request: { body: { content: { 'application/json': { schema: AssetSelection } } } },
       responses: { ...ok(CountResult, 'How many restored'), ...ERROR_RESPONSES },
     }),
     async (c) => {
       const services = c.get('services')
       const ownerId = c.get('principal').user.id
-      const count = await services.assets.restore(ownerId, c.req.valid('json').assetIds)
+      const count = await services.assets.restoreSelection(ownerId, c.req.valid('json'))
       await services.faces.refreshFor(ownerId)
       return c.json({ count }, 200)
     },

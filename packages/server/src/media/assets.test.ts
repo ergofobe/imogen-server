@@ -57,6 +57,14 @@ async function seed(owner: string, overridesList: Partial<typeof assets.$inferIn
   return rows
 }
 
+async function seedOwner(): Promise<string> {
+  const [row] = await db
+    .insert(users)
+    .values({ email: `stranger-${randomUUID()}@example.com`, name: 'Stranger' })
+    .returning()
+  return row!.id
+}
+
 async function seedAlbum(owner: string, overridesList: Partial<typeof assets.$inferInsert>[]) {
   const [album] = await db.insert(albums).values({ ownerId: owner, name: 'Album' }).returning()
   const assetRows = await seed(owner, overridesList)
@@ -394,6 +402,86 @@ describe('mutation', () => {
 
     const [row] = await db.select().from(assets)
     expect(row!.deletedAt).toBeNull()
+  })
+})
+
+describe('selections by query', () => {
+  const listAll = () => service.list(ownerId, { limit: 100, sort: 'capturedAt', order: 'desc' })
+
+  test('trashes everything a filter matches', async () => {
+    await seed(ownerId, [
+      { capturedAt: new Date('2011-08-14T09:00:00Z'), favorite: true },
+      { capturedAt: new Date('2011-08-15T09:00:00Z'), favorite: true },
+      { capturedAt: new Date('2011-08-16T09:00:00Z'), favorite: false },
+    ])
+    expect(await service.trashSelection(ownerId, { query: { favorite: true } })).toBe(2)
+    expect((await listAll()).items).toHaveLength(1)
+  })
+
+  test('honours the exclusion set', async () => {
+    await seed(ownerId, [
+      { capturedAt: new Date('2011-08-14T09:00:00Z'), favorite: true },
+      { capturedAt: new Date('2011-08-15T09:00:00Z'), favorite: true },
+    ])
+    const [keep] = (await listAll()).items
+    expect(
+      await service.trashSelection(ownerId, { query: { favorite: true }, except: [keep!.id] }),
+    ).toBe(1)
+    expect((await listAll()).items[0]!.id).toBe(keep!.id)
+  })
+
+  test('never reaches another owner', async () => {
+    const stranger = await seedOwner()
+    await seed(stranger, [{ capturedAt: new Date('2011-08-14T09:00:00Z'), favorite: true }])
+    await seed(ownerId, [{ capturedAt: new Date('2011-08-14T09:00:00Z'), favorite: true }])
+    expect(await service.trashSelection(ownerId, { query: { favorite: true } })).toBe(1)
+  })
+
+  test('never reaches the vault', async () => {
+    await seed(ownerId, [
+      { capturedAt: new Date('2011-08-14T09:00:00Z'), favorite: true, vaultedAt: new Date() },
+    ])
+    expect(await service.trashSelection(ownerId, { query: { favorite: true } })).toBe(0)
+  })
+
+  test('the id form still works exactly as it did', async () => {
+    await seed(ownerId, [{ capturedAt: new Date('2011-08-14T09:00:00Z') }])
+    const [only] = (await listAll()).items
+    expect(await service.trashSelection(ownerId, { assetIds: [only!.id] })).toBe(1)
+  })
+
+  test('restores by query, from the trash', async () => {
+    await seed(ownerId, [{ capturedAt: new Date('2011-08-14T09:00:00Z'), favorite: true }])
+    await service.trashSelection(ownerId, { query: { favorite: true } })
+    expect(
+      await service.restoreSelection(ownerId, { query: { favorite: true, trashed: true } }),
+    ).toBe(1)
+  })
+})
+
+describe('resolving a selection to ids', () => {
+  test('a query resolves to the matching, visible ids', async () => {
+    const [favored] = await seed(ownerId, [
+      { capturedAt: new Date('2011-08-14T09:00:00Z'), favorite: true },
+      { capturedAt: new Date('2011-08-15T09:00:00Z'), favorite: false },
+    ])
+    expect(await service.resolveSelection(ownerId, { query: { favorite: true } })).toEqual([
+      favored!.id,
+    ])
+  })
+
+  /**
+   * An id list passes straight through unfiltered — including into the vault. Album
+   * membership and trash both re-check ownership and vault status themselves, and the
+   * vault's own move-out route sends exactly the ids of assets that are already vaulted:
+   * running that list past the ordinary vault-exclusive filter would silently resolve to
+   * nothing, breaking the one direction a vaulted photograph is supposed to be reachable.
+   */
+  test('an id list passes straight through, even into the vault', async () => {
+    const vaulted = await addAsset({ vaultedAt: new Date() })
+    expect(await service.resolveSelection(ownerId, { assetIds: [vaulted.id] })).toEqual([
+      vaulted.id,
+    ])
   })
 })
 

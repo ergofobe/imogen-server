@@ -2,6 +2,7 @@ import type {
   Asset,
   AssetFilter,
   AssetQuery,
+  AssetSelection,
   AssetUpdate,
   LibraryStats,
   TimelineBucket,
@@ -20,6 +21,7 @@ import {
   isNull,
   lt,
   lte,
+  notInArray,
   or,
   type SQL,
   sql,
@@ -230,6 +232,68 @@ export class AssetService {
       .where(and(eq(assets.ownerId, ownerId), inArray(assets.id, assetIds)))
       .returning({ id: assets.id })
     return rows.length
+  }
+
+  /**
+   * The rows a selection means, as conditions rather than as ids. The whole point is that
+   * a hundred thousand photographs never become a hundred thousand uuids — not in a
+   * request body, not in a Set, and not in an `in` list.
+   *
+   * Both branches exclude the vault: the query branch gets it free from `buildFilters`,
+   * and the id branch repeats it explicitly, so neither a `query` nor an `assetIds`
+   * selection can ever reach a vaulted photograph.
+   */
+  private selectionConditions(ownerId: string, selection: AssetSelection): SQL[] {
+    if (selection.assetIds) {
+      return [
+        eq(assets.ownerId, ownerId),
+        isNull(assets.vaultedAt),
+        inArray(assets.id, selection.assetIds),
+      ]
+    }
+    const conditions = this.buildFilters(ownerId, selection.query!)
+    if (selection.except?.length) conditions.push(notInArray(assets.id, selection.except))
+    return conditions
+  }
+
+  async trashSelection(ownerId: string, selection: AssetSelection): Promise<number> {
+    const rows = await this.db
+      .update(assets)
+      .set({ deletedAt: new Date(), updatedAt: new Date() })
+      .where(and(...this.selectionConditions(ownerId, selection), isNull(assets.deletedAt)))
+      .returning({ id: assets.id })
+    return rows.length
+  }
+
+  async restoreSelection(ownerId: string, selection: AssetSelection): Promise<number> {
+    const rows = await this.db
+      .update(assets)
+      .set({ deletedAt: null, updatedAt: new Date() })
+      .where(and(...this.selectionConditions(ownerId, selection)))
+      .returning({ id: assets.id })
+    return rows.length
+  }
+
+  /**
+   * The ids a selection means. Trash and restore act by condition, but album membership
+   * is a join table and the vault's move routes touch faces by asset id — both genuinely
+   * need ids, resolved server-side over the same conditions rather than round-tripping
+   * a filter's results back through the client first.
+   *
+   * An explicit id list passes straight through, unfiltered. That is deliberate, not lazy:
+   * `selectionConditions` excludes the vault, which is right for a query but wrong here —
+   * moving photographs *out* of the vault sends exactly the ids of vaulted assets, and
+   * running that list past a vault-exclusive filter would silently resolve to nothing.
+   * The caller already owns the ownership and vault checks that matter for its own
+   * operation (`addAssets`, `moveIn`, `moveOut`), the same as before this existed.
+   */
+  async resolveSelection(ownerId: string, selection: AssetSelection): Promise<string[]> {
+    if (selection.assetIds) return selection.assetIds
+    const rows = await this.db
+      .select({ id: assets.id })
+      .from(assets)
+      .where(and(...this.selectionConditions(ownerId, selection)))
+    return rows.map((r) => r.id)
   }
 
   async timeline(ownerId: string, query: TimelineQuery = {}): Promise<TimelineBucket[]> {

@@ -98,6 +98,76 @@ async function addPhoto(
   return row!
 }
 
+/** A bare asset row, for tests that exercise face bookkeeping without real detection. */
+async function addBareAsset(overrides: Partial<typeof assets.$inferInsert> = {}) {
+  counter++
+  const [row] = await db
+    .insert(assets)
+    .values({
+      ownerId,
+      type: 'image',
+      status: 'ready',
+      originalFilename: `bare-${counter}.jpg`,
+      mimeType: 'image/jpeg',
+      checksum: counter.toString(16).padStart(64, '0'),
+      sizeBytes: 1000,
+      originalPath: `bare/${counter}.jpg`,
+      capturedAt: new Date(),
+      ...overrides,
+    })
+    .returning()
+  return row!
+}
+
+async function addFace(assetId: string, personId: string) {
+  await db.insert(faces).values({
+    assetId,
+    ownerId,
+    personId,
+    x: 0,
+    y: 0,
+    width: 10,
+    height: 10,
+    score: 0.9,
+    embedding: Array(512).fill(0),
+  })
+}
+
+describe('forgetting a set of assets', () => {
+  test('deletes every face for the listed assets and recounts once', async () => {
+    const [person] = await db.insert(people).values({ ownerId, name: 'Group' }).returning()
+    const a = await addBareAsset()
+    const b = await addBareAsset()
+    await addFace(a.id, person!.id)
+    await addFace(b.id, person!.id)
+
+    await service.forgetAssets([a.id, b.id], ownerId)
+
+    expect(await db.select().from(faces)).toBeEmpty()
+    // The person existed only in those photos, so recounting removes them too.
+    expect(await db.select().from(people)).toBeEmpty()
+  })
+
+  test('leaves another person’s faces alone', async () => {
+    const [kept] = await db.insert(people).values({ ownerId, name: 'Kept' }).returning()
+    const [forgotten] = await db.insert(people).values({ ownerId, name: 'Forgotten' }).returning()
+    const keptAsset = await addBareAsset()
+    const forgottenAsset = await addBareAsset()
+    await addFace(keptAsset.id, kept!.id)
+    await addFace(forgottenAsset.id, forgotten!.id)
+
+    await service.forgetAssets([forgottenAsset.id], ownerId)
+
+    const remaining = await db.select().from(faces)
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]!.assetId).toBe(keptAsset.id)
+  })
+
+  test('does nothing for an empty list', async () => {
+    await expect(service.forgetAssets([], ownerId)).resolves.toBeUndefined()
+  })
+})
+
 describe.skipIf(!canRun)('detecting faces', () => {
   test('finds the face in a portrait', async () => {
     const asset = await addPhoto('person-a.png')
