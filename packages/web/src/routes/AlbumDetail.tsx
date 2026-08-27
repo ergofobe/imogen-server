@@ -31,7 +31,7 @@ export function AlbumDetail() {
   const { selected, toggle, clear, selectAll } = useSelection(ids)
 
   // The album is fetched whole, so the grid gets its geometry rather than its machinery.
-  const { containerRef, options } = useGridLayout()
+  const { attachContainer, options } = useGridLayout()
   const photographs = useMemo(() => album?.assets ?? [], [album])
   const { table, tiles } = useAssetTable(photographs, options)
 
@@ -56,6 +56,7 @@ export function AlbumDetail() {
       setConfirmingTrash(null)
       refresh()
       void queryClient.invalidateQueries({ queryKey: ['assets'] })
+      void queryClient.invalidateQueries({ queryKey: ['timeline'] })
     },
   })
 
@@ -135,7 +136,7 @@ export function AlbumDetail() {
           table={table}
           tiles={tiles}
           options={options}
-          containerRef={containerRef}
+          attachContainer={attachContainer}
           selected={selected}
           onOpen={(tile) => openPhoto(tile.id)}
           onToggleSelect={(tile, shiftKey) => toggle(tile.id, shiftKey)}

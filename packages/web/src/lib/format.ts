@@ -18,6 +18,11 @@ const DAY_WITH_YEAR_UTC = new Intl.DateTimeFormat(undefined, {
   year: 'numeric',
   timeZone: 'UTC',
 })
+const CAPTURE_MOMENT = new Intl.DateTimeFormat(undefined, {
+  dateStyle: 'full',
+  timeStyle: 'medium',
+  timeZone: 'UTC',
+})
 const MONTH_YEAR = new Intl.DateTimeFormat(undefined, { month: 'short', year: 'numeric' })
 const EXACT = new Intl.DateTimeFormat(undefined, { dateStyle: 'full', timeStyle: 'short' })
 
@@ -40,6 +45,15 @@ export function formatDayKeyHeading(day: string): string {
   const thisYear = date.getUTCFullYear() === new Date().getUTCFullYear()
   return (thisYear ? DAY_UTC : DAY_WITH_YEAR_UTC).format(date)
 }
+
+/**
+ * A photograph named by when it was taken, for a tile that has no filename to be named by.
+ *
+ * To the second, and in UTC like every other date the timeline speaks: forty photographs
+ * from one afternoon have to be forty different names, or a screen reader reads out forty
+ * identical buttons and none of them can be told apart or referred to.
+ */
+export const formatCaptureMoment = (iso: string) => CAPTURE_MOMENT.format(new Date(iso))
 
 export const formatMonthYear = (iso: string) => MONTH_YEAR.format(new Date(iso))
 export const formatExact = (iso: string) => EXACT.format(new Date(iso))

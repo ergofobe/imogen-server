@@ -9,13 +9,21 @@ import {
   periodOf,
   type SegmentTable,
 } from '../lib/timelineLayout.ts'
-import { evictPeriods, mergeDays, periodsToFetch } from './timelineWindow.ts'
+import {
+  collectPeriod,
+  evictPeriods,
+  mergeDays,
+  periodsOutOfDate,
+  periodsToFetch,
+} from './timelineWindow.ts'
 
 export {
   anchoredScrollTop,
+  collectPeriod,
   evictPeriods,
   MAX_LOADED_PERIODS,
   mergeDays,
+  periodsOutOfDate,
   periodsToFetch,
 } from './timelineWindow.ts'
 
@@ -90,7 +98,7 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
   const measured = useRef(new Map<string, number>())
 
   const pinned = useRef<string[]>([])
-  const loadedPeriods = useRef<string[]>([])
+  const loadedNow = useRef<LoadedTiles>(NOTHING_LOADED)
   const inFlight = useRef(new Set<string>())
   /** Bumped when the filter changes, so a reply to the old question is dropped. */
   const generation = useRef(0)
@@ -100,8 +108,8 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
   }, [visiblePeriods])
 
   useLayoutEffect(() => {
-    loadedPeriods.current = loaded.periods
-  }, [loaded.periods])
+    loadedNow.current = loaded
+  }, [loaded])
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: a filter change is the one thing that invalidates everything held
   useEffect(() => {
@@ -117,20 +125,11 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
       inFlight.current.add(period)
       const era = generation.current
       try {
-        const collected: TimelineTile[] = []
-        let cursor: string | undefined
-        // The endpoint pages at 5000 and a heavy month runs well past that. Every page is
-        // gathered before any of them lands, because a day straddling a page boundary only
-        // reaches the count that lets it be measured once the last page is in.
-        do {
-          const page = await imogen.assets.timelineBucket({
-            ...query,
-            period,
-            ...(cursor ? { cursor } : {}),
-          })
-          collected.push(...page.items)
-          cursor = page.nextCursor ?? undefined
-        } while (cursor)
+        // The endpoint pages at 5000 and a heavy month runs well past that; `collectPeriod`
+        // follows the cursor to the end before any of it lands.
+        const collected = await collectPeriod((cursor) =>
+          imogen.assets.timelineBucket({ ...query, period, ...(cursor ? { cursor } : {}) }),
+        )
 
         if (era !== generation.current) return
         setLoaded((current) => absorb(current, period, collected, pinned.current))
@@ -154,9 +153,22 @@ export function useTimeline(filter: Partial<AssetFilter>, options: LayoutOptions
     }
   }, [wanted, suspended, loaded.periods, loadPeriod])
 
+  /*
+   * The tile map is not a query, so nothing invalidates it. When a fresh spine disagrees with
+   * what a loaded month holds — an upload landed, a date was corrected, a day was emptied —
+   * that month is fetched again in place. This is what makes invalidating `['timeline']` the
+   * only thing a mutation anywhere in the app has to do.
+   *
+   * The map is read through a ref rather than taken as a dependency: depending on it would
+   * re-run this on its own result, and only a fresh spine can make a loaded month stale.
+   */
+  useEffect(() => {
+    for (const period of periodsOutOfDate(buckets, loadedNow.current)) void loadPeriod(period)
+  }, [buckets, loadPeriod])
+
   const reload = useCallback(() => {
     void queryClient.invalidateQueries({ queryKey: ['timeline'] })
-    for (const period of loadedPeriods.current) void loadPeriod(period)
+    for (const period of loadedNow.current.periods) void loadPeriod(period)
   }, [queryClient, loadPeriod])
 
   /*

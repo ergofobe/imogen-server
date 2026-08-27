@@ -3,10 +3,12 @@ import type { TimelineBucket, TimelineTile } from '@imogen/shared'
 import { buildSegments, type LayoutOptions } from '../lib/timelineLayout.ts'
 import {
   anchoredScrollTop,
+  collectPeriod,
   evictPeriods,
   MAX_LOADED_PERIODS,
   mergeDays,
   neighbouringPeriod,
+  periodsOutOfDate,
   periodsToFetch,
   tilesInTimelineOrder,
 } from './timelineWindow.ts'
@@ -88,14 +90,12 @@ describe('mergeDays', () => {
     livePhotoVideoId: null,
   })
 
-  // The bucket endpoint pages at 5000. A wedding shot across a page boundary only ever
-  // reaches its bucket count if the second page adds to the first rather than replacing
-  // it — otherwise the day sits on an estimate for as long as it is loaded.
-  test('a day split across two pages ends up whole', () => {
-    const first = [tile('a', '2011-08-14T09:00:00.000Z')]
-    const second = [tile('b', '2011-08-14T10:00:00.000Z')]
-    const merged = mergeDays(new Map(), '2011-08', [...first, ...second])
-    expect(merged.get('2011-08-14')!.map((t) => t.id)).toEqual(['a', 'b'])
+  test('a whole period becomes days', () => {
+    const merged = mergeDays(new Map(), '2011-08', [
+      tile('a', '2011-08-14T09:00:00.000Z'),
+      tile('b', '2011-08-15T10:00:00.000Z'),
+    ])
+    expect([...merged.keys()].sort()).toEqual(['2011-08-14', '2011-08-15'])
   })
 
   test('reloading a period replaces its own days rather than doubling them', () => {
@@ -315,5 +315,119 @@ describe('tilesInTimelineOrder', () => {
     test('a day the spine does not know reports nothing', () => {
       expect(neighbouringPeriod(table, '1999-01-01', 1)).toBeNull()
     })
+  })
+})
+
+describe('collectPeriod', () => {
+  const tile = (id: string, capturedAt: string): TimelineTile => ({
+    id,
+    capturedAt,
+    width: 4032,
+    height: 3024,
+    type: 'image',
+    status: 'ready',
+    favorite: false,
+    duration: null,
+    placeholderColor: null,
+    livePhotoVideoId: null,
+  })
+
+  /** A server that answers in pages, and records exactly what it was asked for. */
+  const pager = (pages: Array<{ items: TimelineTile[]; nextCursor: string | null }>) => {
+    const asked: Array<string | undefined> = []
+    let next = 0
+    return {
+      asked,
+      fetchPage: async (cursor: string | undefined) => {
+        asked.push(cursor)
+        return pages[next++]!
+      },
+    }
+  }
+
+  // The property correction #3 was about, and the one that would revert silently: the
+  // endpoint pages at 5000, and a heavy day split across a page boundary only reaches its
+  // bucket count — and so is only ever measured rather than estimated — if the pages add up.
+  test('a day split across three pages ends up whole and in order', async () => {
+    const { fetchPage, asked } = pager([
+      { items: [tile('a', '2011-08-14T09:00:00.000Z')], nextCursor: 'c1' },
+      { items: [tile('b', '2011-08-14T10:00:00.000Z')], nextCursor: 'c2' },
+      { items: [tile('c', '2011-08-14T11:00:00.000Z')], nextCursor: null },
+    ])
+    const collected = await collectPeriod(fetchPage)
+
+    expect(collected.map((t) => t.id)).toEqual(['a', 'b', 'c'])
+    expect(asked).toEqual([undefined, 'c1', 'c2'])
+    expect(mergeDays(new Map(), '2011-08', collected).get('2011-08-14')).toHaveLength(3)
+  })
+
+  test('a period that fits in one page asks once and stops', async () => {
+    const { fetchPage, asked } = pager([
+      { items: [tile('a', '2011-08-14T09:00:00.000Z')], nextCursor: null },
+    ])
+    expect(await collectPeriod(fetchPage)).toHaveLength(1)
+    expect(asked).toEqual([undefined])
+  })
+
+  test('an empty period is an empty period, not a hang', async () => {
+    const { fetchPage } = pager([{ items: [], nextCursor: null }])
+    expect(await collectPeriod(fetchPage)).toEqual([])
+  })
+})
+
+describe('periodsOutOfDate', () => {
+  const tile = (id: string, capturedAt: string): TimelineTile => ({
+    id,
+    capturedAt,
+    width: 4032,
+    height: 3024,
+    type: 'image',
+    status: 'ready',
+    favorite: false,
+    duration: null,
+    placeholderColor: null,
+    livePhotoVideoId: null,
+  })
+
+  const august = {
+    byDay: new Map([
+      ['2011-08-14', [tile('a', '2011-08-14T09:00:00.000Z')]],
+      ['2011-08-15', [tile('b', '2011-08-15T09:00:00.000Z')]],
+    ]),
+    periods: ['2011-08'],
+  }
+
+  test('a spine that agrees asks for nothing', () => {
+    expect(periodsOutOfDate([bucket('2011-08-15', 1), bucket('2011-08-14', 1)], august)).toEqual([])
+  })
+
+  // The upload case: the spine has counted the new photograph and the tile map has not, so
+  // the day would draw one photograph inside a section sized for two.
+  test('a day that has gained a photograph makes its month stale', () => {
+    expect(periodsOutOfDate([bucket('2011-08-15', 1), bucket('2011-08-14', 2)], august)).toEqual([
+      '2011-08',
+    ])
+  })
+
+  test('a day that has lost its last photograph makes its month stale', () => {
+    expect(periodsOutOfDate([bucket('2011-08-15', 1)], august)).toEqual(['2011-08'])
+  })
+
+  // The first upload to a day that did not exist before: nothing to compare counts against,
+  // so the absence of the day in a month that is loaded is itself the disagreement.
+  test('a brand new day in a loaded month makes it stale', () => {
+    const buckets = [bucket('2011-08-16', 1), bucket('2011-08-15', 1), bucket('2011-08-14', 1)]
+    expect(periodsOutOfDate(buckets, august)).toEqual(['2011-08'])
+  })
+
+  test('a new day in a month nobody has loaded is left alone', () => {
+    const buckets = [bucket('2011-09-01', 1), bucket('2011-08-15', 1), bucket('2011-08-14', 1)]
+    expect(periodsOutOfDate(buckets, august)).toEqual([])
+  })
+
+  test('nothing loaded is never out of date', () => {
+    expect(periodsOutOfDate([bucket('2011-08-14', 9)], { byDay: new Map(), periods: [] })).toEqual(
+      [],
+    )
   })
 })

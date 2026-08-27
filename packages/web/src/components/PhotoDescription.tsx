@@ -6,8 +6,15 @@ import { imogen } from '../lib/client.ts'
 /** Matches the limit the API enforces, so the field stops before the request fails. */
 const MAX_LENGTH = 4096
 
-/** Query keys whose data holds assets, and so goes stale when a description changes. */
-const ASSET_QUERIES = new Set(['assets', 'album', 'person', 'vault-assets'])
+/**
+ * Query keys whose data holds assets, and so goes stale when a description changes.
+ *
+ * `timeline` is the spine the windowed grid is laid out from, and `asset` is the whole
+ * photograph the viewer fetches for itself. The grid's tile map follows the spine on its
+ * own — it refetches whatever month the new counts disagree with — so refreshing the spine
+ * is all this has to do.
+ */
+const ASSET_QUERIES = new Set(['assets', 'album', 'person', 'vault-assets', 'timeline', 'asset'])
 
 /**
  * What the photograph is of, in the owner's own words.

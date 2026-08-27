@@ -40,7 +40,7 @@ export function SharedAlbum() {
     retry: false,
   })
 
-  const { containerRef, options } = useGridLayout()
+  const { attachContainer, options } = useGridLayout()
   const photographs = useMemo(() => (data && !data.locked ? data.album.assets : []), [data])
   const { table, tiles } = useAssetTable(photographs, options)
 
@@ -149,7 +149,7 @@ export function SharedAlbum() {
               table={table}
               tiles={tiles}
               options={options}
-              containerRef={containerRef}
+              attachContainer={attachContainer}
               selected={EMPTY_SELECTION}
               onOpen={(tile) => openPhoto(tile.id)}
               onToggleSelect={() => {}}

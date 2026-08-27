@@ -51,7 +51,10 @@ export function UploadDrawer({ open, onClose }: { open: boolean; onClose: () => 
       })
 
       setBusy(false)
+      // The timeline spine is what sizes the grid, and its tile map follows the spine, so a
+      // photograph uploaded while the timeline is open appears without leaving the page.
       void queryClient.invalidateQueries({ queryKey: ['assets'] })
+      void queryClient.invalidateQueries({ queryKey: ['timeline'] })
     },
     [queryClient],
   )

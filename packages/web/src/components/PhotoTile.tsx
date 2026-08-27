@@ -1,6 +1,6 @@
 import type { Asset, TimelineTile } from '@imogen/shared'
 import { useAssetUrls } from '../lib/assetUrls.tsx'
-import { formatDayKeyHeading, formatDuration } from '../lib/format.ts'
+import { formatCaptureMoment, formatDuration } from '../lib/format.ts'
 
 /**
  * A tile draws from whichever of the two shapes the caller happens to hold. The windowed
@@ -22,10 +22,16 @@ type Props = {
   onToggleSelect: (asset: TileSubject, shiftKey: boolean) => void
 }
 
-/** What to call a photograph out loud. A tile knows its date even when it has no filename. */
+/**
+ * What to call a photograph out loud.
+ *
+ * A tile has no filename, so it is named by the moment it was taken — to the second, because
+ * a day's worth of tiles named only by their day would be a screen full of buttons a screen
+ * reader cannot tell apart, and the grid is nothing but buttons.
+ */
 function nameOf(asset: TileSubject): string {
   if ('originalFilename' in asset) return asset.originalFilename
-  return `photo from ${formatDayKeyHeading(asset.capturedAt.slice(0, 10))}`
+  return `photo taken ${formatCaptureMoment(asset.capturedAt)}`
 }
 
 /**

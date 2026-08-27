@@ -1,5 +1,5 @@
 import type { TimelineTile } from '@imogen/shared'
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { anchoredScrollTop } from '../hooks/timelineWindow.ts'
 import { DAY_HEADER_CLASS, DAY_HEADING_CLASS } from '../hooks/useGridLayout.ts'
 import { formatDayKeyHeading } from '../lib/format.ts'
@@ -17,8 +17,12 @@ type Props = {
   table: SegmentTable
   tiles: Map<string, TimelineTile[]>
   options: LayoutOptions
-  /** Owned by `useGridLayout`, because the options above are measured from this element. */
-  containerRef: React.RefObject<HTMLDivElement | null>
+  /**
+   * From `useGridLayout`, which measures the options above off this element. A callback ref
+   * rather than a ref object, because the grid appears after its route's first commit and an
+   * observer looking for it then would never find it.
+   */
+  attachContainer: (element: HTMLDivElement | null) => void
   selected: Set<string>
   onOpen: (tile: TimelineTile) => void
   onToggleSelect: (tile: TimelineTile, shiftKey: boolean) => void
@@ -55,28 +59,39 @@ export function PhotoGrid({
   table,
   tiles,
   options,
-  containerRef,
+  attachContainer,
   selected,
   onOpen,
   onToggleSelect,
   onVisibleRangeChange,
   selectable = true,
 }: Props) {
+  const container = useRef<HTMLDivElement | null>(null)
   const [band, setBand] = useState({ top: 0, height: 0 })
   const previousTable = useRef<SegmentTable | null>(null)
   const readBand = useRef<(() => void) | undefined>(undefined)
   const reportRange = useRef(onVisibleRangeChange)
   reportRange.current = onVisibleRangeChange
 
+  // One element, two readers: the hook measures it, and everything below reads scroll
+  // positions off it. Keeping a local handle avoids asking the hook for its element back.
+  const attach = useCallback(
+    (element: HTMLDivElement | null) => {
+      container.current = element
+      attachContainer(element)
+    },
+    [attachContainer],
+  )
+
   useEffect(() => {
-    const container = containerRef.current
-    if (!container) return
-    const scroller = scrollingAncestorOf(container)
+    const element = container.current
+    if (!element) return
+    const scroller = scrollingAncestorOf(element)
 
     let frame = 0
     const read = () => {
       frame = 0
-      const top = scroller.scrollTop - gridOffsetWithin(container, scroller)
+      const top = scroller.scrollTop - gridOffsetWithin(element, scroller)
       const height = scroller.clientHeight
       reportRange.current?.(top, top + height)
       // Only the band reaches React. The exact position goes to the caller, which uses it
@@ -104,7 +119,7 @@ export function PhotoGrid({
       source.removeEventListener('scroll', schedule)
       window.removeEventListener('resize', schedule)
     }
-  }, [containerRef])
+  }, [])
 
   /**
    * When a day's real measurements replace its estimate, every day below it moves. If that
@@ -119,15 +134,15 @@ export function PhotoGrid({
   useLayoutEffect(() => {
     const previous = previousTable.current
     previousTable.current = table
-    const container = containerRef.current
+    const element = container.current
 
-    if (container && previous && previous.segments.length > 0) {
-      const scroller = scrollingAncestorOf(container)
+    if (element && previous && previous.segments.length > 0) {
+      const scroller = scrollingAncestorOf(element)
       const target = anchoredScrollTop(
         previous,
         table,
         scroller,
-        gridOffsetWithin(container, scroller),
+        gridOffsetWithin(element, scroller),
       )
       if (target !== scroller.scrollTop) scroller.scrollTop = target
     }
@@ -137,7 +152,7 @@ export function PhotoGrid({
     // Reading again here is what draws the right days and tells the caller which months it
     // needs, without waiting for the reader to touch the page.
     readBand.current?.()
-  }, [table, containerRef])
+  }, [table])
 
   const visible = useMemo(
     () => segmentsInRange(table, band.top - OVERSCAN, band.top + band.height + OVERSCAN),
@@ -148,7 +163,7 @@ export function PhotoGrid({
 
   return (
     <div
-      ref={containerRef}
+      ref={attach}
       className="w-full"
       style={{ position: 'relative', height: table.totalHeight }}
     >

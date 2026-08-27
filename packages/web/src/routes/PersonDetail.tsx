@@ -46,7 +46,7 @@ export function PersonDetail() {
     },
   })
 
-  const { containerRef, options } = useGridLayout()
+  const { attachContainer, options } = useGridLayout()
   const photos = useMemo(() => person?.photos ?? [], [person])
   const { table, tiles } = useAssetTable(photos, options)
 
@@ -149,7 +149,7 @@ export function PersonDetail() {
           table={table}
           tiles={tiles}
           options={options}
-          containerRef={containerRef}
+          attachContainer={attachContainer}
           selected={EMPTY_SELECTION}
           onOpen={(tile) => openPhoto(tile.id)}
           onToggleSelect={() => {}}

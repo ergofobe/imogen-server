@@ -1,4 +1,4 @@
-import type { TimelineTile } from '@imogen/shared'
+import type { TimelineBucket, TimelineTile } from '@imogen/shared'
 import { groupTilesByDay, periodOf, type SegmentTable, scrollDelta } from '../lib/timelineLayout.ts'
 
 /**
@@ -51,6 +51,67 @@ export function evictPeriods(usedInOrder: string[], pinned: string[]): string[] 
     keep.add(usedInOrder[i]!)
   }
   return usedInOrder.filter((period) => keep.has(period))
+}
+
+/** One page of the bucket endpoint: the shape `imogen.assets.timelineBucket` answers with. */
+export type TilePage = { items: TimelineTile[]; nextCursor: string | null }
+
+/**
+ * One period, whole, however many pages the server chooses to answer in.
+ *
+ * The cursor is followed to null and the pages are concatenated before anything is returned,
+ * because a period is only useful complete: a day straddling a page boundary holds fewer
+ * tiles than its bucket count until the last page is in, and the geometry module rightly
+ * refuses to measure a day that looks half empty. Landing a page at a time would leave such
+ * a day on an estimate for as long as it stayed loaded.
+ *
+ * Takes the fetch as an argument so this can be exercised without the SDK client, which
+ * reads `window` the moment it is imported.
+ */
+export async function collectPeriod(
+  fetchPage: (cursor: string | undefined) => Promise<TilePage>,
+): Promise<TimelineTile[]> {
+  const collected: TimelineTile[] = []
+  let cursor: string | undefined
+  do {
+    const page = await fetchPage(cursor)
+    for (const tile of page.items) collected.push(tile)
+    cursor = page.nextCursor ?? undefined
+  } while (cursor)
+  return collected
+}
+
+/**
+ * The loaded months the spine no longer agrees with, and which therefore have to be fetched
+ * again.
+ *
+ * The tile map is not a query and nothing invalidates it, so without this an upload landing
+ * mid-scroll would size its day for one more photograph than the day draws — the spine knows
+ * about it, the tiles do not — and a photograph given a corrected date would leave both the
+ * day it left and the day it joined wrong. Comparing counts makes the spine the single thing
+ * that has to be refreshed after a mutation: whatever it says has changed is refetched, and
+ * the caller does not have to know which days a mutation touched.
+ *
+ * A day the spine now lists that a loaded month holds no tiles for counts as a disagreement
+ * too: that is exactly what a new day's first upload looks like.
+ */
+export function periodsOutOfDate(
+  buckets: TimelineBucket[],
+  loaded: { byDay: Map<string, TimelineTile[]>; periods: string[] },
+): string[] {
+  if (loaded.periods.length === 0) return []
+  const loadedPeriods = new Set(loaded.periods)
+  const counted = new Map(buckets.map((bucket) => [bucket.date, bucket.count]))
+
+  const stale = new Set<string>()
+  for (const [day, tiles] of loaded.byDay) {
+    if (counted.get(day) !== tiles.length) stale.add(periodOf(day))
+  }
+  for (const bucket of buckets) {
+    const period = periodOf(bucket.date)
+    if (loadedPeriods.has(period) && !loaded.byDay.has(bucket.date)) stale.add(period)
+  }
+  return loaded.periods.filter((period) => stale.has(period))
 }
 
 /**

@@ -4,8 +4,15 @@ import { useEffect, useState } from 'react'
 import { imogen } from '../lib/client.ts'
 import { formatExact } from '../lib/format.ts'
 
-/** Query keys whose data holds assets, and so goes stale when a date changes. */
-const ASSET_QUERIES = new Set(['assets', 'album', 'person', 'vault-assets'])
+/**
+ * Query keys whose data holds assets, and so goes stale when a date changes.
+ *
+ * `timeline` is the spine the windowed grid is laid out from, and `asset` is the whole
+ * photograph the viewer fetches for itself. The grid's tile map follows the spine on its
+ * own — it refetches whatever month the new counts disagree with — so refreshing the spine
+ * is all this has to do.
+ */
+const ASSET_QUERIES = new Set(['assets', 'album', 'person', 'vault-assets', 'timeline', 'asset'])
 
 const MONTHS = [
   'January',

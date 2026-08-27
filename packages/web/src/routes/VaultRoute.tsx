@@ -36,7 +36,7 @@ export function VaultRoute() {
   const ids = assets?.map((a) => a.id) ?? []
   const { selected, toggle, clear, selectAll } = useSelection(ids)
 
-  const { containerRef, options } = useGridLayout()
+  const { attachContainer, options } = useGridLayout()
   const photographs = useMemo(() => assets ?? [], [assets])
   const { table, tiles } = useAssetTable(photographs, options)
 
@@ -44,6 +44,7 @@ export function VaultRoute() {
     void queryClient.invalidateQueries({ queryKey: ['vault-status'] })
     void queryClient.invalidateQueries({ queryKey: ['vault-assets'] })
     void queryClient.invalidateQueries({ queryKey: ['assets'] })
+    void queryClient.invalidateQueries({ queryKey: ['timeline'] })
   }
 
   const moveOut = useMutation({
@@ -90,7 +91,7 @@ export function VaultRoute() {
           table={table}
           tiles={tiles}
           options={options}
-          containerRef={containerRef}
+          attachContainer={attachContainer}
           selected={selected}
           onOpen={(tile) => openPhoto(tile.id)}
           onToggleSelect={(tile, shiftKey) => toggle(tile.id, shiftKey)}

@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useLayoutEffect, useMemo, useState } from 'react'
 import type { LayoutOptions } from '../lib/timelineLayout.ts'
 
 /**
@@ -38,17 +38,22 @@ export function targetHeightFor(width: number): number {
 }
 
 export type GridLayout = {
-  /** Attach to the element the grid draws into; everything else is measured from it. */
-  containerRef: React.RefObject<HTMLDivElement | null>
+  /**
+   * A callback ref for the element the grid draws into. It has to be a callback rather than
+   * a ref object: every route that uses a grid returns something else first — a skeleton
+   * while the spine loads, a lock screen, an empty state — so on the first commit there is
+   * no element to observe, and an effect that looked for one then would look exactly once
+   * and never find it. The grid would stay zero-wide, and so stay blank, for good.
+   */
+  attachContainer: (element: HTMLDivElement | null) => void
   options: LayoutOptions
 }
 
 export function useGridLayout(): GridLayout {
-  const containerRef = useRef<HTMLDivElement>(null)
+  const [container, setContainer] = useState<HTMLDivElement | null>(null)
   const [metrics, setMetrics] = useState({ width: 0, headerHeight: DERIVED_HEADER_HEIGHT })
 
   useLayoutEffect(() => {
-    const container = containerRef.current
     if (!container) return
 
     // The observer fires on height too, and the grid's height changes every time a day
@@ -68,7 +73,7 @@ export function useGridLayout(): GridLayout {
     })
     observer.observe(container)
     return () => observer.disconnect()
-  }, [])
+  }, [container])
 
   const options = useMemo<LayoutOptions>(
     () => ({
@@ -81,7 +86,7 @@ export function useGridLayout(): GridLayout {
     [metrics],
   )
 
-  return { containerRef, options }
+  return { attachContainer: setContainer, options }
 }
 
 /**

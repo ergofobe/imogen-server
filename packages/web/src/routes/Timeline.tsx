@@ -28,7 +28,7 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
   const queryClient = useQueryClient()
   const { openId, open: openPhoto, replace: showPhoto, close: closePhoto } = useViewerParam()
 
-  const { containerRef, options } = useGridLayout()
+  const { attachContainer, options } = useGridLayout()
   const { table, tiles, isPending, totalCount, requestPeriods, reload } = useTimeline(
     query,
     options,
@@ -183,7 +183,7 @@ export function Timeline({ title, query = {}, empty, mode = 'library' }: Props) 
           table={table}
           tiles={tiles}
           options={options}
-          containerRef={containerRef}
+          attachContainer={attachContainer}
           selected={selected}
           onOpen={(tile) => openPhoto(tile.id)}
           onToggleSelect={(tile, shiftKey) => toggle(tile.id, shiftKey)}
