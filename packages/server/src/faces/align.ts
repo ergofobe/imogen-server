@@ -1,4 +1,4 @@
-import sharp from 'sharp'
+import { openOriginal } from '../media/decode.ts'
 
 /**
  * ArcFace's canonical five-point template, in the 112x112 space every embedding is
@@ -65,7 +65,7 @@ export async function alignFace(
   landmarks: Array<[number, number]>,
 ): Promise<Float32Array> {
   // Upright, to match the frame the landmarks were detected in.
-  const { data, info } = await sharp(imagePath)
+  const { data, info } = await openOriginal(imagePath)
     .rotate()
     .removeAlpha()
     .raw()

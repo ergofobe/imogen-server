@@ -286,6 +286,30 @@ describe('failure handling', () => {
   })
 })
 
+describe('a half-uploaded photograph', () => {
+  /*
+   * An upload that dies mid-transfer leaves a valid JPEG header followed by a partial
+   * scan. The rows that arrived are a real photograph, so it belongs in the library —
+   * not marked failed because the tail is missing.
+   */
+  test('still yields derivatives from the rows that arrived', async () => {
+    const truncated = join(workDir, 'truncated.jpg')
+    const full = await Bun.file(jpegPath).arrayBuffer()
+    await Bun.write(truncated, new Uint8Array(full).subarray(0, Math.floor(full.byteLength * 0.7)))
+
+    const result = await pipeline.process(truncated, {
+      mimeType: 'image/jpeg',
+      filename: 'truncated.jpg',
+    })
+
+    expect(result.error).toBeNull()
+    expect(result.thumbnail).not.toBeNull()
+    expect(result.preview).not.toBeNull()
+    expect(result.width).toBe(1600)
+    expect(result.height).toBe(1200)
+  })
+})
+
 describe('storage', () => {
   test('round-trips a file through the local driver', async () => {
     const stored = await storage.write('a/b/c.txt', 'hello')
