@@ -258,17 +258,20 @@ export class AssetService {
    * a hundred thousand photographs never become a hundred thousand uuids — not in a
    * request body, not in a Set, and not in an `in` list.
    *
-   * Both branches exclude the vault: the query branch gets it free from `buildFilters`,
-   * and the id branch repeats it explicitly, so neither a `query` nor an `assetIds`
-   * selection can ever reach a vaulted photograph.
+   * The invariant across both branches, which is the same one `resolveSelection` states
+   * below: A QUERY MAY NEVER REACH THE VAULT; AN EXPLICIT ID LIST MAY. A query is parsed
+   * from a URL, so anything it can express is expressible by whoever holds the URL, and
+   * the vault is precisely the thing no URL may reach — the query branch gets that from
+   * `buildFilters` and it is not repeated here. An id list is the opposite act: the caller
+   * is naming one photograph it already had to get past the vault's own gate to see, and
+   * the vault's viewer trashes exactly that way. Excluding the vault here too made that
+   * button match zero rows, answer `{count: 0}`, and say nothing about it.
+   *
+   * Ownership is checked on both branches regardless: knowing an id is not owning it.
    */
   private selectionConditions(ownerId: string, selection: AssetSelection): SQL[] {
     if (selection.assetIds) {
-      return [
-        eq(assets.ownerId, ownerId),
-        isNull(assets.vaultedAt),
-        inArray(assets.id, selection.assetIds),
-      ]
+      return [eq(assets.ownerId, ownerId), inArray(assets.id, selection.assetIds)]
     }
     const conditions = this.buildFilters(ownerId, selection.query!)
     if (selection.except?.length) conditions.push(notInArray(assets.id, selection.except))
@@ -285,17 +288,23 @@ export class AssetService {
   }
 
   /**
-   * The weaker sibling of the vault move-out gap: a `query`-form selection here with no
-   * `trashed: true` inherits `isNull(assets.deletedAt)` from `buildFilters`'s untrashed
-   * default, so it matches nothing and restores nothing — a silent no-op rather than a
-   * rejected request. Left as-is: unlike vault move-out, `trashed: true` gives a query a
-   * real, correct way to mean "the trash", so there is no case that can only ever fail.
+   * `isNotNull(assets.deletedAt)` is the mirror of the `isNull` guard `trashSelection`
+   * carries, and it is load-bearing twice over: without it an id list of ten photographs
+   * of which two were in the trash cleared `deletedAt` on all ten, gave the other eight a
+   * fresh `updatedAt` for nothing, and answered `{count: 10}` — which is the number the UI
+   * reads back to the reader. The count has to be what was actually restored.
+   *
+   * The weaker sibling of the vault move-out gap survives it: a `query`-form selection with
+   * no `trashed: true` inherits `isNull(assets.deletedAt)` from `buildFilters`'s untrashed
+   * default and so contradicts the guard below, matching nothing — a silent no-op rather
+   * than a rejected request. Left as-is: unlike vault move-out, `trashed: true` gives a
+   * query a real, correct way to mean "the trash", so there is no case that can only fail.
    */
   async restoreSelection(ownerId: string, selection: AssetSelection): Promise<number> {
     const rows = await this.db
       .update(assets)
       .set({ deletedAt: null, updatedAt: new Date() })
-      .where(and(...this.selectionConditions(ownerId, selection)))
+      .where(and(...this.selectionConditions(ownerId, selection), isNotNull(assets.deletedAt)))
       .returning({ id: assets.id })
     return rows.length
   }
@@ -306,12 +315,12 @@ export class AssetService {
    * need ids, resolved server-side over the same conditions rather than round-tripping
    * a filter's results back through the client first.
    *
-   * An explicit id list passes straight through, unfiltered. That is deliberate, not lazy:
-   * `selectionConditions` excludes the vault, which is right for a query but wrong here —
-   * moving photographs *out* of the vault sends exactly the ids of vaulted assets, and
-   * running that list past a vault-exclusive filter would silently resolve to nothing.
-   * The caller already owns the ownership and vault checks that matter for its own
-   * operation (`addAssets`, `moveIn`, `moveOut`), the same as before this existed.
+   * An explicit id list passes straight through, unfiltered — not even the ownership check
+   * `selectionConditions` applies. That is deliberate, not lazy: the caller already owns
+   * the ownership and vault checks that matter for its own operation (`addAssets`,
+   * `moveIn`, `moveOut`), the same as before this existed. Moving photographs *out* of the
+   * vault sends exactly the ids of vaulted assets, which is the same reason the id branch
+   * of `selectionConditions` no longer excludes the vault either.
    *
    * Ordered `capturedAt desc, id desc` — the same order as every other listing here,
    * matching `assets_timeline_idx`. A caller that chunks this result (album membership,

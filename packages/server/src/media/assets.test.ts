@@ -451,18 +451,63 @@ describe('selections by query', () => {
   })
 
   /**
-   * `never reaches the vault`, above, goes through the QUERY branch and re-proves Task
-   * 8's `buildFilters` guard — it says nothing about the id branch's own
-   * `isNull(assets.vaultedAt)`. This drives the same asset id straight in.
+   * The other half of what `never reaches the vault` states. A QUERY is parsed from a URL,
+   * so it must never reach a vaulted photograph however it is phrased. An explicit id list
+   * is a different act: the caller is naming one photograph it already had to get past the
+   * vault's gate to see, and the vault's own viewer trashes exactly that way. Refusing it
+   * made the trash button inside the vault do nothing at all, and say nothing about it.
    */
-  test('the id form never reaches the vault either', async () => {
+  test('the id form reaches into the vault, because the caller named the photograph', async () => {
     const [vaulted] = await seed(ownerId, [
       { capturedAt: new Date('2011-08-14T09:00:00Z'), vaultedAt: new Date() },
     ])
-    expect(await service.trashSelection(ownerId, { assetIds: [vaulted!.id] })).toBe(0)
+    expect(await service.trashSelection(ownerId, { assetIds: [vaulted!.id] })).toBe(1)
     const [row] = await db.select().from(assets).where(eq(assets.id, vaulted!.id))
+    expect(row!.deletedAt).not.toBeNull()
+    // Trashed, still vaulted: trashing does not tip the vault out into the library.
     expect(row!.vaultedAt).not.toBeNull()
+  })
+
+  /**
+   * The tempting way to fix the above is to drop the vault predicate rather than to move it
+   * onto the id branch alone — which opens the query branch at the same time. These two say
+   * the query branch is still shut, and both would fail if `isNull(assets.vaultedAt)` were
+   * simply deleted from `buildFilters` instead.
+   */
+  test('a query still cannot trash a vaulted photograph, even as the only match', async () => {
+    const [vaulted] = await seed(ownerId, [
+      { capturedAt: new Date('2011-08-14T09:00:00Z'), favorite: true, vaultedAt: new Date() },
+    ])
+    expect(await service.trashSelection(ownerId, { query: { favorite: true } })).toBe(0)
+    const [row] = await db.select().from(assets).where(eq(assets.id, vaulted!.id))
     expect(row!.deletedAt).toBeNull()
+  })
+
+  test('a query for the trash still cannot restore a vaulted photograph', async () => {
+    const [vaulted] = await seed(ownerId, [
+      {
+        capturedAt: new Date('2011-08-14T09:00:00Z'),
+        vaultedAt: new Date(),
+        deletedAt: new Date(),
+      },
+    ])
+    expect(await service.restoreSelection(ownerId, { query: { trashed: true } })).toBe(0)
+    const [row] = await db.select().from(assets).where(eq(assets.id, vaulted!.id))
+    expect(row!.deletedAt).not.toBeNull()
+  })
+
+  test('the id form restores a photograph that is both trashed and vaulted', async () => {
+    const [vaulted] = await seed(ownerId, [
+      {
+        capturedAt: new Date('2011-08-14T09:00:00Z'),
+        vaultedAt: new Date(),
+        deletedAt: new Date(),
+      },
+    ])
+    expect(await service.restoreSelection(ownerId, { assetIds: [vaulted!.id] })).toBe(1)
+    const [row] = await db.select().from(assets).where(eq(assets.id, vaulted!.id))
+    expect(row!.deletedAt).toBeNull()
+    expect(row!.vaultedAt).not.toBeNull()
   })
 
   /**
@@ -484,6 +529,31 @@ describe('selections by query', () => {
     expect(
       await service.restoreSelection(ownerId, { query: { favorite: true, trashed: true } }),
     ).toBe(1)
+  })
+
+  /**
+   * `trashSelection` has always guarded with `isNull(deletedAt)`; restore had no
+   * counterpart. Ten ids of which two were in the trash cleared `deletedAt` on all ten and
+   * answered ten — and the count is exactly what the UI reads back to the reader.
+   */
+  test('restoring counts what it actually restored, not what it was handed', async () => {
+    const [trashed, untouched] = await seed(ownerId, [
+      { capturedAt: new Date('2011-08-14T09:00:00Z'), deletedAt: new Date() },
+      { capturedAt: new Date('2011-08-15T09:00:00Z') },
+    ])
+    expect(
+      await service.restoreSelection(ownerId, { assetIds: [trashed!.id, untouched!.id] }),
+    ).toBe(1)
+    const [row] = await db.select().from(assets).where(eq(assets.id, trashed!.id))
+    expect(row!.deletedAt).toBeNull()
+  })
+
+  /** And the ones it had no business touching are not touched: no spurious `updatedAt`. */
+  test('restoring leaves a photograph that was never in the trash alone', async () => {
+    const [untouched] = await seed(ownerId, [{ capturedAt: new Date('2011-08-15T09:00:00Z') }])
+    await service.restoreSelection(ownerId, { assetIds: [untouched!.id] })
+    const [row] = await db.select().from(assets).where(eq(assets.id, untouched!.id))
+    expect(row!.updatedAt).toEqual(untouched!.updatedAt)
   })
 })
 
