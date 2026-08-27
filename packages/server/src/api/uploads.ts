@@ -1,7 +1,12 @@
 import { appendFile, mkdir, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createRoute, OpenAPIHono, z } from '@hono/zod-openapi'
-import { AssetUploadResult, UploadSession, UploadSessionCreate } from '@imogen/shared'
+import {
+  AssetUploadMetadata,
+  AssetUploadResult,
+  UploadSession,
+  UploadSessionCreate,
+} from '@imogen/shared'
 import { and, eq } from 'drizzle-orm'
 import { type AppEnv, requireAuth, requireScope } from '../auth/middleware.ts'
 import { assets, uploadSessions } from '../db/schema.ts'
@@ -78,6 +83,8 @@ export function createUploadRoutes() {
             deviceAssetId: body.deviceAssetId,
             capturedAt: body.capturedAt,
             favorite: body.favorite,
+            description: body.description,
+            location: body.location,
           },
           expiresAt,
         })
@@ -178,20 +185,17 @@ export function createUploadRoutes() {
         throw badRequest(`Upload is incomplete: ${size} of ${row.sizeBytes} bytes received`)
       }
 
-      const metadata = (row.metadata ?? {}) as Record<string, unknown>
+      // The row was written from a validated body, but it may have been written by an
+      // older build; a session that cannot be re-validated is ingested without hints
+      // rather than refused after its bytes have all arrived.
+      const metadata = AssetUploadMetadata.safeParse(row.metadata ?? {})
       try {
         const result = await services.ingest.ingest({
           ownerId: principal.user.id,
           tempPath: row.tempPath,
           filename: row.filename,
           mimeType: row.mimeType,
-          metadata: {
-            ...(typeof metadata.deviceAssetId === 'string'
-              ? { deviceAssetId: metadata.deviceAssetId }
-              : {}),
-            ...(typeof metadata.capturedAt === 'string' ? { capturedAt: metadata.capturedAt } : {}),
-            ...(typeof metadata.favorite === 'boolean' ? { favorite: metadata.favorite } : {}),
-          },
+          metadata: metadata.success ? metadata.data : {},
         })
         return c.json(result, 201)
       } finally {

@@ -103,6 +103,9 @@ export function createAssetRoutes() {
                 deviceAssetId: z.string().optional(),
                 capturedAt: z.string().optional(),
                 favorite: z.string().optional(),
+                description: z.string().optional(),
+                /** A GeoPoint as JSON, for an importer carrying its own coordinates. */
+                location: z.string().optional(),
               }),
             },
           },
@@ -128,6 +131,8 @@ export function createAssetRoutes() {
         capturedAt: str(form.capturedAt),
         favorite: str(form.favorite),
         filename: str(form.filename),
+        description: str(form.description),
+        location: json(str(form.location)),
       })
       if (!metadata.success) {
         throw badRequest('Invalid upload metadata', fieldErrors(metadata.error))
@@ -376,6 +381,20 @@ export function createAssetRoutes() {
 
 function str(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+/**
+ * A multipart field carrying JSON. Undefined for both an absent field and unparseable
+ * text, which leaves the schema to reject it as a missing field rather than the request
+ * failing here with a message about syntax.
+ */
+function json(value: string | undefined): unknown {
+  if (value === undefined) return undefined
+  try {
+    return JSON.parse(value)
+  } catch {
+    return undefined
+  }
 }
 
 function fieldErrors(error: z.ZodError): Record<string, string[]> {

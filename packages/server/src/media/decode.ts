@@ -134,10 +134,18 @@ export async function decodeWithFfmpeg(
   if (seekSeconds > 0) args.push('-ss', seekSeconds.toFixed(2))
   args.push('-i', path, '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', 'pipe:1')
 
-  const proc = Bun.spawn(args, { stdout: 'pipe', stderr: 'ignore' })
-  const buffer = Buffer.from(await new Response(proc.stdout).arrayBuffer())
-  const code = await proc.exited
-  if (code === 0 && buffer.length > 0) return buffer
-  // Seeking past the end of a short clip yields nothing; retry from the start.
-  return seekSeconds > 0 ? decodeWithFfmpeg(path, ffmpegPath, 0) : null
+  try {
+    const proc = Bun.spawn(args, { stdout: 'pipe', stderr: 'ignore' })
+    const buffer = Buffer.from(await new Response(proc.stdout).arrayBuffer())
+    const code = await proc.exited
+    if (code === 0 && buffer.length > 0) return buffer
+    // Seeking past the end of a short clip yields nothing; retry from the start.
+    return seekSeconds > 0 ? decodeWithFfmpeg(path, ffmpegPath, 0) : null
+  } catch {
+    // ffmpeg is not installed here, or IMOGEN_FFMPEG_PATH points at nothing. Letting the
+    // spawn throw would abandon the whole ingest, including the photographs sharp had
+    // already decoded perfectly well; a server without ffmpeg should lose RAW and video,
+    // not everything.
+    return null
+  }
 }
