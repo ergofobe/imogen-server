@@ -2,6 +2,7 @@ import { and, cosineDistance, desc, eq, inArray, isNotNull, isNull, sql } from '
 import type ort from 'onnxruntime-node'
 import type { Database } from '../db/index.ts'
 import { assets, faces, people, settings } from '../db/schema.ts'
+import { FACE_BACKFILL_JOB, FACE_MODELS_JOB } from '../jobs/faces.ts'
 import { forbidden, notFound } from '../lib/errors.ts'
 import { bestMatch, CLUSTER, updateCentroid } from './cluster.ts'
 import { detect } from './detect.ts'
@@ -42,6 +43,11 @@ export class FaceService {
     private readonly db: Database,
     private readonly models: ModelStore,
     private readonly originalPath: (relativePath: string) => string,
+    private readonly enqueue: (
+      name: string,
+      payload: Record<string, unknown>,
+      options?: { maxAttempts?: number },
+    ) => Promise<unknown>,
   ) {}
 
   async isEnabled(): Promise<boolean> {
@@ -53,6 +59,12 @@ export class FaceService {
     return (row?.value as { enabled?: boolean } | undefined)?.enabled === true
   }
 
+  /**
+   * Switching this on is what pays for the models, so scheduling the download belongs
+   * here rather than in one of the routes that can flip it. The admin settings toggle
+   * and the button on the people page are two such routes, and a server whose flag said
+   * enabled while no download had ever been queued was the result of them disagreeing.
+   */
   async setEnabled(enabled: boolean): Promise<void> {
     await this.db
       .insert(settings)
@@ -61,7 +73,16 @@ export class FaceService {
         target: settings.key,
         set: { value: { enabled }, updatedAt: new Date() },
       })
-    if (!enabled) this.sessions = null
+
+    if (!enabled) {
+      this.sessions = null
+      return
+    }
+
+    // 190 MB over a home connection deserves more than the default handful of attempts:
+    // giving up leaves the server permanently unable to scan anything.
+    if (await this.models.isReady()) await this.enqueue(FACE_BACKFILL_JOB, {})
+    else await this.enqueue(FACE_MODELS_JOB, {}, { maxAttempts: 10 })
   }
 
   /** Whether the weights are on disk. Nothing can be scanned until they are. */

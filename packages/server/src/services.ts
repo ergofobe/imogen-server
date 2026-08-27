@@ -67,7 +67,12 @@ export function createServices(config: Config, database?: Database): Services {
   const albums = new AlbumService(db)
   const vault = new VaultService(db, { secret: config.secret })
   const models = new ModelStore(config.modelsDir)
-  const faces = new FaceService(db, models, (p) => library.absolutePath(p))
+  const faces = new FaceService(
+    db,
+    models,
+    (p) => library.absolutePath(p),
+    (name, payload, options) => queue.enqueue(name, payload, options),
+  )
   const ingest = new IngestService(db, library, thumbnails, pipeline, (name, payload) =>
     queue.enqueue(name, payload),
   )
