@@ -116,6 +116,47 @@ describe('a vaulted photo is absent from the ordinary library', () => {
     expect(body.buckets.reduce((sum, b) => sum + b.count, 0)).toBe(1)
   })
 
+  test('it is absent from a period bucket, whose tiles serialise what the route promises', async () => {
+    const { cookie, secretId, publicId } = await setup()
+    // Uploaded fixtures carry no EXIF capture time, so they land in the current month.
+    const period = new Date().toISOString().slice(0, 7)
+
+    const body = (await (
+      await request(`/api/v1/assets/timeline/bucket?period=${period}&limit=10`, {
+        headers: { Cookie: cookie },
+      })
+    ).json()) as {
+      items: Array<{
+        id: string
+        capturedAt: string
+        type: string
+        status: string
+        width: number | null
+        height: number | null
+        favorite: boolean
+        duration: number | null
+        placeholderColor: string | null
+        livePhotoVideoId: string | null
+      }>
+      nextCursor: string | null
+      total: number | null
+    }
+
+    // Pins that /timeline/bucket is reachable ahead of /:id — an id-shaped route
+    // registered first would otherwise swallow this path — and that the handler's
+    // inferred return type matches the declared pageOf(TimelineTile) response, which
+    // @hono/zod-openapi does not check at runtime.
+    expect(body.items.map((i) => i.id)).toEqual([publicId])
+    expect(body.items.map((i) => i.id)).not.toContain(secretId)
+    expect(body.total).toBe(1)
+    expect(body.nextCursor).toBeNull()
+    const tile = body.items[0]!
+    expect(tile.type).toBe('image')
+    expect(typeof tile.capturedAt).toBe('string')
+    expect('width' in tile).toBe(true)
+    expect('livePhotoVideoId' in tile).toBe(true)
+  })
+
   test('it is not counted in library statistics', async () => {
     const { cookie } = await setup()
 

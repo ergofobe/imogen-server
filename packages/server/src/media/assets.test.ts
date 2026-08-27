@@ -1,7 +1,8 @@
 import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
+import { randomUUID } from 'node:crypto'
 import { sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
-import { albumAssets, albums, assets, users } from '../db/schema.ts'
+import { albumAssets, albums, assets, faces, people, users } from '../db/schema.ts'
 import { createTestDatabase } from '../test/harness.ts'
 import { AssetService } from './assets.ts'
 
@@ -63,6 +64,21 @@ async function seedAlbum(owner: string, overridesList: Partial<typeof assets.$in
     .insert(albumAssets)
     .values(assetRows.map((row, position) => ({ albumId: album!.id, assetId: row.id, position })))
   return album!.id
+}
+
+/** A face of one person on one asset. The embedding is a placeholder — nothing here reads it. */
+async function seedFace(owner: string, personId: string, assetId: string) {
+  await db.insert(faces).values({
+    assetId,
+    ownerId: owner,
+    personId,
+    x: 0,
+    y: 0,
+    width: 10,
+    height: 10,
+    score: 0.9,
+    embedding: Array(512).fill(0),
+  })
 }
 
 describe('listing', () => {
@@ -144,6 +160,28 @@ describe('listing', () => {
     })
 
     expect(page.items.map((a) => a.id)).toEqual([video.id])
+  })
+
+  test('filters by the person appearing in the photo, once per asset regardless of face count', async () => {
+    const [withPerson, withoutPerson] = await seed(ownerId, [
+      { capturedAt: new Date('2011-08-14T09:00:00Z') },
+      { capturedAt: new Date('2011-08-15T09:00:00Z') },
+    ])
+    const [person] = await db.insert(people).values({ ownerId }).returning()
+    // Two faces of the same person on the same asset — the exists() semi-join must not
+    // duplicate the asset in the results.
+    await seedFace(ownerId, person!.id, withPerson!.id)
+    await seedFace(ownerId, person!.id, withPerson!.id)
+    void withoutPerson
+
+    const page = await service.list(ownerId, {
+      limit: 100,
+      sort: 'capturedAt',
+      order: 'desc',
+      personId: person!.id,
+    })
+
+    expect(page.items.map((a) => a.id)).toEqual([withPerson!.id])
   })
 
   test('filters by capture date range', async () => {
@@ -421,6 +459,38 @@ describe('timeline buckets', () => {
     })
     expect(second.items).toHaveLength(2)
     expect(second.items[0]!.id).not.toBe(first.items[0]!.id)
+
+    // The total is the whole period, not "whatever is left after the cursor" — a future
+    // refactor that reuses the paged condition list for the count would shrink this.
+    expect(first.total).toBe(5)
+    expect(second.total).toBe(5)
+  })
+
+  test('the cursor tie-breaks by id when many assets share one capturedAt', async () => {
+    // A bulk import is exactly what produces thousands of identical timestamps. If the
+    // cursor predicate degrades into an AND of two independent conditions instead of a
+    // true tuple comparison, rows sharing the boundary's timestamp go missing.
+    const sameMoment = new Date('2011-08-14T09:00:00Z')
+    const seeded = await seed(
+      ownerId,
+      Array.from({ length: 5 }, () => ({ capturedAt: sameMoment })),
+    )
+
+    let page = await service.bucket(ownerId, { period: '2011-08', limit: 2 })
+    const seen = [...page.items.map((t) => t.id)]
+    while (page.nextCursor) {
+      page = await service.bucket(ownerId, {
+        period: '2011-08',
+        limit: 2,
+        cursor: page.nextCursor,
+      })
+      seen.push(...page.items.map((t) => t.id))
+    }
+
+    expect(page.nextCursor).toBeNull()
+    expect(seen).toHaveLength(5)
+    expect(new Set(seen).size).toBe(5)
+    expect(new Set(seen)).toEqual(new Set(seeded.map((r) => r.id)))
   })
 
   test('period intersects takenAfter rather than widening it', async () => {
@@ -449,17 +519,26 @@ describe('timeline buckets', () => {
     expect(buckets).toEqual([{ date: '2011-08-14', count: 1, coverAssetId: null }])
   })
 
-  test('covers name the newest ready asset, and nothing when none is ready', async () => {
-    await seed(ownerId, [
+  test('covers name the newest ready asset, and fall back as ready assets are removed', async () => {
+    // Two ready assets, so a naive min(id) or ascending pick would still pass with only
+    // one — the newest-by-capturedAt ordering only shows up with two to choose between.
+    const [older, newer] = await seed(ownerId, [
       { capturedAt: new Date('2011-08-14T09:00:00Z'), status: 'ready' },
-      { capturedAt: new Date('2011-08-14T18:00:00Z'), status: 'processing' },
+      { capturedAt: new Date('2011-08-14T14:00:00Z'), status: 'ready' },
     ])
-    const [bucket] = await service.timeline(ownerId, { covers: true })
-    expect(bucket!.coverAssetId).not.toBeNull()
+    // Newest overall, but not ready — must not be picked over an older ready asset.
+    await seed(ownerId, [{ capturedAt: new Date('2011-08-14T18:00:00Z'), status: 'processing' }])
 
-    await service.trash(ownerId, [bucket!.coverAssetId!])
-    const [afterwards] = await service.timeline(ownerId, { covers: true })
-    expect(afterwards!.coverAssetId).toBeNull()
+    const [bucket] = await service.timeline(ownerId, { covers: true })
+    expect(bucket!.coverAssetId).toBe(newer!.id)
+
+    await service.trash(ownerId, [newer!.id])
+    const [afterNewerGone] = await service.timeline(ownerId, { covers: true })
+    expect(afterNewerGone!.coverAssetId).toBe(older!.id)
+
+    await service.trash(ownerId, [older!.id])
+    const [afterBothGone] = await service.timeline(ownerId, { covers: true })
+    expect(afterBothGone!.coverAssetId).toBeNull()
   })
 
   test('a timeline with no filters answers exactly as it did before', async () => {
@@ -467,6 +546,37 @@ describe('timeline buckets', () => {
     expect(await service.timeline(ownerId, {})).toEqual([
       { date: '2011-08-14', count: 1, coverAssetId: null },
     ])
+  })
+
+  test('a tile carries each of its fields in the right place', async () => {
+    const livePhotoVideoId = randomUUID()
+    const [row] = await seed(ownerId, [
+      {
+        capturedAt: new Date('2011-08-14T09:00:00Z'),
+        type: 'video',
+        status: 'ready',
+        favorite: true,
+        width: 800,
+        height: 600,
+        duration: 12.5,
+        placeholderColor: '#abcdef',
+        livePhotoVideoId,
+      },
+    ])
+
+    const page = await service.bucket(ownerId, { period: '2011-08', limit: 10 })
+    const tile = page.items[0]!
+
+    expect(tile.id).toBe(row!.id)
+    expect(tile.capturedAt).toBe('2011-08-14T09:00:00.000Z')
+    expect(tile.type).toBe('video')
+    expect(tile.status).toBe('ready')
+    expect(tile.favorite).toBe(true)
+    expect(tile.width).toBe(800)
+    expect(tile.height).toBe(600)
+    expect(tile.duration).toBe(12.5)
+    expect(tile.placeholderColor).toBe('#abcdef')
+    expect(tile.livePhotoVideoId).toBe(livePhotoVideoId)
   })
 })
 

@@ -270,23 +270,28 @@ export class AssetService {
    */
   async bucket(ownerId: string, query: TimelineBucketQuery) {
     const { start, end } = periodBounds(query.period)
-    const conditions = [
+    // The condition set every query in this method starts from. A cursor predicate is
+    // added only for the page query, below — never mutated onto this array — so the
+    // count query can reuse it unmodified and stay the period total rather than
+    // shrinking as the caller pages through.
+    const base = [
       ...this.buildFilters(ownerId, query),
       gte(assets.capturedAt, start),
       lt(assets.capturedAt, end),
     ]
 
     const after = query.cursor ? decodeCursor(query.cursor) : null
-    if (after) {
-      conditions.push(
-        sql`(${assets.capturedAt}, ${assets.id}) < (${new Date(after.value)}, ${after.id})`,
-      )
-    }
+    const paged = after
+      ? [
+          ...base,
+          sql`(${assets.capturedAt}, ${assets.id}) < (${new Date(after.value)}, ${after.id})`,
+        ]
+      : base
 
     const rows = await this.db
-      .select()
+      .select(TILE_COLUMNS)
       .from(assets)
-      .where(and(...conditions))
+      .where(and(...paged))
       .orderBy(desc(assets.capturedAt), desc(assets.id))
       .limit(query.limit + 1)
 
@@ -302,13 +307,7 @@ export class AssetService {
     const [counted] = await this.db
       .select({ total: sql<number>`count(*)::int` })
       .from(assets)
-      .where(
-        and(
-          ...this.buildFilters(ownerId, query),
-          gte(assets.capturedAt, start),
-          lt(assets.capturedAt, end),
-        ),
-      )
+      .where(and(...base))
 
     return {
       items: page.map(toTile),
@@ -371,7 +370,27 @@ function periodBounds(period: string): { start: Date; end: Date } {
   }
 }
 
-function toTile(row: typeof assets.$inferSelect): TimelineTile {
+/**
+ * Exactly the columns a tile draws. `bucket()` selects only these — up to `limit + 1`
+ * rows per call — rather than every column on `assets`, which would drag TOASTed exif
+ * json, the search vector, and a 512-dimension embedding across the wire for nothing.
+ */
+const TILE_COLUMNS = {
+  id: assets.id,
+  capturedAt: assets.capturedAt,
+  width: assets.width,
+  height: assets.height,
+  type: assets.type,
+  status: assets.status,
+  favorite: assets.favorite,
+  duration: assets.duration,
+  placeholderColor: assets.placeholderColor,
+  livePhotoVideoId: assets.livePhotoVideoId,
+}
+
+type TileRow = Pick<typeof assets.$inferSelect, keyof typeof TILE_COLUMNS>
+
+function toTile(row: TileRow): TimelineTile {
   return {
     id: row.id,
     capturedAt: row.capturedAt.toISOString(),
