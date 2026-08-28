@@ -1,10 +1,11 @@
 import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
 import { createHash, randomBytes } from 'node:crypto'
-import { sql } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 import sharp from 'sharp'
 import manifest from '../../package.json'
 import { createApp } from '../app.ts'
-import { albumAssets, assets } from '../db/schema.ts'
+import { createDatabase } from '../db/index.ts'
+import { albumAssets, assets, users } from '../db/schema.ts'
 import { COVER_SAMPLE } from '../lib/batch.ts'
 import { createServices } from '../services.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
@@ -80,6 +81,23 @@ describe('health and docs', () => {
 
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ status: 'ok' })
+  })
+
+  test('health check fails when the database is unreachable', async () => {
+    const badConfig = createTestConfig({ publicUrl: 'http://localhost:3000' })
+    const badServices = createServices(
+      badConfig,
+      createDatabase('postgres://imogen:imogen@localhost:1/imogen'),
+    )
+    const badApp = createApp({ services: badServices })
+
+    const response = await badApp.fetch(new Request('http://localhost:3000/api/v1/health'))
+
+    expect(response.status).toBe(503)
+    expect(await response.json()).toMatchObject({ status: 'error' })
+
+    await badServices.shutdown()
+    removeTestConfig(badConfig)
   })
 
   test('health check reports the version this build was cut at', async () => {
@@ -246,6 +264,46 @@ describe('uploading', () => {
     expect(response.status).toBe(200)
     expect(second.duplicate).toBe(true)
     expect(second.asset.id).toBe(first.asset.id)
+  })
+
+  test('two uploads of the same bytes racing each other still produce one asset', async () => {
+    // The advisory lock in claimChecksum is what keeps this from becoming a unique-index
+    // violation on the loser rather than a tidy `duplicate: true`. See #9.
+    const { cookie } = await signUp()
+    const photo = await makePhoto()
+
+    const [firstResponse, secondResponse] = await Promise.all([
+      upload(cookie, photo),
+      upload(cookie, photo),
+    ])
+    type UploadBody = { asset: { id: string }; duplicate: boolean }
+    const [first, second] = (await Promise.all([firstResponse.json(), secondResponse.json()])) as [
+      UploadBody,
+      UploadBody,
+    ]
+
+    expect([first.duplicate, second.duplicate].sort()).toEqual([false, true])
+    expect(first.asset.id).toBe(second.asset.id)
+
+    const rows = await harness.db.select({ id: assets.id }).from(assets)
+    expect(rows.length).toBe(1)
+  })
+
+  test('a quota rejection rolls back cleanly and releases the checksum lock', async () => {
+    const { cookie, user } = await signUp()
+    await harness.db.update(users).set({ quotaBytes: 1 }).where(eq(users.id, user.id))
+
+    const rejected = await upload(cookie, await makePhoto())
+    expect(rejected.status).toBe(413)
+
+    const rows = await harness.db.select({ id: assets.id }).from(assets)
+    expect(rows.length).toBe(0)
+
+    // If claimChecksum's transaction failed to roll back, or left the advisory lock
+    // held, a later upload would hang rather than simply succeed once quota allows it.
+    await harness.db.update(users).set({ quotaBytes: null }).where(eq(users.id, user.id))
+    const accepted = await upload(cookie, await makePhoto('second.jpg'))
+    expect(accepted.status).toBe(201)
   })
 
   test('refuses a file that is neither a photo nor a video', async () => {
