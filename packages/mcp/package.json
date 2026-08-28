@@ -1,6 +1,6 @@
 {
   "name": "@imogen/mcp",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "description": "Connect a local AI agent to an imogen photo library over MCP",
   "license": "AGPL-3.0-or-later",
