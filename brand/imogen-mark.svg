@@ -1,0 +1,26 @@
+<!--
+  imogen mark — master.
+
+  This is the source of truth for the aperture mark. Its geometry is copied exactly
+  from packages/web/public/icons/icon.svg, which remains the canonical rendition for
+  web (installed PWA icon, favicon). Every other rendition below is derived from this
+  file by hand for its platform's asset pipeline; if the geometry or colors here change,
+  update each of them to match:
+
+    - web:      packages/web/public/icons/icon.svg, packages/web/public/icons/maskable.svg
+    - iOS:      App/Resources/Assets.xcassets/ImogenMark.imageset, .../AppIcon.appiconset
+    - Android:  app/src/main/res/drawable/ic_imogen_mark.xml, .../ic_launcher_foreground.xml
+
+  See BRAND.md for the full color token table and per-platform guidance.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="imogen">
+  <defs>
+    <mask id="aperture">
+      <rect width="64" height="64" fill="#fff"/>
+      <circle cx="32" cy="32" r="11" fill="#000"/>
+    </mask>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#17191c"/>
+  <rect x="12" y="12" width="40" height="40" rx="5" fill="#e39b5c" mask="url(#aperture)"/>
+  <circle cx="32" cy="32" r="6.5" fill="#e39b5c"/>
+</svg>
