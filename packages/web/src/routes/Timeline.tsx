@@ -1,8 +1,9 @@
 import type { Asset, AssetFilter, AssetSelection } from '@imogen/shared'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useRef, useState } from 'react'
+import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { AlbumPicker } from '../components/AlbumPicker.tsx'
+import { Notice } from '../components/Notice.tsx'
 import { SelectionBar } from '../components/SelectionBar.tsx'
 import { TimelineBody, TimelineCount } from '../components/TimelineBody.tsx'
 import { TimelineSkeleton } from '../components/TimelineSkeleton.tsx'
@@ -13,6 +14,7 @@ import { useSelection } from '../hooks/useSelection.ts'
 import { useTimelineGrid } from '../hooks/useTimelineGrid.ts'
 import { useTimelineViewer } from '../hooks/useTimelineViewer.ts'
 import { imogen } from '../lib/client.ts'
+import type { VaultHandoff } from '../lib/vaultHandoff.ts'
 
 type Props = {
   title: string
@@ -71,12 +73,17 @@ export function Timeline({ title, query = NO_FILTER, empty, mode = 'library' }: 
   /**
    * Moving into the vault needs the vault open. If it is locked we send the user to the
    * vault to unlock rather than asking for a passphrase inside a toolbar.
+   *
+   * The request goes with them. An unlock somebody was sent to BY an action has to finish
+   * that action: this used to navigate and drop the selection on the floor, so the reader
+   * arrived at an open vault with their photographs still in the library and nothing on
+   * screen admitting that the thing they asked for had not happened.
    */
   const toVault = useMutation({
     mutationFn: async (request: AssetSelection) => {
       const status = await imogen.vault.status()
       if (!status.configured || !status.unlocked) {
-        navigate('/vault')
+        navigate('/vault', { state: { moveIn: request } satisfies VaultHandoff })
         return { moved: 0 }
       }
       return imogen.vault.moveIn(request)
@@ -190,23 +197,5 @@ export function Timeline({ title, query = NO_FILTER, empty, mode = 'library' }: 
         />
       )}
     </>
-  )
-}
-
-/** Says what happened and then gets out of the way. */
-function Notice({ notice, onDone }: { notice: string | null; onDone: () => void }) {
-  const done = useRef(onDone)
-  done.current = onDone
-  useEffect(() => {
-    if (!notice) return
-    const timer = setTimeout(() => done.current(), 4000)
-    return () => clearTimeout(timer)
-  }, [notice])
-
-  if (!notice) return null
-  return (
-    <div className="fixed inset-x-0 bottom-0 z-50 flex justify-center p-4 pb-[max(1rem,calc(env(safe-area-inset-bottom)+4.5rem))] md:pb-6">
-      <p className="surface-panel rounded-full px-4 py-2 text-sm">{notice}</p>
-    </div>
   )
 }

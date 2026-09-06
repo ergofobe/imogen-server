@@ -1,6 +1,8 @@
 import type { AssetSelection } from '@imogen/shared'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router'
+import { Notice } from '../components/Notice.tsx'
 import { SelectionBar } from '../components/SelectionBar.tsx'
 import { TimelineBody, TimelineCount } from '../components/TimelineBody.tsx'
 import { TimelineSkeleton } from '../components/TimelineSkeleton.tsx'
@@ -11,6 +13,7 @@ import type { TimelineSource } from '../hooks/useTimeline.ts'
 import { useTimelineGrid } from '../hooks/useTimelineGrid.ts'
 import { useTimelineViewer } from '../hooks/useTimelineViewer.ts'
 import { imogen } from '../lib/client.ts'
+import { vaultHandoff } from '../lib/vaultHandoff.ts'
 
 /**
  * The vault's own spine.
@@ -36,6 +39,9 @@ const NO_FILTER = {}
 
 export function VaultRoute() {
   const queryClient = useQueryClient()
+  const location = useLocation()
+  const navigate = useNavigate()
+  const [notice, setNotice] = useState<string | null>(null)
 
   const { data: status, isPending } = useQuery({
     queryKey: ['vault-status'],
@@ -72,6 +78,40 @@ export function VaultRoute() {
     void queryClient.invalidateQueries({ queryKey: ['timeline'] })
     grid.reload()
   }
+
+  /**
+   * The action that sent the reader here, finished the moment the vault opens.
+   *
+   * Somebody who asked for "move to vault" over a locked vault is not asking to look at
+   * the vault — the unlock is a toll on the way, and a toll that eats what you were
+   * carrying is a bad toll. So the library hands the request over in history state and it
+   * is run here, once, as soon as `unlocked` turns true; the setup screen arrives at the
+   * same place, since setting a passphrase unlocks.
+   */
+  const moveIn = useMutation({
+    mutationFn: (request: AssetSelection) => imogen.vault.moveIn(request),
+    onSuccess: ({ moved }) => {
+      setNotice(`Moved ${moved} ${moved === 1 ? 'photo' : 'photos'} to the vault`)
+      refresh()
+    },
+    onError: (cause) =>
+      setNotice(cause instanceof Error ? cause.message : 'Could not move those to the vault'),
+  })
+
+  // Whether this vault has already taken its handoff, so a re-render, a React double-effect
+  // or a later unlock cannot move the same photographs twice.
+  const taken = useRef(false)
+  useEffect(() => {
+    if (!unlocked || taken.current) return
+    const handed = vaultHandoff(location.state)
+    if (!handed) return
+    taken.current = true
+    // Forgotten before it is run, so a reload or a back gesture onto this entry replays
+    // nothing — and so the ids stop sitting in the browser's history the moment they are
+    // spent.
+    navigate(location.pathname, { replace: true, state: null })
+    moveIn.mutate(handed.moveIn)
+  }, [unlocked, location.state, location.pathname, navigate, moveIn.mutate])
 
   const moveOut = useMutation({
     mutationFn: (request: AssetSelection) => imogen.vault.moveOut(request),
@@ -158,6 +198,8 @@ export function VaultRoute() {
           ]}
         />
       )}
+
+      <Notice notice={notice} onDone={() => setNotice(null)} />
 
       {viewer.asset && (
         <Viewer
