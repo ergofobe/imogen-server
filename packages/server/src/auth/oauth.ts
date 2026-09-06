@@ -24,6 +24,18 @@ const PROTECTED_RESOURCE_PATHS = ['', '/mcp'] as const
 /** The path of a resource this server publishes a document for, and nothing else. */
 export type ProtectedResourcePath = (typeof PROTECTED_RESOURCE_PATHS)[number]
 
+/**
+ * The one spelling of a resource identifier this server uses, everywhere.
+ *
+ * `IMOGEN_PUBLIC_URL` only has its trailing slashes stripped, so it can still arrive as
+ * `https://Host:443`. Advertising that spelling while comparing against a normalised one
+ * would make the server refuse the very identifier it published, and a spec-compliant MCP
+ * client — which must echo `resource` back from the document — could never connect.
+ */
+function canonicalize(url: URL): string {
+  return url.href.replace(/\/+$/, '')
+}
+
 /** The OAuth error codes imogen can return, as defined by RFC 6749 §5.2 and RFC 7591. */
 export type OAuthErrorCode =
   | 'invalid_request'
@@ -159,7 +171,7 @@ export class OAuthService {
   protectedResourceMetadata(resourcePath: ProtectedResourcePath = '') {
     const base = this.options.publicUrl
     return {
-      resource: `${base}${resourcePath}`,
+      resource: this.resourceIdentifier(resourcePath),
       authorization_servers: [base],
       scopes_supported: [...ALL_SCOPES],
       bearer_methods_supported: ['header'],
@@ -167,9 +179,19 @@ export class OAuthService {
     }
   }
 
-  /** The identifiers a token may name, exactly as the metadata documents publish them. */
+  /**
+   * The identifier of one resource this server protects, in the single spelling that the
+   * document publishes, the token records, and the surface checks against. Callers ask
+   * for it rather than building it, because three concatenations of `publicUrl` would
+   * eventually disagree and the disagreement would read as a valid token being refused.
+   */
+  resourceIdentifier(path: ProtectedResourcePath = ''): string {
+    return canonicalize(new URL(`${this.options.publicUrl}${path}`))
+  }
+
+  /** Every identifier a token may name. */
   resourceIdentifiers(): string[] {
-    return PROTECTED_RESOURCE_PATHS.map((path) => `${this.options.publicUrl}${path}`)
+    return PROTECTED_RESOURCE_PATHS.map((path) => this.resourceIdentifier(path))
   }
 
   /**
@@ -190,7 +212,7 @@ export class OAuthService {
     if (parsed.hash) {
       throw new OAuthError('invalid_target', 'a resource identifier must not contain a fragment')
     }
-    const normalized = parsed.href.replace(/\/+$/, '')
+    const normalized = canonicalize(parsed)
     const match = this.resourceIdentifiers().find((identifier) => identifier === normalized)
     if (!match) {
       throw new OAuthError('invalid_target', `${value} is not a resource of this server`)

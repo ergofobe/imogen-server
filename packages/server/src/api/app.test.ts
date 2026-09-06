@@ -1476,6 +1476,66 @@ describe('token audience', () => {
     expect(url.searchParams.get('code')).toBeNull()
   })
 
+  // Every other case here skips straight to `approved=yes`. A real connector does not: it
+  // is shown the consent screen and submits it, and `resource` only survives that round
+  // trip as a hidden input. If it were dropped there, every token would come back unbound
+  // and each test above would still pass.
+  test('carries the resource through the consent screen a real connector submits', async () => {
+    const { cookie } = await signUp()
+    const client = (await (
+      await jsonRequest('/oauth/register', 'POST', {
+        client_name: 'Connector',
+        redirect_uris: ['https://claude.ai/api/mcp/auth_callback'],
+        token_endpoint_auth_method: 'none',
+      })
+    ).json()) as { client_id: string }
+
+    const verifier = randomBytes(32).toString('base64url')
+    const challenge = createHash('sha256').update(verifier).digest('base64url')
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: client.client_id,
+      redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      scope: 'library:read',
+      resource: MCP,
+    })
+
+    const consent = await request(`/oauth/authorize?${params}`, { headers: { Cookie: cookie } })
+    const html = await consent.text()
+    expect(consent.status).toBe(200)
+    expect(html).toContain(`name="resource" value="${MCP}"`)
+
+    // Submit what that form actually carries, rather than trusting the query we sent.
+    const fields = [...html.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)">/g)]
+    const submitted = new URLSearchParams(fields.map(([, name, value]) => [name!, value!]))
+    submitted.set('approved', 'yes')
+
+    const approved = await request(`/oauth/authorize?${submitted}`, {
+      headers: { Cookie: cookie },
+      redirect: 'manual',
+    })
+    const code = new URL(approved.headers.get('location')!).searchParams.get('code')!
+
+    const token = (await (
+      await request('/oauth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          client_id: client.client_id,
+          code,
+          code_verifier: verifier,
+          redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+        }),
+      })
+    ).json()) as { access_token: string }
+
+    expect((await callMcp(token.access_token)).status).toBe(200)
+    expect((await callRest(token.access_token)).status).toBe(401)
+  })
+
   test('the authorization server advertises that it honours resource indicators', async () => {
     const meta = (await (await request('/.well-known/oauth-authorization-server')).json()) as {
       resource_indicators_supported: boolean

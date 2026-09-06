@@ -55,10 +55,13 @@ export function createOAuthRoutes() {
     }
 
     // The user must be signed in to consent. Send them to sign in and come back.
+    // Only a session may consent, so no bearer token is ever honoured here and there is
+    // no resource to check one against.
     const principal = await resolvePrincipal(
       services,
       c.req.raw.headers,
       getCookie(c, SESSION_COOKIE),
+      null,
     )
     if (principal?.via !== 'session') {
       const returnTo = `/oauth/authorize?${new URLSearchParams(query).toString()}`
@@ -68,18 +71,18 @@ export function createOAuthRoutes() {
     // RFC 8707. Settled before the consent screen so the user is never asked to approve a
     // request that cannot be honoured. imogen binds a token to a single resource, so a
     // request naming several distinct ones has no answer.
-    const requestedResources = [...new Set(c.req.queries('resource') ?? [])]
-    if (requestedResources.length > 1) {
-      return fail('invalid_target', 'a token may be bound to only one resource')
-    }
     let resource: string | undefined
-    if (requestedResources[0] !== undefined) {
-      try {
-        resource = services.oauth.canonicalResource(requestedResources[0])
-      } catch (error) {
-        if (error instanceof OAuthError) return fail(error.code, error.message)
-        throw error
+    try {
+      const named = new Set(
+        (c.req.queries('resource') ?? []).map((value) => services.oauth.canonicalResource(value)),
+      )
+      if (named.size > 1) {
+        return fail('invalid_target', 'a token may be bound to only one resource')
       }
+      resource = [...named][0]
+    } catch (error) {
+      if (error instanceof OAuthError) return fail(error.code, error.toJSON().error_description)
+      throw error
     }
 
     const scopeList = query.scope?.split(/\s+/).filter(Boolean)

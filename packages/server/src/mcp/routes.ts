@@ -77,7 +77,7 @@ export function createMcpRoutes() {
       services,
       c.req.raw.headers,
       undefined,
-      `${services.config.publicUrl}/mcp`,
+      services.oauth.resourceIdentifier('/mcp'),
     )
 
     const responses = []

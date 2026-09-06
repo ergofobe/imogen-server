@@ -562,4 +562,22 @@ describe('resource indicators', () => {
     expect(oauth.resourceIdentifiers()).toContain(oauth.protectedResourceMetadata().resource)
     expect(oauth.resourceIdentifiers()).toContain(oauth.protectedResourceMetadata('/mcp').resource)
   })
+
+  // IMOGEN_PUBLIC_URL is only stripped of trailing slashes, so a deployment can hand us a
+  // default port or a capitalised host. Advertising one spelling and accepting another
+  // would lock every spec-compliant MCP client out of the connector flow, and the failure
+  // would appear at the client, an entire OAuth round trip away from its cause.
+  test.each([
+    'https://Photos.Example.com',
+    'https://photos.example.com:443',
+    'http://photos.example.com:80',
+  ])('advertises and accepts the same identifier when configured as %s', (publicUrl) => {
+    const server = new OAuthService(db, { publicUrl })
+
+    for (const path of ['', '/mcp'] as const) {
+      const advertised = server.protectedResourceMetadata(path).resource
+      expect(server.canonicalResource(advertised)).toBe(advertised)
+      expect(server.resourceIdentifier(path)).toBe(advertised)
+    }
+  })
 })

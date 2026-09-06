@@ -23,21 +23,23 @@ export type AppEnv = {
  * consenting to a connector must not hand it the whole API. A token with no recorded
  * audience predates RFC 8707 support here and is accepted anywhere, so nothing already
  * issued stops working. Sessions have no audience at all — the user is present.
+ *
+ * The parameter is required, and `null` is the deliberate "no bearer token reaches this"
+ * opt-out. An optional one would default to no enforcement, so the next caller to forget
+ * it would reopen the hole silently; this way forgetting it does not compile.
  */
 export async function resolvePrincipal(
   services: Services,
   headers: Headers,
   cookieToken: string | undefined,
-  audience?: string,
+  audience: string | null,
 ): Promise<Principal | null> {
   const authorization = headers.get('authorization')
   if (authorization?.toLowerCase().startsWith('bearer ')) {
     const token = authorization.slice(7).trim()
     const grant = await services.oauth.verifyAccessToken(token)
     if (!grant) return null
-    if (grant.resource !== null && audience !== undefined && grant.resource !== audience) {
-      return null
-    }
+    if (grant.resource !== null && grant.resource !== audience) return null
     const user = await services.accounts.findById(grant.userId)
     if (!user || user.disabledAt) return null
     return { user, scopes: grant.scopes, via: 'oauth', clientId: grant.clientId }
@@ -64,7 +66,7 @@ export function optionalAuth(): MiddlewareHandler<AppEnv> {
       services,
       c.req.raw.headers,
       getCookie(c, SESSION_COOKIE),
-      services.config.publicUrl,
+      services.oauth.resourceIdentifier(),
     )
     if (principal) c.set('principal', principal)
     await next()
@@ -78,7 +80,7 @@ export function requireAuth(): MiddlewareHandler<AppEnv> {
       services,
       c.req.raw.headers,
       getCookie(c, SESSION_COOKIE),
-      services.config.publicUrl,
+      services.oauth.resourceIdentifier(),
     )
     if (!principal) {
       // RFC 9728: point unauthenticated clients at the metadata that tells them how to auth.
@@ -134,7 +136,7 @@ export function requireHiddenAdmin(): MiddlewareHandler<AppEnv> {
       services,
       c.req.raw.headers,
       getCookie(c, SESSION_COOKIE),
-      services.config.publicUrl,
+      services.oauth.resourceIdentifier(),
     )
     // Word for word what the server says for a path it has never heard of. A message
     // of its own — "Not found" against "No route for /api/v1/admin/users" — would be
