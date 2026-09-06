@@ -224,12 +224,14 @@ export function createWellKnownRoutes() {
   app.get('/oauth-authorization-server', (c) =>
     c.json(c.get('services').oauth.authorizationServerMetadata(), 200, cors),
   )
-  // MCP clients look for the resource document under the endpoint path too.
   app.get('/oauth-protected-resource', (c) =>
     c.json(c.get('services').oauth.protectedResourceMetadata(), 200, cors),
   )
+  // RFC 9728 nests the document under the resource's own path, so this one describes the
+  // MCP endpoint. It has to name that endpoint, not the site root, or the client that
+  // followed the 401 here cannot match the document to what it was refused at.
   app.get('/oauth-protected-resource/mcp', (c) =>
-    c.json(c.get('services').oauth.protectedResourceMetadata(), 200, cors),
+    c.json(c.get('services').oauth.protectedResourceMetadata('/mcp'), 200, cors),
   )
   // Some clients probe the OIDC discovery path first.
   app.get('/openid-configuration', (c) =>

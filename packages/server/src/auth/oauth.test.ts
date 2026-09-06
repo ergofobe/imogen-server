@@ -399,4 +399,11 @@ describe('metadata documents', () => {
     expect(meta.resource).toBe('https://photos.example.com')
     expect(meta.authorization_servers).toEqual(['https://photos.example.com'])
   })
+
+  test('the MCP document names the endpoint it protects, not the site root', () => {
+    const meta = oauth.protectedResourceMetadata('/mcp')
+
+    expect(meta.resource).toBe('https://photos.example.com/mcp')
+    expect(meta.authorization_servers).toEqual(['https://photos.example.com'])
+  })
 })

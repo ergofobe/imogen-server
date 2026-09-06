@@ -841,6 +841,15 @@ describe('OAuth discovery and flow', () => {
 
     expect(response.status).toBe(200)
     expect((await response.json()) as { resource: string }).toMatchObject({
+      resource: 'http://localhost:3000/mcp',
+    })
+  })
+
+  test('the site-root document still names the site root', async () => {
+    const response = await request('/.well-known/oauth-protected-resource')
+
+    expect(response.status).toBe(200)
+    expect((await response.json()) as { resource: string }).toMatchObject({
       resource: 'http://localhost:3000',
     })
   })
@@ -1037,6 +1046,23 @@ describe('MCP endpoint', () => {
 
     expect(response.status).toBe(401)
     expect(response.headers.get('www-authenticate')).toContain('oauth-protected-resource')
+  })
+
+  test('following the 401 pointer lands on a document describing the MCP endpoint', async () => {
+    const response = await rpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' })
+    const pointer = /resource_metadata="([^"]+)"/.exec(
+      response.headers.get('www-authenticate') ?? '',
+    )?.[1]
+
+    expect(pointer).toBe('http://localhost:3000/.well-known/oauth-protected-resource/mcp')
+
+    // The document the challenge points at has to name the endpoint the caller was
+    // refused at. A document answering with the site root is the mismatch that leaves
+    // connect-card clients with no authorization URL to open.
+    const metadata = await request(new URL(pointer as string).pathname)
+    expect((await metadata.json()) as { resource: string }).toMatchObject({
+      resource: 'http://localhost:3000/mcp',
+    })
   })
 
   test('lists the tools an authorized connector may use', async () => {
