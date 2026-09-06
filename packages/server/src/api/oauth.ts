@@ -65,6 +65,23 @@ export function createOAuthRoutes() {
       return c.redirect(`/login?returnTo=${encodeURIComponent(returnTo)}`)
     }
 
+    // RFC 8707. Settled before the consent screen so the user is never asked to approve a
+    // request that cannot be honoured. imogen binds a token to a single resource, so a
+    // request naming several distinct ones has no answer.
+    const requestedResources = [...new Set(c.req.queries('resource') ?? [])]
+    if (requestedResources.length > 1) {
+      return fail('invalid_target', 'a token may be bound to only one resource')
+    }
+    let resource: string | undefined
+    if (requestedResources[0] !== undefined) {
+      try {
+        resource = services.oauth.canonicalResource(requestedResources[0])
+      } catch (error) {
+        if (error instanceof OAuthError) return fail(error.code, error.message)
+        throw error
+      }
+    }
+
     const scopeList = query.scope?.split(/\s+/).filter(Boolean)
     const requested = (scopeList ?? ['library:read']).filter((s): s is OAuthScope =>
       (ALL_SCOPES as string[]).includes(s),
@@ -96,6 +113,7 @@ export function createOAuthRoutes() {
         scopes,
         codeChallenge: query.code_challenge,
         codeChallengeMethod: query.code_challenge_method,
+        resource,
       })
       const url = new URL(redirectUri)
       url.searchParams.set('code', code)
@@ -149,6 +167,7 @@ export function createOAuthRoutes() {
           code,
           codeVerifier,
           redirectUri,
+          resource: field('resource'),
         })
         return c.json(token, 200, { 'Cache-Control': 'no-store' })
       }
@@ -161,6 +180,7 @@ export function createOAuthRoutes() {
           clientSecret,
           refreshToken,
           scope: field('scope'),
+          resource: field('resource'),
         })
         return c.json(token, 200, { 'Cache-Control': 'no-store' })
       }

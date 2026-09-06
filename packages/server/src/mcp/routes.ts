@@ -71,7 +71,14 @@ export function createMcpRoutes() {
     const isBatch = Array.isArray(body)
     const messages = isBatch ? body : [body]
 
-    const principal = await resolvePrincipal(services, c.req.raw.headers, undefined)
+    // This endpoint is its own protected resource, so a token minted for the REST API is
+    // not a token for it. Anything the user consented to here was consented to for here.
+    const principal = await resolvePrincipal(
+      services,
+      c.req.raw.headers,
+      undefined,
+      `${services.config.publicUrl}/mcp`,
+    )
 
     const responses = []
     for (const message of messages) {

@@ -1344,3 +1344,150 @@ describe('OIDC routes are reachable without a session', () => {
     expect(response.status).toBe(400)
   })
 })
+
+/**
+ * imogen advertises two protected-resource identifiers — the site root for the REST API
+ * and `/mcp` for the connector endpoint. A token minted for one must not be replayable
+ * at the other, or the user who consented to an MCP connector has silently handed it the
+ * whole REST API.
+ */
+describe('token audience', () => {
+  const MCP = 'http://localhost:3000/mcp'
+  const ROOT = 'http://localhost:3000'
+
+  /** Runs the whole connector flow, optionally asking for a specific resource. */
+  async function tokenFor(resource?: string, email = 'owner@example.com') {
+    const { cookie } = await signUp(email)
+    const client = (await (
+      await jsonRequest('/oauth/register', 'POST', {
+        client_name: 'Connector',
+        redirect_uris: ['https://claude.ai/api/mcp/auth_callback'],
+        token_endpoint_auth_method: 'none',
+      })
+    ).json()) as { client_id: string }
+
+    const verifier = randomBytes(32).toString('base64url')
+    const challenge = createHash('sha256').update(verifier).digest('base64url')
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: client.client_id,
+      redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+      code_challenge: challenge,
+      code_challenge_method: 'S256',
+      scope: 'library:read',
+      approved: 'yes',
+    })
+    if (resource) params.set('resource', resource)
+
+    const approved = await request(`/oauth/authorize?${params}`, {
+      headers: { Cookie: cookie },
+      redirect: 'manual',
+    })
+    const location = new URL(approved.headers.get('location')!)
+    const code = location.searchParams.get('code')
+    if (!code) throw new Error(`authorize refused: ${location.searchParams.get('error')}`)
+
+    const body = new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: client.client_id,
+      code,
+      code_verifier: verifier,
+      redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+    })
+    if (resource) body.set('resource', resource)
+
+    const token = (await (
+      await request('/oauth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      })
+    ).json()) as { access_token: string }
+
+    return { token: token.access_token, clientId: client.client_id, cookie }
+  }
+
+  const callMcp = (token: string) =>
+    request('/mcp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    })
+
+  const callRest = (token: string) =>
+    request('/api/v1/assets', { headers: { Authorization: `Bearer ${token}` } })
+
+  test('a token bound to the MCP endpoint is refused by the REST API', async () => {
+    const { token } = await tokenFor(MCP)
+
+    expect((await callMcp(token)).status).toBe(200)
+    expect((await callRest(token)).status).toBe(401)
+  })
+
+  test('a token bound to the site root is refused by the MCP endpoint', async () => {
+    const { token } = await tokenFor(ROOT)
+
+    expect((await callRest(token)).status).toBe(200)
+    expect((await callMcp(token)).status).toBe(401)
+  })
+
+  test('the MCP refusal still points at the document naming the MCP endpoint', async () => {
+    const { token } = await tokenFor(ROOT)
+
+    const response = await callMcp(token)
+    expect(response.headers.get('www-authenticate')).toContain(
+      'http://localhost:3000/.well-known/oauth-protected-resource/mcp',
+    )
+  })
+
+  test('a token from a client that asked for no resource still works everywhere', async () => {
+    const { token } = await tokenFor()
+
+    expect((await callRest(token)).status).toBe(200)
+    expect((await callMcp(token)).status).toBe(200)
+  })
+
+  test('authorize refuses a resource the server does not advertise', async () => {
+    const { cookie } = await signUp()
+    const client = (await (
+      await jsonRequest('/oauth/register', 'POST', {
+        client_name: 'Connector',
+        redirect_uris: ['https://claude.ai/api/mcp/auth_callback'],
+        token_endpoint_auth_method: 'none',
+      })
+    ).json()) as { client_id: string }
+
+    const response = await request(
+      `/oauth/authorize?${new URLSearchParams({
+        response_type: 'code',
+        client_id: client.client_id,
+        redirect_uri: 'https://claude.ai/api/mcp/auth_callback',
+        code_challenge: 'x'.repeat(43),
+        code_challenge_method: 'S256',
+        resource: 'https://attacker.example.com',
+        approved: 'yes',
+      })}`,
+      { headers: { Cookie: cookie }, redirect: 'manual' },
+    )
+
+    expect(response.status).toBe(302)
+    const url = new URL(response.headers.get('location')!)
+    expect(url.searchParams.get('error')).toBe('invalid_target')
+    expect(url.searchParams.get('code')).toBeNull()
+  })
+
+  test('the authorization server advertises that it honours resource indicators', async () => {
+    const meta = (await (await request('/.well-known/oauth-authorization-server')).json()) as {
+      resource_indicators_supported: boolean
+    }
+
+    expect(meta.resource_indicators_supported).toBe(true)
+  })
+
+  test('a browser session is unaffected by audience, having no token at all', async () => {
+    const { cookie } = await signUp()
+
+    const response = await request('/api/v1/assets', { headers: { Cookie: cookie } })
+    expect(response.status).toBe(200)
+  })
+})
