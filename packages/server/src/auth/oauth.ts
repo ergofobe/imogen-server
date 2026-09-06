@@ -130,10 +130,16 @@ export class OAuthService {
     }
   }
 
-  protectedResourceMetadata() {
+  /**
+   * RFC 9728: `resource` is the identifier of the resource the client asked about, which
+   * for an MCP connector is the endpoint URL rather than the site root. Answering with the
+   * root from `/.well-known/oauth-protected-resource/mcp` reads as a mismatched document,
+   * and a connect-card client that cannot match it never builds an authorization URL.
+   */
+  protectedResourceMetadata(resourcePath = '') {
     const base = this.options.publicUrl
     return {
-      resource: base,
+      resource: `${base}${resourcePath}`,
       authorization_servers: [base],
       scopes_supported: [...ALL_SCOPES],
       bearer_methods_supported: ['header'],

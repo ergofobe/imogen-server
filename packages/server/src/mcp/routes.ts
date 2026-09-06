@@ -190,9 +190,13 @@ export function createMcpRoutes() {
   return app
 }
 
-/** RFC 9728: the 401 tells the client exactly where to go to get a token. */
+/**
+ * RFC 9728: the 401 tells the client exactly where to go to get a token. Point at the
+ * document nested under `/mcp`, which names this endpoint as the resource; the root
+ * document names the site and leaves the client with nothing it can match.
+ */
 function unauthorizedResponse(c: Context<AppEnv>, publicUrl: string) {
   return c.json(failure(null, RPC.INVALID_REQUEST, 'Authorization required'), 401, {
-    'WWW-Authenticate': `Bearer resource_metadata="${publicUrl}/.well-known/oauth-protected-resource"`,
+    'WWW-Authenticate': `Bearer resource_metadata="${publicUrl}/.well-known/oauth-protected-resource/mcp"`,
   })
 }
