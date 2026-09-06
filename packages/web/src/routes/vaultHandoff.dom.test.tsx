@@ -114,18 +114,36 @@ async function settle() {
   }
 }
 
+/** The browser's own back, which is how most people leave a screen they did not want. */
+let goBack: (() => void) | null = null
+
+async function back() {
+  const { act } = await import('react')
+  if (!goBack) throw new Error('nothing to go back from')
+  await act(async () => {
+    goBack?.()
+  })
+  await settle()
+}
+
 /** The whole app's shape as far as this bug is concerned: a library and a vault. */
 async function mountApp(path = '/') {
-  const { MemoryRouter, Route, Routes } = await import('react-router')
+  const { MemoryRouter, Route, Routes, useNavigate } = await import('react-router')
   const { QueryClient, QueryClientProvider } = await import('@tanstack/react-query')
   const { Timeline } = await import('./Timeline.tsx')
   const { VaultRoute } = await import('./VaultRoute.tsx')
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
   })
+  function History() {
+    const navigate = useNavigate()
+    goBack = () => navigate(-1)
+    return null
+  }
   const container = await render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[path]}>
+        <History />
         <Routes>
           <Route
             path="/"
@@ -247,5 +265,63 @@ describe('an unlock nobody asked an action of', () => {
 
     expect(container.textContent).toContain('Vault')
     expect(calls.some((c) => c.what === 'vault.moveIn')).toBe(false)
+  })
+})
+
+/**
+ * Backing out of an unlock the reader did not want after all.
+ *
+ * The selection is the work: forty photographs picked out of a year is minutes of somebody's
+ * attention, and losing it to a screen they decided against is the same rudeness as losing it
+ * to the unlock itself. So it waits for them on the library's own history entry.
+ *
+ * What it must NOT do is outlive the errand. An explicit id list is the one selection the
+ * server lets reach the vault — deliberately, so the vault's own viewer can trash the
+ * photograph it is looking at — so a stash that came back AFTER the move went through would
+ * put vaulted photographs under the library's "Move to trash", and that button would work.
+ */
+describe('backing out of the unlock', () => {
+  test('hands the selection back', async () => {
+    unlocked = false
+    const container = await mountApp()
+    await askToVault(container)
+    expect(container.textContent).toContain('Vault locked')
+
+    await back()
+
+    expect(container.textContent).toContain('Library')
+    expect(container.textContent).toContain('1 selected')
+  })
+
+  test('hands back a select-all as the filter it was, not as a list', async () => {
+    unlocked = false
+    const container = await mountApp()
+    await press(container.querySelector('[aria-label="Select"]'), 'a photograph')
+    await press(button(container, 'Select all'), 'Select all')
+    await press(button(container, 'Move to vault'), 'Move to vault')
+    expect(container.textContent).toContain('Vault locked')
+
+    await back()
+
+    expect(container.textContent).toContain('2 selected')
+    await press(button(container, 'Move to trash'), 'Move to trash')
+    const dialog = container.querySelector('[role="alertdialog"]')
+    await press(button(dialog ?? container, 'Move to trash'), 'Move to trash (confirm)')
+    expect(calls.find((c) => c.what === 'assets.trash')?.body).toEqual({ query: {}, except: [] })
+  })
+
+  test('does not come back once the move has actually happened', async () => {
+    unlocked = false
+    const container = await mountApp()
+    await askToVault(container)
+    await fillAndSubmit(container, [PASSPHRASE])
+    expect(calls.some((c) => c.what === 'vault.moveIn')).toBe(true)
+
+    await back()
+
+    expect(container.textContent).toContain('Library')
+    // Those photographs are in the vault now. A selection naming them is a live "Move to
+    // trash" pointed into the vault, which is the one place an id list is allowed to reach.
+    expect(container.textContent).not.toContain('selected')
   })
 })

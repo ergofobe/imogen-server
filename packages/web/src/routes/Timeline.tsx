@@ -1,7 +1,7 @@
 import type { Asset, AssetFilter, AssetSelection } from '@imogen/shared'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
-import { useNavigate } from 'react-router'
+import { useEffect, useRef, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router'
 import { AlbumPicker } from '../components/AlbumPicker.tsx'
 import { Notice } from '../components/Notice.tsx'
 import { SelectionBar } from '../components/SelectionBar.tsx'
@@ -10,11 +10,11 @@ import { TimelineSkeleton } from '../components/TimelineSkeleton.tsx'
 import { TrashConfirmation, useTrashConfirmation } from '../components/TrashConfirmation.tsx'
 import { Viewer } from '../components/Viewer.tsx'
 import { useOverviewKey } from '../hooks/useOverviewKey.ts'
-import { useSelection } from '../hooks/useSelection.ts'
+import { packSelection, useSelection } from '../hooks/useSelection.ts'
 import { useTimelineGrid } from '../hooks/useTimelineGrid.ts'
 import { useTimelineViewer } from '../hooks/useTimelineViewer.ts'
 import { imogen } from '../lib/client.ts'
-import type { VaultHandoff } from '../lib/vaultHandoff.ts'
+import { errandSpent, type VaultHandoff, type VaultStash, vaultStash } from '../lib/vaultHandoff.ts'
 
 type Props = {
   title: string
@@ -29,6 +29,8 @@ const NO_FILTER: Partial<AssetFilter> = {}
 export function Timeline({ title, query = NO_FILTER, empty, mode = 'library' }: Props) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const location = useLocation()
+  const here = `${location.pathname}${location.search}`
 
   const grid = useTimelineGrid(query)
   const viewer = useTimelineViewer(grid)
@@ -74,22 +76,46 @@ export function Timeline({ title, query = NO_FILTER, empty, mode = 'library' }: 
    * Moving into the vault needs the vault open. If it is locked we send the user to the
    * vault to unlock rather than asking for a passphrase inside a toolbar.
    *
-   * The request goes with them. An unlock somebody was sent to BY an action has to finish
-   * that action: this used to navigate and drop the selection on the floor, so the reader
-   * arrived at an open vault with their photographs still in the library and nothing on
-   * screen admitting that the thing they asked for had not happened.
+   * Both the request and the selection go with them, on the two history entries either side
+   * of the unlock. An unlock somebody was sent to BY an action has to finish that action,
+   * and an unlock they turn down has to give them back what they were holding: this used to
+   * drop both on the floor, so the reader arrived at an open vault with their photographs
+   * still in the library, or came back from a screen they had declined to a library that had
+   * forgotten the forty photographs they picked.
    */
   const toVault = useMutation({
     mutationFn: async (request: AssetSelection) => {
       const status = await imogen.vault.status()
       if (!status.configured || !status.unlocked) {
-        navigate('/vault', { state: { moveIn: request } satisfies VaultHandoff })
+        const errand = crypto.randomUUID()
+        const stash: VaultStash = { reselect: packSelection(selection.selection), errand }
+        navigate(here, { replace: true, state: stash })
+        navigate('/vault', { state: { moveIn: request, errand } satisfies VaultHandoff })
         return { moved: 0 }
       }
       return imogen.vault.moveIn(request)
     },
     onSuccess: afterMutation,
   })
+
+  /**
+   * The selection this view left on its own entry, back where it was.
+   *
+   * Read once and then wiped from the entry, so a later visit to the same entry starts from
+   * whatever is actually ticked — and so the ids stop sitting in the browser's history the
+   * moment they are spent. A stash whose errand went through is dropped rather than restored:
+   * those photographs are in the vault now, and re-selecting them here would aim the
+   * library's own actions at them.
+   */
+  const reselected = useRef(false)
+  useEffect(() => {
+    if (reselected.current) return
+    const stash = vaultStash(location.state)
+    if (!stash) return
+    reselected.current = true
+    navigate(here, { replace: true, state: null })
+    if (!errandSpent(stash.errand)) selection.restore(stash.reselect)
+  }, [location.state, here, navigate, selection.restore])
 
   const restore = useMutation({
     mutationFn: (request: AssetSelection) => imogen.assets.restore(request),

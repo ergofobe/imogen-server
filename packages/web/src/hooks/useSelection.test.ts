@@ -4,11 +4,13 @@ import {
   EXPLICIT_ID_LIMIT,
   extendIn,
   isSelectedIn,
+  packSelection,
   resolvedCount,
   type Selection,
   selectionRefusal,
   toggleIn,
   toRequest,
+  unpackSelection,
 } from './useSelection.ts'
 
 describe('toRequest', () => {
@@ -148,3 +150,59 @@ describe('selectionRefusal', () => {
 function setOf(size: number): Set<string> {
   return new Set(Array.from({ length: size }, (_, index) => `id-${index}`))
 }
+
+/**
+ * A selection has to survive one round trip: the history entry the library leaves behind
+ * when it sends somebody off to unlock the vault, so backing out of the unlock returns them
+ * to what they had ticked.
+ *
+ * Which means what comes back is not this app's data any more. It comes back from a reload,
+ * from a back gesture, and from whatever a previous page put on that entry — and a selection
+ * built from it goes on to name rows in a request. So the far side checks.
+ */
+describe('packSelection and unpackSelection', () => {
+  test('an id selection survives the round trip', () => {
+    const selection: Selection = { kind: 'ids', ids: new Set(['a', 'b']) }
+    expect(unpackSelection(packSelection(selection))).toEqual(selection)
+  })
+
+  test('a select-all survives as a select-all, exceptions and all', () => {
+    const selection: Selection = { kind: 'all', except: new Set(['c']) }
+    expect(unpackSelection(packSelection(selection))).toEqual(selection)
+  })
+
+  test('an empty select-all does not come back as an empty id list', () => {
+    // The two say opposite things: one means every photograph, the other means none.
+    expect(unpackSelection(packSelection({ kind: 'all', except: new Set() }))).toEqual({
+      kind: 'all',
+      except: new Set(),
+    })
+  })
+
+  test('packs to plain arrays, because a history entry is not the place for a Set', () => {
+    expect(packSelection({ kind: 'ids', ids: new Set(['a']) })).toEqual({
+      kind: 'ids',
+      ids: ['a'],
+    })
+  })
+
+  test('refuses anything that is not one', () => {
+    for (const junk of [
+      null,
+      undefined,
+      'ids',
+      42,
+      {},
+      { kind: 'ids' },
+      { kind: 'all' },
+      { kind: 'everything', ids: ['a'] },
+      { kind: 'ids', ids: 'a' },
+      { kind: 'ids', ids: {} },
+      // The one that would otherwise get through and name rows nobody chose.
+      { kind: 'ids', ids: ['a', 7] },
+      { kind: 'all', except: [null] },
+    ]) {
+      expect(unpackSelection(junk)).toBeNull()
+    }
+  })
+})

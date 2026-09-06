@@ -13,7 +13,7 @@ import type { TimelineSource } from '../hooks/useTimeline.ts'
 import { useTimelineGrid } from '../hooks/useTimelineGrid.ts'
 import { useTimelineViewer } from '../hooks/useTimelineViewer.ts'
 import { imogen } from '../lib/client.ts'
-import { vaultHandoff } from '../lib/vaultHandoff.ts'
+import { spendErrand, type VaultHandoff, vaultHandoff } from '../lib/vaultHandoff.ts'
 
 /**
  * The vault's own spine.
@@ -89,8 +89,12 @@ export function VaultRoute() {
    * same place, since setting a passphrase unlocks.
    */
   const moveIn = useMutation({
-    mutationFn: (request: AssetSelection) => imogen.vault.moveIn(request),
-    onSuccess: ({ moved }) => {
+    mutationFn: (handoff: VaultHandoff) => imogen.vault.moveIn(handoff.moveIn),
+    onSuccess: ({ moved }, { errand }) => {
+      // Only once it has actually landed. The library kept the selection on the entry the
+      // reader came from, to give back if they turned the unlock down — and a move that
+      // failed is one they may well want to try again from there.
+      spendErrand(errand)
       setNotice(`Moved ${moved} ${moved === 1 ? 'photo' : 'photos'} to the vault`)
       refresh()
     },
@@ -110,7 +114,7 @@ export function VaultRoute() {
     // nothing — and so the ids stop sitting in the browser's history the moment they are
     // spent.
     navigate(location.pathname, { replace: true, state: null })
-    moveIn.mutate(handed.moveIn)
+    moveIn.mutate(handed)
   }, [unlocked, location.state, location.pathname, navigate, moveIn.mutate])
 
   const moveOut = useMutation({

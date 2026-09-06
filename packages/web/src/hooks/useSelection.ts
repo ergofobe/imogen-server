@@ -38,6 +38,32 @@ export function toRequest(selection: Selection, query: Partial<AssetFilter>): As
   return { query, except: [...selection.except] }
 }
 
+/**
+ * A selection as plain arrays, for the one place it has to survive the component holding it:
+ * the history entry the library leaves behind when it sends somebody off to unlock the vault.
+ *
+ * Unpacking checks rather than casts. History state comes back from a reload, from a back
+ * gesture, and from whatever the previous page put there, so it is somebody else's data by
+ * the time it is read.
+ */
+export type PackedSelection = { kind: 'ids'; ids: string[] } | { kind: 'all'; except: string[] }
+
+export function packSelection(selection: Selection): PackedSelection {
+  return selection.kind === 'ids'
+    ? { kind: 'ids', ids: [...selection.ids] }
+    : { kind: 'all', except: [...selection.except] }
+}
+
+export function unpackSelection(packed: unknown): Selection | null {
+  if (!packed || typeof packed !== 'object') return null
+  const { kind, ids, except } = packed as Record<string, unknown>
+  const names = (value: unknown): value is string[] =>
+    Array.isArray(value) && value.every((entry) => typeof entry === 'string')
+  if (kind === 'ids' && names(ids)) return { kind: 'ids', ids: new Set(ids) }
+  if (kind === 'all' && names(except)) return { kind: 'all', except: new Set(except) }
+  return null
+}
+
 /** A click on one photograph, which means the opposite thing under each kind. */
 export function toggleIn(selection: Selection, id: string): Selection {
   if (selection.kind === 'ids') {
@@ -124,6 +150,8 @@ export type SelectionState = {
   canSelectAll: boolean
   selectAll: () => void
   clear: () => void
+  /** Puts back a selection this view made earlier, from `packSelection`. */
+  restore: (selection: Selection) => void
   toRequest: () => AssetSelection
   /** Set when the server would refuse this selection; the bar says it and stops the click. */
   refusal: string | null
@@ -172,6 +200,12 @@ export function useSelection(options: {
     anchor.current = null
   }, [])
 
+  const restore = useCallback((restored: Selection) => {
+    // No anchor: the run a shift-click would extend was made on a screen that is gone.
+    anchor.current = null
+    setSelection(restored)
+  }, [])
+
   const selectAll = useCallback(() => {
     anchor.current = null
     // With a filter to name, select-all is that filter and costs one request. Without one it
@@ -199,6 +233,7 @@ export function useSelection(options: {
     toggle,
     selectAll,
     clear,
+    restore,
     toRequest: request,
     refusal: useMemo(() => selectionRefusal(selection), [selection]),
   }
