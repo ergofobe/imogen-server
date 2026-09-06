@@ -407,3 +407,159 @@ describe('metadata documents', () => {
     expect(meta.authorization_servers).toEqual(['https://photos.example.com'])
   })
 })
+
+describe('resource indicators', () => {
+  const MCP = 'https://photos.example.com/mcp'
+  const ROOT = 'https://photos.example.com'
+
+  async function tokenFor(resource?: string) {
+    const client = await registerClient({ token_endpoint_auth_method: 'none' })
+    const { verifier, challenge } = pkce()
+    const code = await oauth.issueAuthorizationCode({
+      clientId: client.client_id,
+      userId,
+      redirectUri: 'https://client.example.com/callback',
+      scopes: ['library:read'],
+      codeChallenge: challenge,
+      codeChallengeMethod: 'S256',
+      resource,
+    })
+    const token = await oauth.exchangeAuthorizationCode({
+      clientId: client.client_id,
+      code,
+      codeVerifier: verifier,
+      redirectUri: 'https://client.example.com/callback',
+    })
+    return { client, token }
+  }
+
+  test('carries the requested resource from the code onto the token it mints', async () => {
+    const { token } = await tokenFor(MCP)
+
+    const principal = await oauth.verifyAccessToken(token.access_token)
+    expect(principal?.resource).toBe(MCP)
+  })
+
+  test('leaves the audience unset when the client asks for no resource', async () => {
+    const { token } = await tokenFor()
+
+    const principal = await oauth.verifyAccessToken(token.access_token)
+    expect(principal?.resource).toBeNull()
+  })
+
+  test('refuses a resource this server does not advertise', async () => {
+    const client = await registerClient({ token_endpoint_auth_method: 'none' })
+    const { challenge } = pkce()
+
+    await expect(
+      oauth.issueAuthorizationCode({
+        clientId: client.client_id,
+        userId,
+        redirectUri: 'https://client.example.com/callback',
+        scopes: ['library:read'],
+        codeChallenge: challenge,
+        codeChallengeMethod: 'S256',
+        resource: 'https://photos.example.com/../evil',
+      }),
+    ).rejects.toThrow(OAuthError)
+  })
+
+  test('refuses a resource belonging to another origin', async () => {
+    const client = await registerClient({ token_endpoint_auth_method: 'none' })
+    const { challenge } = pkce()
+
+    await expect(
+      oauth.issueAuthorizationCode({
+        clientId: client.client_id,
+        userId,
+        redirectUri: 'https://client.example.com/callback',
+        scopes: ['library:read'],
+        codeChallenge: challenge,
+        codeChallengeMethod: 'S256',
+        resource: 'https://attacker.example.com',
+      }),
+    ).rejects.toThrow(OAuthError)
+  })
+
+  test('treats a trailing slash on the site root as the same resource', async () => {
+    const { token } = await tokenFor('https://photos.example.com/')
+
+    const principal = await oauth.verifyAccessToken(token.access_token)
+    expect(principal?.resource).toBe(ROOT)
+  })
+
+  test('refuses to exchange a code for a resource other than the one it was issued for', async () => {
+    const client = await registerClient({ token_endpoint_auth_method: 'none' })
+    const { verifier, challenge } = pkce()
+    const code = await oauth.issueAuthorizationCode({
+      clientId: client.client_id,
+      userId,
+      redirectUri: 'https://client.example.com/callback',
+      scopes: ['library:read'],
+      codeChallenge: challenge,
+      codeChallengeMethod: 'S256',
+      resource: MCP,
+    })
+
+    await expect(
+      oauth.exchangeAuthorizationCode({
+        clientId: client.client_id,
+        code,
+        codeVerifier: verifier,
+        redirectUri: 'https://client.example.com/callback',
+        resource: ROOT,
+      }),
+    ).rejects.toThrow(OAuthError)
+  })
+
+  test('carries the audience across a refresh', async () => {
+    const { client, token } = await tokenFor(MCP)
+
+    const refreshed = await oauth.refresh({
+      clientId: client.client_id,
+      refreshToken: token.refresh_token!,
+    })
+
+    const principal = await oauth.verifyAccessToken(refreshed.access_token)
+    expect(principal?.resource).toBe(MCP)
+  })
+
+  test('refuses to refresh a token into a different audience', async () => {
+    const { client, token } = await tokenFor(MCP)
+
+    await expect(
+      oauth.refresh({
+        clientId: client.client_id,
+        refreshToken: token.refresh_token!,
+        resource: ROOT,
+      }),
+    ).rejects.toThrow(OAuthError)
+  })
+
+  test('will not let an unbound refresh token acquire an audience it never consented to', async () => {
+    const { client, token } = await tokenFor()
+
+    await expect(
+      oauth.refresh({
+        clientId: client.client_id,
+        refreshToken: token.refresh_token!,
+        resource: MCP,
+      }),
+    ).rejects.toThrow(OAuthError)
+  })
+
+  test('advertises that the resource parameter is honoured', () => {
+    expect(oauth.authorizationServerMetadata().resource_indicators_supported).toBe(true)
+  })
+
+  // The advertised set and the accepted set are the same list or the server is lying:
+  // a client that reads a protected-resource document and echoes its `resource` back
+  // must not then be told that resource does not exist.
+  test('accepts every resource it publishes a document for', () => {
+    for (const identifier of oauth.resourceIdentifiers()) {
+      expect(oauth.canonicalResource(identifier)).toBe(identifier)
+    }
+    expect(oauth.resourceIdentifiers()).toContain(oauth.protectedResourceMetadata().resource)
+    expect(oauth.resourceIdentifiers()).toContain(oauth.protectedResourceMetadata('/mcp').resource)
+  })
+})
