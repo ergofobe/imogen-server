@@ -214,36 +214,53 @@ export class FaceService {
   /**
    * Recomputes how many faces each person has, counting only photos that are actually
    * visible — a person's count must never include a vaulted or trashed photo.
+   *
+   * Under the same per-owner lock `recordFace` files beneath, and for the same reason it
+   * gives. This rewrites every one of the owner's `people` rows and then deletes the
+   * empty ones, so it is housekeeping of exactly the kind that lock exists to keep away
+   * from a filing in progress. Unlocked, four job workers recounting one owner's 5,758
+   * people put three backends in a lock cycle on this UPDATE — `deadlock detected` on
+   * repeat, `faces_person_id_people_id_fk` violations where the DELETE landed between a
+   * person being chosen and their face being written, and finally the 10s `lock_timeout`
+   * taking the server down with it.
+   *
+   * Serialising recounts per owner costs throughput on a backfill. It is not the reason
+   * the backfill is slow — `processAsset` calling this once per photo is — and that is
+   * worth fixing separately rather than by leaving the lock off.
    */
   async refreshCounts(ownerId: string): Promise<void> {
-    await this.db.execute(sql`
-      update ${people} set face_count = counted.total, cover_face_id = counted.cover
-      from (
-        select f.person_id,
-               count(*)::int as total,
-               (array_agg(f.id order by f.score desc))[1] as cover
-        from ${faces} f
-        join ${assets} a on a.id = f.asset_id
-        where f.owner_id = ${ownerId}
-          and a.vaulted_at is null
-          and a.deleted_at is null
-        group by f.person_id
-      ) as counted
-      where ${people.id} = counted.person_id and ${people.ownerId} = ${ownerId}
-    `)
+    await this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`faces:${ownerId}`}))`)
 
-    // A person whose every photo went to the vault or the trash is no longer a person.
-    await this.db.execute(sql`
-      delete from ${people}
-      where ${people.ownerId} = ${ownerId}
-        and not exists (
-          select 1 from ${faces} f
+      await tx.execute(sql`
+        update ${people} set face_count = counted.total, cover_face_id = counted.cover
+        from (
+          select f.person_id,
+                 count(*)::int as total,
+                 (array_agg(f.id order by f.score desc))[1] as cover
+          from ${faces} f
           join ${assets} a on a.id = f.asset_id
-          where f.person_id = ${people.id}
+          where f.owner_id = ${ownerId}
             and a.vaulted_at is null
             and a.deleted_at is null
-        )
-    `)
+          group by f.person_id
+        ) as counted
+        where ${people.id} = counted.person_id and ${people.ownerId} = ${ownerId}
+      `)
+
+      // A person whose every photo went to the vault or the trash is no longer a person.
+      await tx.execute(sql`
+        delete from ${people}
+        where ${people.ownerId} = ${ownerId}
+          and not exists (
+            select 1 from ${faces} f
+            join ${assets} a on a.id = f.asset_id
+            where f.person_id = ${people.id}
+              and a.vaulted_at is null
+              and a.deleted_at is null
+          )
+      `)
+    })
   }
 
   /** Recounts after photos come or go without their faces changing — trash, restore. */
