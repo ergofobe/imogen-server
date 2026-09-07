@@ -5,7 +5,7 @@ services:
     # A released minor, not :latest — CI moves :latest on every push to main, so
     # :latest is trunk. This picks up 0.3 patch releases and nothing else, which
     # means cutting 0.4 has to bump it here; nothing else does.
-    image: ghcr.io/ergofobe/imogen-server:0.3
+    image: ghcr.io/ergofobe/imogen-server:0.4
     restart: unless-stopped
     depends_on:
       db:
