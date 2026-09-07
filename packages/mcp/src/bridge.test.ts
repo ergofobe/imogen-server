@@ -17,10 +17,12 @@ const refusal = () =>
 describe('deciding what to write back for a forwarded message', () => {
   test('answers a refused request with the id the agent asked under', async () => {
     const reply = (await replyTo({ id: 1 }, refusal())) as {
+      jsonrpc: string
       id: unknown
       error: { message: string }
     }
 
+    expect(reply.jsonrpc).toBe('2.0')
     expect(reply.id).toBe(1)
     expect(reply.error.message).toContain('imogen-mcp login')
   })
@@ -54,7 +56,7 @@ describe('deciding what to write back for a forwarded message', () => {
   })
 
   test('stays silent for an accepted notification', async () => {
-    expect(await replyTo({ id: 1 }, new Response(null, { status: 202 }))).toBeUndefined()
+    expect(await replyTo({}, new Response(null, { status: 202 }))).toBeUndefined()
   })
 
   test('forwards a successful response as it came', async () => {
@@ -63,7 +65,18 @@ describe('deciding what to write back for a forwarded message', () => {
     expect(await replyTo({ id: 1 }, json(body, 200))).toEqual(body)
   })
 
-  test('stays silent when a successful response has no body', async () => {
-    expect(await replyTo({ id: 1 }, new Response('', { status: 200 }))).toBeUndefined()
+  test('answers rather than hangs when a request draws an empty body', async () => {
+    // The same hang as a refusal, one branch over: a proxy answering for a dropped upstream,
+    // or a 202 arriving for something that was not a notification.
+    const reply = (await replyTo({ id: 3 }, new Response('', { status: 200 }))) as { id: unknown }
+
+    expect(reply.id).toBe(3)
+  })
+
+  test('carries the server’s account of the failure so it is not lost', async () => {
+    const body = { error: { code: 'bad_request', message: 'Request body is not valid JSON' } }
+    const reply = (await replyTo({ id: 4 }, json(body, 400))) as { error: { data: string } }
+
+    expect(reply.error.data).toContain('not valid JSON')
   })
 })
