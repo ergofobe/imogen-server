@@ -393,6 +393,47 @@ describe('OAuth client', () => {
     expect(page.items[0]!.id).toBe(uploaded.asset.id)
   })
 
+  test('binds a token to the resource the client named, and only that one', async () => {
+    await signUp()
+    const registered = await oauth.register('My Photo App', ['myapp://oauth'])
+
+    // The identifier comes from the server's own RFC 9728 document rather than being
+    // spelled out here: a client that guesses it gets a token good nowhere.
+    const api = await oauth.discoverProtectedResource()
+    const pending = await oauth.beginAuthorization(
+      registered.client_id,
+      'myapp://oauth',
+      ['library:read'],
+      api.resource,
+    )
+    const approved = await testFetch(`${pending.authorizationUrl}&approved=yes`, {
+      redirect: 'manual',
+    })
+    const tokens = await oauth.completeAuthorization(pending, approved.headers.get('location')!)
+
+    const tokenClient = new ImogenClient({
+      baseUrl: 'http://localhost:3000',
+      token: tokens.access_token,
+      fetch: async (input, init) => app.fetch(new Request(input as RequestInfo, init)),
+    })
+    expect(await tokenClient.assets.list()).toMatchObject({ items: [] })
+
+    // Same token, other surface. /mcp is its own protected resource, so consenting to a
+    // connector must not hand it the REST API — or the reverse, as here.
+    const mcp = await app.fetch(
+      new Request('http://localhost:3000/mcp', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokens.access_token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      }),
+    )
+
+    expect(mcp.status).toBe(401)
+  })
+
   test('refuses a callback whose state does not match', async () => {
     const registered = await oauth.register('My Photo App', ['myapp://oauth'])
     const pending = await oauth.beginAuthorization(registered.client_id, 'myapp://oauth')

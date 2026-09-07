@@ -3,6 +3,9 @@
     "target": "ESNext",
     "module": "Preserve",
     "moduleResolution": "bundler",
+    // The SDK's `types`/`default` exports point at a dist/ it never ships from the submodule;
+    // only its `bun` condition reaches the sources bun already runs us against.
+    "customConditions": ["bun"],
     "lib": ["ESNext", "DOM", "DOM.Iterable"],
     "types": ["bun"],
     "strict": true,
