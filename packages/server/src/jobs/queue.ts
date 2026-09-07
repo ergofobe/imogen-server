@@ -53,6 +53,11 @@ function describeError(error: unknown): string {
   return chain.join(': ')
 }
 
+/** Long enough to outlast the slowest job, so a live one is never reclaimed under it. */
+const STALE_AFTER_MINUTES = 15
+
+const RECLAIMED = 'Reclaimed: the worker stopped without finishing this job'
+
 export class JobQueue {
   private readonly handlers = new Map<string, JobHandler>()
   private workers: Promise<void>[] = []
@@ -203,6 +208,39 @@ export class JobQueue {
         runAt: new Date(Date.now() + delaySeconds * 1000),
       })
       .where(eq(jobs.id, id))
+  }
+
+  /**
+   * Returns to the queue any job a worker died in the middle of.
+   *
+   * `claim` only ever looks at `queued`, so a row left `running` when the process went
+   * away is never looked at again. Thirteen sat that way in production for eleven days,
+   * and four of them were `asset.ingest` holding back 364 already-uploaded photos.
+   *
+   * A job out of attempts is failed rather than requeued. The crash may well be the job's
+   * own doing — a photo that kills the process is reclaimed, retried, and kills it again —
+   * and `claim` does not check the attempt limit, so requeuing forever would be a crash
+   * loop wearing the costume of a recovery.
+   *
+   * The window has to outlast the longest job rather than the shortest crash: a job still
+   * legitimately running must never be handed to a second worker, which also keeps this
+   * honest if the server is ever run as more than one replica.
+   */
+  async reclaimStale(olderThanMinutes = STALE_AFTER_MINUTES): Promise<number> {
+    const cutoff = new Date(Date.now() - olderThanMinutes * 60_000)
+    const spent = sql`${jobs.attempts} >= ${jobs.maxAttempts}`
+    const reclaimed = await this.db.execute(sql`
+      update ${jobs}
+      set status = case when ${spent} then 'failed' else 'queued' end,
+          finished_at = case when ${spent} then now() else null end,
+          last_error = ${RECLAIMED},
+          started_at = null,
+          run_at = now()
+      where ${jobs.status} = 'running' and ${jobs.startedAt} < ${cutoff}
+      returning ${jobs.id}
+    `)
+    const rows = Array.isArray(reclaimed) ? reclaimed : (reclaimed as { rows?: unknown[] }).rows
+    return rows?.length ?? 0
   }
 
   async pruneCompleted(olderThanDays = 7): Promise<void> {
