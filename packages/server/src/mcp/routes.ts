@@ -1,6 +1,7 @@
 import type { Context } from 'hono'
 import { Hono } from 'hono'
 import { z } from 'zod'
+import manifest from '../../package.json'
 import { type AppEnv, resolvePrincipal } from '../auth/middleware.ts'
 import { HttpError } from '../lib/errors.ts'
 import { TOOLS, TOOLS_BY_NAME, type ToolContext } from './tools.ts'
@@ -101,7 +102,10 @@ export function createMcpRoutes() {
           result(id, {
             protocolVersion: SUPPORTED_PROTOCOLS.includes(asked) ? asked : PROTOCOL_VERSION,
             capabilities: { tools: { listChanged: false } },
-            serverInfo: { name: 'imogen', title: 'imogen photos', version: '0.1.0' },
+            // From the manifest for the same reason the health check reads it there: a
+            // second copy of the number is one nobody remembers to bump, and this one
+            // told every MCP client 0.1.0 for four releases running.
+            serverInfo: { name: 'imogen', title: 'imogen photos', version: manifest.version },
             instructions:
               'This is the user’s personal photo library. Search with search_photos, then ' +
               'use get_photo_image to actually look at a photo. Ids come from search results.',

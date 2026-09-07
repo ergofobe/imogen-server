@@ -481,7 +481,10 @@ describe.skipIf(!canRun)('grouping faces into people', () => {
     const stored = await db.select().from(faces)
     expect(stored.length).toBeGreaterThan(0)
     expect(stored.every((f) => f.personId !== null)).toBe(true)
-  })
+    // Five photographs through the ONNX pipeline at once fits in bun's default 5s only
+    // on an idle machine; a loaded runner has taken 5.6s, and timing out here leaves
+    // rows behind that fail the next test's truncate instead of just this one.
+  }, 15_000)
 
   test('lists the photos a person appears in', async () => {
     const a = await addPhoto('person-a.png')

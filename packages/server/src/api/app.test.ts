@@ -1035,10 +1035,14 @@ describe('MCP endpoint', () => {
 
   test('initialize works before authenticating, so a client can discover the server', async () => {
     const response = await rpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
-    const body = (await response.json()) as { result: { serverInfo: { name: string } } }
+    const body = (await response.json()) as {
+      result: { serverInfo: { name: string; version: string } }
+    }
 
     expect(response.status).toBe(200)
     expect(body.result.serverInfo.name).toBe('imogen')
+    // The version was written out by hand here once and went stale across four releases.
+    expect(body.result.serverInfo.version).toBe(manifest.version)
   })
 
   test('listing tools without a token returns 401 with the metadata pointer', async () => {
