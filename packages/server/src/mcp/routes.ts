@@ -63,15 +63,6 @@ export function createMcpRoutes() {
     if (c.req.method === 'GET') return c.body(null, 405, { Allow: 'POST' })
     if (c.req.method !== 'POST') return c.body(null, 405, { Allow: 'POST' })
 
-    const body = await c.req.json().catch(() => null)
-    if (body === null) {
-      return c.json(failure(null, RPC.PARSE_ERROR, 'Request body is not valid JSON'), 400)
-    }
-
-    // A batch is an array; answer each and drop notification responses.
-    const isBatch = Array.isArray(body)
-    const messages = isBatch ? body : [body]
-
     // This endpoint is its own protected resource, so a token minted for the REST API is
     // not a token for it. Anything the user consented to here was consented to for here.
     const principal = await resolvePrincipal(
@@ -80,6 +71,26 @@ export function createMcpRoutes() {
       undefined,
       services.oauth.resourceIdentifier('/mcp'),
     )
+
+    // Every method here needs a caller, initialize and ping included. Answering the
+    // handshake unauthenticated looks helpful and is the opposite: initialize is the
+    // first request a client makes, so a 200 there is the server saying it needs no
+    // sign-in. Claude's connector dialog reads that as "Authentication: None", Grok
+    // records the connector as connected, and neither ever opens an authorize URL or
+    // sees a tool. The 401 below is the only thing that starts RFC 9728 discovery, and
+    // the spec's own flow opens with an unauthenticated request meeting exactly it.
+    if (!principal) {
+      return unauthorizedResponse(c, services.config.publicUrl)
+    }
+
+    const body = await c.req.json().catch(() => null)
+    if (body === null) {
+      return c.json(failure(null, RPC.PARSE_ERROR, 'Request body is not valid JSON'), 400)
+    }
+
+    // A batch is an array; answer each and drop notification responses.
+    const isBatch = Array.isArray(body)
+    const messages = isBatch ? body : [body]
 
     const responses = []
     for (const message of messages) {
@@ -117,11 +128,6 @@ export function createMcpRoutes() {
       if (request.method === 'ping') {
         responses.push(result(id, {}))
         continue
-      }
-
-      // Everything past this point touches the library, so it needs a caller.
-      if (!principal) {
-        return unauthorizedResponse(c, services.config.publicUrl)
       }
 
       if (request.method === 'tools/list') {
