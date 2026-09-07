@@ -1,6 +1,6 @@
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
-import { defineConfig } from 'vite'
+import { defaultClientConditions, defineConfig } from 'vite'
 import { VitePWA } from 'vite-plugin-pwa'
 
 export default defineConfig({
@@ -59,6 +59,11 @@ export default defineConfig({
       devOptions: { enabled: false },
     }),
   ],
+  // The SDK's `types`/`default` exports point at a dist/ it never ships from the submodule;
+  // only its `bun` condition reaches the sources, which vite compiles as happily as bun runs
+  // them. The defaults are spread back in because this list replaces them rather than adding
+  // to them, and dropping `browser` would quietly hand some other package its node build.
+  resolve: { conditions: ['bun', ...defaultClientConditions] },
   server: {
     port: 5173,
     proxy: {
