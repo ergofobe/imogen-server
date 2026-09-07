@@ -13,10 +13,19 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Three jobs below name the image. A registry path copied around is a registry path that
-# goes stale in one of the copies.
+# Both are named once because two jobs below need them, and a registry path or a tag rule
+# copied around is one that goes stale in exactly one of the copies.
+#
+# Tags carry no leading v, so a compose file pins `imogen-server:0.1.0` rather than
+# `:v0.1.0`. main additionally moves :latest and publishes a short-sha tag, so an
+# unreleased commit is still deployable by digest.
 env:
   IMAGE: ghcr.io/ergofobe/imogen-server
+  TAG_RULES: |
+    type=semver,pattern={{version}}
+    type=semver,pattern={{major}}.{{minor}}
+    type=raw,value=latest,enable={{is_default_branch}}
+    type=sha,format=short,enable={{is_default_branch}}
 
 jobs:
   check:
@@ -101,6 +110,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      PUBLISH: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
     strategy:
       fail-fast: false
       matrix:
@@ -122,24 +133,30 @@ jobs:
           submodules: recursive
       - uses: docker/setup-buildx-action@v3
 
-      # A pull request still builds both platforms, to prove the Dockerfile works on each,
-      # but does not sign in or push: a fork's token cannot write to the registry, and an
-      # unreviewed branch has no business publishing an image people can pull.
+      # Only main and release tags publish. A pull request still builds both platforms, to
+      # prove the Dockerfile works on each, but does not sign in or push: a fork's token
+      # cannot write to the registry, and an unreviewed branch has no business publishing an
+      # image people can pull. `github.ref` covers pull_request too, whose ref is
+      # refs/pull/N/merge; a workflow_dispatch on a feature branch would otherwise push
+      # per-platform manifests that no tag will ever name.
       - name: Sign in to GHCR
-        if: github.event_name != 'pull_request'
+        if: ${{ env.PUBLISH == 'true' }}
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Labels only. Tags are worked out once, in the merge job, and applied to the manifest
-      # list rather than to either half of it.
+      # Only the labels are used here — the merge job applies the tags, to the manifest list
+      # rather than to either half of it. The rules still have to match, because
+      # org.opencontainers.image.version is baked into each half from them, and metadata's
+      # own defaults would stamp `v0.4.1` where every release so far says `0.4.1`.
       - name: Work out the labels
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
+          tags: ${{ env.TAG_RULES }}
 
       - name: Build the image
         id: build
@@ -149,7 +166,7 @@ jobs:
           file: Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ env.PUBLISH }}
           # Scoped per platform. A single shared scope would have each build evict the
           # other's layers on every run, so neither would ever start from a warm cache.
           cache-from: type=gha,scope=${{ env.PLATFORM }}
@@ -158,7 +175,7 @@ jobs:
       # The digest is the entire payload. An empty file named after it carries everything
       # the merge job needs to rebuild the reference.
       - name: Hand the digest to the merge job
-        if: github.event_name != 'pull_request'
+        if: ${{ env.PUBLISH == 'true' }}
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
@@ -166,7 +183,7 @@ jobs:
           touch "/tmp/digests/${DIGEST#sha256:}"
 
       - name: Upload the digest
-        if: github.event_name != 'pull_request'
+        if: ${{ env.PUBLISH == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: digest-${{ env.PLATFORM }}
@@ -178,7 +195,9 @@ jobs:
   # covering both platforms rather than whichever build happened to finish last.
   merge:
     needs: docker
-    if: github.event_name != 'pull_request'
+    # Spelled out rather than reusing the docker job's PUBLISH: a job-level `if` cannot see
+    # `env`.
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -200,37 +219,45 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tags carry no leading v, so a compose file pins `imogen-server:0.1.0`
-      # rather than `:v0.1.0`. main additionally moves :latest and publishes a
-      # short-sha tag, so an unreleased commit is still deployable by digest.
       - name: Work out the tags
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,format=short,enable={{is_default_branch}}
+          tags: ${{ env.TAG_RULES }}
 
       - name: Assemble the manifest list
         working-directory: /tmp/digests
         run: |
-          # Assembled as an array rather than interpolated into one string: splitting a
+          # Assembled as arrays rather than interpolated into one string: splitting a
           # command line on whitespace is a bug waiting for the first tag that contains any.
-          args=()
-          while IFS= read -r tag; do args+=(-t "$tag"); done \
+          shopt -s nullglob
+          refs=()
+          for digest in *; do refs+=("$IMAGE@sha256:$digest"); done
+          tags=()
+          while IFS= read -r tag; do tags+=(-t "$tag"); done \
             < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
-          for digest in *; do args+=("$IMAGE@sha256:$digest"); done
-          docker buildx imagetools create "${args[@]}"
 
-      # Cheap, and it is the whole point of the change: a run that manages to publish one
-      # platform should fail here rather than ship an image that quietly emulates.
-      - name: Check both platforms made it in
+          # Both counts are asserted because both can be silently empty: an unmatched
+          # download-artifact pattern warns rather than fails, and the jq above runs in a
+          # process substitution, whose exit status nothing ever sees. Untrapped, the first
+          # publishes nothing under every tag and the second publishes an image under none.
+          [ "${#refs[@]}" -eq 2 ] || { echo "::error::expected 2 platform digests, got ${#refs[@]}"; exit 1; }
+          [ "${#tags[@]}" -gt 0 ] || { echo "::error::no tags; DOCKER_METADATA_OUTPUT_JSON is empty or malformed"; exit 1; }
+
+          # Checked on a dry run of the very same call, because `create` publishes: a check
+          # that ran afterwards would be reporting a bad :latest rather than preventing one.
+          # The unknown/unknown entries filtered out here are the provenance attestations
+          # buildx attaches to each half.
+          docker buildx imagetools create --dry-run "${tags[@]}" "${refs[@]}" > /tmp/preview.json
+          jq -e '[.manifests[].platform | select(.os != "unknown")
+                  | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]' \
+            /tmp/preview.json > /dev/null \
+            || { echo "::error::manifest list is not both platforms:"; jq -c '[.manifests[].platform]' /tmp/preview.json; exit 1; }
+
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+
+      - name: Show what was published
         env:
           VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          docker buildx imagetools inspect "$IMAGE:$VERSION" --raw \
-            | jq -e '[.manifests[].platform | select(.os != "unknown")
-                      | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]'
+        run: docker buildx imagetools inspect "$IMAGE:$VERSION"
