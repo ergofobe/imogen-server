@@ -219,15 +219,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The per-platform builds label their own image configs, but the manifest list is
+      # what a tag now names, and it is a level above those. Without this the index carries
+      # no org.opencontainers.image.* at all — including `source`, which is what links the
+      # GHCR package back to this repository.
       - name: Work out the tags
         id: meta
         uses: docker/metadata-action@v5
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
           images: ${{ env.IMAGE }}
           tags: ${{ env.TAG_RULES }}
 
       - name: Assemble the manifest list
         working-directory: /tmp/digests
+        env:
+          ANNOTATIONS: ${{ steps.meta.outputs.annotations }}
         run: |
           # Assembled as arrays rather than interpolated into one string: splitting a
           # command line on whitespace is a bug waiting for the first tag that contains any.
@@ -237,11 +245,15 @@ jobs:
           tags=()
           while IFS= read -r tag; do tags+=(-t "$tag"); done \
             < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          notes=()
+          while IFS= read -r annotation; do
+            if [ -n "$annotation" ]; then notes+=(--annotation "$annotation"); fi
+          done <<< "$ANNOTATIONS"
 
-          # Both counts are asserted because both can be silently empty: an unmatched
-          # download-artifact pattern warns rather than fails, and the jq above runs in a
+          # Both counts are asserted because both can be silently short: a matrix leg that
+          # uploaded nothing leaves one digest rather than none, and the jq above runs in a
           # process substitution, whose exit status nothing ever sees. Untrapped, the first
-          # publishes nothing under every tag and the second publishes an image under none.
+          # publishes half a manifest list and the second publishes an image under no tag.
           [ "${#refs[@]}" -eq 2 ] || { echo "::error::expected 2 platform digests, got ${#refs[@]}"; exit 1; }
           [ "${#tags[@]}" -gt 0 ] || { echo "::error::no tags; DOCKER_METADATA_OUTPUT_JSON is empty or malformed"; exit 1; }
 
@@ -249,13 +261,16 @@ jobs:
           # that ran afterwards would be reporting a bad :latest rather than preventing one.
           # The unknown/unknown entries filtered out here are the provenance attestations
           # buildx attaches to each half.
-          docker buildx imagetools create --dry-run "${tags[@]}" "${refs[@]}" > /tmp/preview.json
+          docker buildx imagetools create --dry-run "${tags[@]}" "${notes[@]}" "${refs[@]}" \
+            > /tmp/preview.json
           jq -e '[.manifests[].platform | select(.os != "unknown")
                   | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]' \
             /tmp/preview.json > /dev/null \
-            || { echo "::error::manifest list is not both platforms:"; jq -c '[.manifests[].platform]' /tmp/preview.json; exit 1; }
+            || { echo "::error::manifest list is not both platforms:"
+                 jq -c '[.manifests[].platform]' /tmp/preview.json || cat /tmp/preview.json
+                 exit 1; }
 
-          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+          docker buildx imagetools create "${tags[@]}" "${notes[@]}" "${refs[@]}"
 
       - name: Show what was published
         env:
