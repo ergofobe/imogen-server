@@ -1066,6 +1066,18 @@ describe('MCP endpoint', () => {
     expect(body.result.serverInfo.version).toBe(manifest.version)
   })
 
+  // The notification path now sits behind the authorization gate. A client that has
+  // authorized still sends notifications/initialized straight after the handshake, and
+  // it must keep getting the bodyless 202 rather than anything it would try to parse.
+  test('an authorized notification is accepted with no body to reply to', async () => {
+    const { token } = await connectorToken()
+
+    const response = await rpc({ jsonrpc: '2.0', method: 'notifications/initialized' }, token)
+
+    expect(response.status).toBe(202)
+    expect(await response.text()).toBe('')
+  })
+
   test('listing tools without a token returns 401 with the metadata pointer', async () => {
     const response = await rpc({ jsonrpc: '2.0', id: 1, method: 'tools/list' })
 
