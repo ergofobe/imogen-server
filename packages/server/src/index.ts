@@ -15,6 +15,10 @@ const here = dirname(fileURLToPath(import.meta.url))
 const webRoot = join(here, '../../web/dist')
 const app = createApp({ services, ...(existsSync(webRoot) ? { webRoot } : {}) })
 
+// A restart is the one moment we know for certain that nothing this process claimed is
+// still running, so it is the natural place to recover what the last one left behind.
+await services.queue.reclaimStale()
+
 services.queue.start()
 await scheduleMaintenance(services.queue)
 
@@ -39,3 +43,24 @@ async function shutdown(signal: string) {
 }
 process.on('SIGINT', () => void shutdown('SIGINT'))
 process.on('SIGTERM', () => void shutdown('SIGTERM'))
+
+/**
+ * Say why the process is ending, whatever the reason.
+ *
+ * This server twice exited 0 in production while serving — no signal, no stack, the line
+ * above never printed, and the jobs it had claimed were left `running` forever. An exit
+ * that explains nothing is one nobody can fix, so: `beforeExit` distinguishes an event
+ * loop that simply ran dry from a deliberate exit, and the two handlers below turn an
+ * error that would otherwise leave silently into one that is written down first. Both
+ * still end the process — this is instrumentation, not a safety net to keep running on.
+ */
+process.on('beforeExit', (code) => console.log(`event loop drained, exiting with ${code}`))
+process.on('exit', (code) => console.log(`process exiting with code ${code}`))
+process.on('uncaughtException', (error) => {
+  console.error('uncaught exception', error)
+  process.exit(1)
+})
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandled rejection', reason)
+  process.exit(1)
+})
