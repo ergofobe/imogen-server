@@ -4,17 +4,16 @@ import type { OAuthClient, PendingAuthorization } from '@imogen/sdk'
  * Registers this machine and starts an authorization bound to `/mcp` alone.
  *
  * The bridge forwards to `/mcp` and nowhere else, so an unbound token — valid there *and*
- * across the whole REST API — is more reach than it has any use for. This server has
- * enforced token audiences since #14, and its own stdio bridge was the first-party client
- * still holding the broadest possible token. RFC 8707 `resource` is what narrows it.
+ * across the whole REST API — is more reach than it has any use for. Audiences have been
+ * enforced since #14 (merged as #18), which left this server's own stdio bridge as the
+ * first-party client still holding the broadest possible token.
  *
- * The identifier comes from the server's RFC 9728 document rather than `${baseUrl}/mcp`.
- * The server compares against the single spelling it publishes and deliberately does not
- * normalise beyond stripping trailing slashes, so a concatenated near-miss
- * (`https://Host:443/mcp`) is refused as `invalid_target` by the very server that
- * published the real one.
+ * Read the identifier from the RFC 9728 document rather than building `${baseUrl}/mcp`:
+ * the server compares against the one spelling it publishes and normalises nothing beyond
+ * trailing slashes, so a concatenated near-miss (`https://Host:443/mcp`) is refused as
+ * `invalid_target` by the very server that published the real one.
  *
- * `resource` rides on `pending` from here, which is what keeps the authorization request
+ * `resource` rides on `pending` from here, which is what stops the authorization request
  * and the token exchange from naming different things — the exchange refuses a resource
  * the code did not record.
  */

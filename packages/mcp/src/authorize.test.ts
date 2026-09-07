@@ -5,22 +5,30 @@ import { beginBridgeAuthorization } from './authorize.ts'
 const SERVER = 'https://photos.example.com'
 
 /**
- * The identifier the server publishes deliberately is not `${baseUrl}/mcp`: this stands in
- * for a deployment whose `IMOGEN_PUBLIC_URL` is spelled differently from the address the
- * bridge was pointed at. A client that builds the identifier instead of reading it gets
- * `invalid_target` from the very server that published it.
+ * What the server publishes is deliberately not `${SERVER}/mcp`: this stands in for a
+ * deployment whose `IMOGEN_PUBLIC_URL` is spelled differently from the address the bridge
+ * was pointed at. A client that builds the identifier rather than reading it is refused
+ * as `invalid_target` by the very server that published the real one.
  */
 const PUBLISHED_MCP_RESOURCE = 'https://photos.example.com:8443/mcp'
+
+/** The scopes the bridge has always asked for, and which this change must not disturb. */
+const DEFAULT_SCOPES = 'library:read library:write albums:read albums:write'
+
+const REDIRECT_URI = 'http://127.0.0.1:1234/callback'
 
 const json = (body: unknown) =>
   new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } })
 
-const stubServer = (): { fetch: FetchLike; requests: string[] } => {
-  const requests: string[] = []
+type Stub = { fetch: FetchLike; urls: string[]; registration: () => Record<string, unknown> }
 
-  const fetch: FetchLike = async (input) => {
+const stubServer = (): Stub => {
+  const urls: string[] = []
+  let registration: Record<string, unknown> | undefined
+
+  const fetch: FetchLike = async (input, init) => {
     const url = typeof input === 'string' ? input : input.toString()
-    requests.push(url)
+    urls.push(url)
 
     if (url.endsWith('/.well-known/oauth-authorization-server')) {
       return json({
@@ -37,22 +45,28 @@ const stubServer = (): { fetch: FetchLike; requests: string[] } => {
       return json({ resource: SERVER })
     }
     if (url.endsWith('/oauth/register')) {
+      registration = JSON.parse(String(init?.body)) as Record<string, unknown>
       return json({ client_id: 'CLIENT' })
     }
     throw new Error(`unexpected request: ${url}`)
   }
 
-  return { fetch, requests }
+  return {
+    fetch,
+    urls,
+    registration: () => {
+      if (!registration) throw new Error('nothing registered')
+      return registration
+    },
+  }
 }
+
+const begin = (stub: Stub) =>
+  beginBridgeAuthorization(new OAuthClient(SERVER, stub.fetch), REDIRECT_URI)
 
 describe('starting the bridge’s authorization', () => {
   test('binds the token to /mcp rather than the whole server', async () => {
-    const { fetch } = stubServer()
-
-    const { pending } = await beginBridgeAuthorization(
-      new OAuthClient(SERVER, fetch),
-      'http://127.0.0.1:1234/callback',
-    )
+    const { pending } = await begin(stubServer())
 
     expect(new URL(pending.authorizationUrl).searchParams.get('resource')).toBe(
       PUBLISHED_MCP_RESOURCE,
@@ -60,41 +74,32 @@ describe('starting the bridge’s authorization', () => {
   })
 
   test('reads the identifier from the document instead of building it', async () => {
-    const { fetch, requests } = stubServer()
+    const stub = stubServer()
 
-    const { pending } = await beginBridgeAuthorization(
-      new OAuthClient(SERVER, fetch),
-      'http://127.0.0.1:1234/callback',
-    )
+    const { pending } = await begin(stub)
 
-    expect(requests).toContain(`${SERVER}/.well-known/oauth-protected-resource/mcp`)
+    expect(stub.urls).toContain(`${SERVER}/.well-known/oauth-protected-resource/mcp`)
     // Not `${SERVER}/mcp`, which is what concatenation would have produced.
     expect(pending.resource).toBe(PUBLISHED_MCP_RESOURCE)
   })
 
-  test('carries the resource on `pending`, so the token exchange cannot disagree', async () => {
-    const { fetch } = stubServer()
+  test('asks for the same scopes it always did', async () => {
+    const stub = stubServer()
 
-    const { pending } = await beginBridgeAuthorization(
-      new OAuthClient(SERVER, fetch),
-      'http://127.0.0.1:1234/callback',
-    )
+    const { pending } = await begin(stub)
 
-    // `exchangeAuthorizationCode` refuses a token request naming a resource the code did
-    // not record, so these two travelling together is the point of returning `pending`.
-    expect(pending.resource).toBe(PUBLISHED_MCP_RESOURCE)
-    expect(pending.resource).toBe(new URL(pending.authorizationUrl).searchParams.get('resource'))
+    // `resource` is passed positionally, one slot past `scopes`. Getting that wrong is
+    // silent: the flow still completes, having asked for a scope named after a URL.
+    expect(new URL(pending.authorizationUrl).searchParams.get('scope')).toBe(DEFAULT_SCOPES)
+    expect(stub.registration().scope).toBe(DEFAULT_SCOPES)
   })
 
-  test('registers under the redirect the loopback listener is actually on', async () => {
-    const { fetch } = stubServer()
+  test('registers the loopback redirect the listener is actually on', async () => {
+    const stub = stubServer()
 
-    const { clientId, pending } = await beginBridgeAuthorization(
-      new OAuthClient(SERVER, fetch),
-      'http://127.0.0.1:1234/callback',
-    )
+    const { clientId } = await begin(stub)
 
+    expect(stub.registration().redirect_uris).toEqual([REDIRECT_URI])
     expect(clientId).toBe('CLIENT')
-    expect(pending.redirectUri).toBe('http://127.0.0.1:1234/callback')
   })
 })
