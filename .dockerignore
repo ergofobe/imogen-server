@@ -8,6 +8,7 @@ node_modules
 **/dev-dist
 data
 .git
+**/.git
 .github
 docs
 *.tsbuildinfo
