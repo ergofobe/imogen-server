@@ -207,6 +207,79 @@ describe('forgetting a set of assets', () => {
 })
 
 /**
+ * Four job workers process one owner's photos at a time, and each finishes by recounting
+ * that owner. Nothing serialised those recounts: the UPDATE and the DELETE inside
+ * `refreshCounts` walk the same `people` rows, the grouped subquery fixes no order
+ * between them, and concurrent copies took the same rows in different orders.
+ *
+ * In production this deadlocked continuously against one owner's 5,758 people — three
+ * backends in a lock cycle, all running this same statement — and the retries piled up
+ * until a statement hit the lock timeout and took the server down with it.
+ *
+ * Driven with plain rows rather than real detection, so it runs without the model
+ * fixtures `canRun` gates.
+ */
+/**
+ * `recordFace` files a face under a per-owner advisory lock, and says why: without it
+ * concurrent workers each find nobody yet and split one person into three, and the
+ * housekeeping pass can delete a person in the instant between creating them and
+ * storing their face.
+ *
+ * `refreshCounts` performs that same housekeeping — it rewrites every one of the owner's
+ * `people` rows and then deletes the empty ones — and took no lock at all. Against one
+ * production owner's 5,758 people with four job workers, that gave three backends in a
+ * lock cycle running this same UPDATE, a stream of `deadlock detected`, and
+ * `faces_person_id_people_id_fk` violations from the DELETE landing between a person
+ * being chosen and their face being inserted. Retries piled up until a statement hit the
+ * 10s `lock_timeout` and took the server with it.
+ *
+ * Holding the lock elsewhere and watching the recount wait is the deterministic version
+ * of that: a deadlock itself is a race, but "does not run concurrently" is not.
+ */
+describe('recounting under concurrency', () => {
+  test('recounting waits for the same per-owner lock that files a face', async () => {
+    const asset = await addBareAsset()
+    const [person] = await db.insert(people).values({ ownerId }).returning()
+    await addFace(asset.id, person!.id)
+
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let locked!: () => void
+    const isLocked = new Promise<void>((resolve) => {
+      locked = resolve
+    })
+
+    const holder = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`faces:${ownerId}`}))`)
+      locked()
+      await held
+    })
+    await isLocked
+
+    let finished = false
+    const recount = service.refreshCounts(ownerId).then(() => {
+      finished = true
+    })
+
+    try {
+      await Bun.sleep(250)
+      // Unfixed, this has already run to completion straight through the lock.
+      expect(finished).toBe(false)
+    } finally {
+      // Always let the holder commit: a failed assertion would otherwise leave the
+      // transaction open and wedge the truncate in `beforeEach`.
+      release()
+      await holder
+      await recount
+    }
+
+    expect(finished).toBe(true)
+  })
+})
+
+/**
  * `photosOf` used to be `selectDistinctOn([assets.id])` with no `orderBy` at all — an
  * arbitrary five hundred in whatever order Postgres felt like handing back uuids, not
  * the most recent five hundred. Driven with plain `faces` rows rather than real
