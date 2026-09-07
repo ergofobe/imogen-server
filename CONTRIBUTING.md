@@ -25,11 +25,18 @@ The `overrides` block in the root `package.json` is what points `@imogen/sdk` an
 `@imogen/shared` at `imogen-sdk/`. Deleting it, and the submodule with it, is the whole of
 the change once the packages are on npm.
 
+Those two paths are spelled `file:imogen-sdk/...` with no leading `./`, which is load
+bearing rather than untidy: with the `./` bun normalises the override and the SDK's own
+nested `@imogen/shared` dependency to two different store keys and installs two copies of
+the Zod schemas, so the server and the SDK would validate against separate instances of
+the same contract. Bare, they dedupe to one.
+
 The submodule pointer is the record of which SDK commit this repository was built and
 tested against, so a change to the SDK lands here as a commit that moves it:
 
 ```bash
-git -C imogen-sdk checkout <sha>    # or: git -C imogen-sdk pull
+git -C imogen-sdk fetch origin
+git -C imogen-sdk checkout <sha>    # detached HEAD: a pointer is a commit, not a branch
 git add imogen-sdk && git commit -m "Move to the current SDK"
 ```
 

@@ -5,8 +5,9 @@
 #     docker build -t imogen .
 #
 # The client packages are a submodule at ./imogen-sdk, so they are inside the context;
-# build from a clone made with --recurse-submodules or the two COPY lines below find
-# nothing. Once the packages are on npm those lines go away with the overrides block.
+# build from a clone made with --recurse-submodules or the two COPY lines below fail the
+# build outright. Once the packages are on npm those lines go away with the overrides
+# block.
 
 # ---- Build ----------------------------------------------------------------
 FROM oven/bun:1.3-debian AS build
