@@ -155,8 +155,10 @@ export class OAuthService {
       // S256 only. Advertising `plain` invites a downgrade that defeats the point.
       code_challenge_methods_supported: ['S256'],
       token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
-      // RFC 8707. Advertised only because `resource` is now recorded and enforced; a
-      // client that sends it gets a token that works nowhere else.
+      // Conventional rather than registered: RFC 8707 defines the `resource` parameter
+      // and the `invalid_target` error but no metadata field for them, and RFC 8414 §2
+      // allows the extra key. Advertised only because `resource` is now recorded and
+      // enforced; a client that sends it gets a token that works nowhere else.
       resource_indicators_supported: true,
       service_documentation: `${base}/api/v1/docs`,
     }
