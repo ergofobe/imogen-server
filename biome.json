@@ -8,6 +8,7 @@
   "files": {
     "includes": [
       "**",
+      "!imogen-sdk",
       "!**/dist",
       "!**/node_modules",
       "!**/drizzle",

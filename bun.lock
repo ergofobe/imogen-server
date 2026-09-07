@@ -12,7 +12,7 @@
     },
     "packages/mcp": {
       "name": "@imogen/mcp",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "bin": {
         "imogen-mcp": "./src/cli.ts",
       },
@@ -22,7 +22,7 @@
     },
     "packages/server": {
       "name": "@imogen/server",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "dependencies": {
         "@hono/zod-openapi": "^1.6.1",
         "@imogen/shared": "^0.1.0",
@@ -43,7 +43,7 @@
     },
     "packages/web": {
       "name": "@imogen/web",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "dependencies": {
         "@imogen/sdk": "^0.1.0",
         "@imogen/shared": "^0.1.0",
@@ -70,8 +70,8 @@
     "onnxruntime-node",
   ],
   "overrides": {
-    "@imogen/sdk": "file:../imogen-sdk/typescript/packages/sdk",
-    "@imogen/shared": "file:../imogen-sdk/typescript/packages/shared",
+    "@imogen/sdk": "file:imogen-sdk/typescript/packages/sdk",
+    "@imogen/shared": "file:imogen-sdk/typescript/packages/shared",
   },
   "packages": {
     "@ai-sdk/gateway": ["@ai-sdk/gateway@3.0.13", "", { "dependencies": { "@ai-sdk/provider": "3.0.2", "@ai-sdk/provider-utils": "4.0.5", "@vercel/oidc": "3.1.0" }, "peerDependencies": { "zod": "^3.25.76 || ^4.1.8" } }, "sha512-g7nE4PFtngOZNZSy1lOPpkC+FAiHxqBJXqyRMEG7NUrEVZlz5goBdtHg1YgWRJIX776JTXAmbOI5JreAKVAsVA=="],
@@ -1704,15 +1704,15 @@
 
     "@floating-ui/dom/@floating-ui/utils": ["@floating-ui/utils@0.2.12", "", {}, "sha512-HpCo8tmWzLVad5s2d19EhAz5zqrrQ6s69qd6moPMQvkOuSwDT1YgRfWSVuc4ennqrgv3OHppiOGMQ7oC13yIww=="],
 
-    "@imogen/mcp/@imogen/sdk": ["@imogen/sdk@file:../imogen-sdk/typescript/packages/sdk", { "dependencies": { "@imogen/shared": "workspace:*" } }],
+    "@imogen/mcp/@imogen/sdk": ["@imogen/sdk@file:imogen-sdk/typescript/packages/sdk", { "dependencies": { "@imogen/shared": "workspace:*" } }],
 
-    "@imogen/server/@imogen/sdk": ["@imogen/sdk@file:../imogen-sdk/typescript/packages/sdk", { "dependencies": { "@imogen/shared": "workspace:*" } }],
+    "@imogen/server/@imogen/sdk": ["@imogen/sdk@file:imogen-sdk/typescript/packages/sdk", { "dependencies": { "@imogen/shared": "workspace:*" } }],
 
-    "@imogen/server/@imogen/shared": ["@imogen/shared@file:../imogen-sdk/typescript/packages/shared", { "dependencies": { "zod": "^4.1.5" } }],
+    "@imogen/server/@imogen/shared": ["@imogen/shared@file:imogen-sdk/typescript/packages/shared", { "dependencies": { "zod": "^4.1.5" } }],
 
-    "@imogen/web/@imogen/sdk": ["@imogen/sdk@file:../imogen-sdk/typescript/packages/sdk", { "dependencies": { "@imogen/shared": "workspace:*" } }],
+    "@imogen/web/@imogen/sdk": ["@imogen/sdk@file:imogen-sdk/typescript/packages/sdk", { "dependencies": { "@imogen/shared": "workspace:*" } }],
 
-    "@imogen/web/@imogen/shared": ["@imogen/shared@file:../imogen-sdk/typescript/packages/shared", { "dependencies": { "zod": "^4.1.5" } }],
+    "@imogen/web/@imogen/shared": ["@imogen/shared@file:imogen-sdk/typescript/packages/shared", { "dependencies": { "zod": "^4.1.5" } }],
 
     "@scalar/api-client/set-cookie-parser": ["set-cookie-parser@3.1.0", "", {}, "sha512-kjnC1DXBHcxaOaOXBHBeRtltsDG2nUiUni+jP92M9gYdW12rsmx92UsfpH7o5tDRs7I1ZZPSQJQGv3UaRfCiuw=="],
 
@@ -1818,11 +1818,11 @@
 
     "@esbuild-kit/core-utils/esbuild/@esbuild/win32-x64": ["@esbuild/win32-x64@0.18.20", "", { "os": "win32", "cpu": "x64" }, "sha512-kTdfRcSiDfQca/y9QIkng02avJ+NCaQvrMejlsB3RRv5sE9rRoeBPISaZpKxHELzRxZyLvNts1P27W3wV+8geQ=="],
 
-    "@imogen/mcp/@imogen/sdk/@imogen/shared": ["@imogen/shared@file:../imogen-sdk/typescript/packages/shared", { "dependencies": { "zod": "^4.1.5" } }],
+    "@imogen/mcp/@imogen/sdk/@imogen/shared": ["@imogen/shared@file:imogen-sdk/typescript/packages/shared", {}],
 
-    "@imogen/server/@imogen/sdk/@imogen/shared": ["@imogen/shared@file:../imogen-sdk/typescript/packages/shared", { "dependencies": { "zod": "^4.1.5" } }],
+    "@imogen/server/@imogen/sdk/@imogen/shared": ["@imogen/shared@file:imogen-sdk/typescript/packages/shared", {}],
 
-    "@imogen/web/@imogen/sdk/@imogen/shared": ["@imogen/shared@file:../imogen-sdk/typescript/packages/shared", { "dependencies": { "zod": "^4.1.5" } }],
+    "@imogen/web/@imogen/sdk/@imogen/shared": ["@imogen/shared@file:imogen-sdk/typescript/packages/shared", {}],
 
     "@scalar/core/@scalar/types/@scalar/helpers": ["@scalar/helpers@0.2.18", "", {}, "sha512-w1d4tpNEVZ293oB2BAgLrS0kVPUtG3eByNmOCJA5eK9vcT4D3cmsGtWjUaaqit0BQCsBFHK51rasGvSWnApYTw=="],
 
