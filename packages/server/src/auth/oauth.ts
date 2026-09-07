@@ -14,6 +14,28 @@ const ACCESS_TOKEN_TTL_SECONDS = 60 * 60
 const REFRESH_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 60
 const AUTH_CODE_TTL_SECONDS = 60
 
+/**
+ * The resources this server publishes a protected-resource document for: the site root,
+ * which is the REST API, and the MCP endpoint. A token may be bound to one of these and
+ * to nothing else.
+ */
+const PROTECTED_RESOURCE_PATHS = ['', '/mcp'] as const
+
+/** The path of a resource this server publishes a document for, and nothing else. */
+export type ProtectedResourcePath = (typeof PROTECTED_RESOURCE_PATHS)[number]
+
+/**
+ * The one spelling of a resource identifier this server uses, everywhere.
+ *
+ * `IMOGEN_PUBLIC_URL` only has its trailing slashes stripped, so it can still arrive as
+ * `https://Host:443`. Advertising that spelling while comparing against a normalised one
+ * would make the server refuse the very identifier it published, and a spec-compliant MCP
+ * client — which must echo `resource` back from the document — could never connect.
+ */
+function canonicalize(url: URL): string {
+  return url.href.replace(/\/+$/, '')
+}
+
 /** The OAuth error codes imogen can return, as defined by RFC 6749 §5.2 and RFC 7591. */
 export type OAuthErrorCode =
   | 'invalid_request'
@@ -24,6 +46,7 @@ export type OAuthErrorCode =
   | 'unsupported_grant_type'
   | 'invalid_redirect_uri'
   | 'invalid_client_metadata'
+  | 'invalid_target'
 
 export class OAuthError extends Error {
   readonly code: OAuthErrorCode
@@ -45,6 +68,8 @@ export type Principal = {
   userId: string
   clientId: string
   scopes: OAuthScope[]
+  /** The resource this token is bound to, or null when it is valid at every surface. */
+  resource: string | null
 }
 
 export type IssueCodeInput = {
@@ -54,6 +79,8 @@ export type IssueCodeInput = {
   scopes: string[]
   codeChallenge: string
   codeChallengeMethod: string
+  /** RFC 8707 `resource`. Must be one of the identifiers this server advertises. */
+  resource?: string
   ttlSeconds?: number
 }
 
@@ -63,6 +90,7 @@ export type ExchangeInput = {
   code: string
   codeVerifier: string
   redirectUri: string
+  resource?: string
 }
 
 export type RefreshInput = {
@@ -70,6 +98,7 @@ export type RefreshInput = {
   clientSecret?: string
   refreshToken: string
   scope?: string
+  resource?: string
 }
 
 /**
@@ -126,6 +155,11 @@ export class OAuthService {
       // S256 only. Advertising `plain` invites a downgrade that defeats the point.
       code_challenge_methods_supported: ['S256'],
       token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
+      // Conventional rather than registered: RFC 8707 defines the `resource` parameter
+      // and the `invalid_target` error but no metadata field for them, and RFC 8414 §2
+      // allows the extra key. Advertised only because `resource` is now recorded and
+      // enforced; a client that sends it gets a token that works nowhere else.
+      resource_indicators_supported: true,
       service_documentation: `${base}/api/v1/docs`,
     }
   }
@@ -136,15 +170,56 @@ export class OAuthService {
    * root from `/.well-known/oauth-protected-resource/mcp` reads as a mismatched document,
    * and a connect-card client that cannot match it never builds an authorization URL.
    */
-  protectedResourceMetadata(resourcePath = '') {
+  protectedResourceMetadata(resourcePath: ProtectedResourcePath = '') {
     const base = this.options.publicUrl
     return {
-      resource: `${base}${resourcePath}`,
+      resource: this.resourceIdentifier(resourcePath),
       authorization_servers: [base],
       scopes_supported: [...ALL_SCOPES],
       bearer_methods_supported: ['header'],
       resource_documentation: `${base}/api/v1/docs`,
     }
+  }
+
+  /**
+   * The identifier of one resource this server protects, in the single spelling that the
+   * document publishes, the token records, and the surface checks against. Callers ask
+   * for it rather than building it, because three concatenations of `publicUrl` would
+   * eventually disagree and the disagreement would read as a valid token being refused.
+   */
+  resourceIdentifier(path: ProtectedResourcePath = ''): string {
+    return canonicalize(new URL(`${this.options.publicUrl}${path}`))
+  }
+
+  /** Every identifier a token may name. */
+  resourceIdentifiers(): string[] {
+    return PROTECTED_RESOURCE_PATHS.map((path) => this.resourceIdentifier(path))
+  }
+
+  /**
+   * Resolves an RFC 8707 `resource` to the identifier this server advertises, or refuses.
+   *
+   * The comparison is against the advertised set after URL normalisation rather than by
+   * inspecting the path, which is what stops `https://host/mcp/../anything` — normalised
+   * by `URL` to `/anything` — from being read as the MCP endpoint. A trailing slash names
+   * the same resource; a query, a fragment, or another origin does not.
+   */
+  canonicalResource(value: string): string {
+    let parsed: URL
+    try {
+      parsed = new URL(value)
+    } catch {
+      throw new OAuthError('invalid_target', `${value} is not a valid resource identifier`)
+    }
+    if (parsed.hash) {
+      throw new OAuthError('invalid_target', 'a resource identifier must not contain a fragment')
+    }
+    const normalized = canonicalize(parsed)
+    const match = this.resourceIdentifiers().find((identifier) => identifier === normalized)
+    if (!match) {
+      throw new OAuthError('invalid_target', `${value} is not a resource of this server`)
+    }
+    return match
   }
 
   // --- Registration ---
@@ -224,6 +299,8 @@ export class OAuthService {
       throw new OAuthError('invalid_redirect_uri', 'redirect_uri is not registered')
     }
 
+    const resource = input.resource === undefined ? null : this.canonicalResource(input.resource)
+
     const code = generateToken('imog_code', 32)
     const ttl = input.ttlSeconds ?? AUTH_CODE_TTL_SECONDS
     await this.db.insert(oauthAuthCodes).values({
@@ -234,6 +311,7 @@ export class OAuthService {
       scopes: narrowScopes(input.scopes),
       codeChallenge: input.codeChallenge,
       codeChallengeMethod: input.codeChallengeMethod,
+      resource,
       familyId: crypto.randomUUID(),
       expiresAt: new Date(Date.now() + ttl * 1000),
     })
@@ -268,6 +346,13 @@ export class OAuthService {
     if (!safeEqual(sha256Base64Url(input.codeVerifier), record.codeChallenge)) {
       throw new OAuthError('invalid_grant', 'code_verifier does not match the challenge')
     }
+    // RFC 8707 §2.2: the token request may name a resource, but only one the user
+    // actually authorized. A code issued without one cannot acquire an audience here.
+    if (input.resource !== undefined) {
+      if (this.canonicalResource(input.resource) !== record.resource) {
+        throw new OAuthError('invalid_target', 'resource does not match the authorization request')
+      }
+    }
 
     // Claim the code before minting anything, so two concurrent exchanges cannot both win.
     const claimed = await this.db
@@ -285,6 +370,7 @@ export class OAuthService {
       userId: record.userId,
       scopes: record.scopes as OAuthScope[],
       familyId: record.familyId,
+      resource: record.resource,
     })
   }
 
@@ -318,6 +404,13 @@ export class OAuthService {
     if (record.clientId !== input.clientId) {
       throw new OAuthError('invalid_grant', 'refresh token was issued to another client')
     }
+    // A refresh may narrow scope but never changes audience: the resource was settled at
+    // consent, so asking for a different one here is an attempt to widen the grant.
+    if (input.resource !== undefined) {
+      if (this.canonicalResource(input.resource) !== record.resource) {
+        throw new OAuthError('invalid_target', 'resource does not match the original grant')
+      }
+    }
 
     const held = record.scopes as OAuthScope[]
     let scopes = held
@@ -340,6 +433,7 @@ export class OAuthService {
       userId: record.userId,
       scopes,
       familyId: record.familyId,
+      resource: record.resource,
     })
   }
 
@@ -360,6 +454,7 @@ export class OAuthService {
       userId: record.userId,
       clientId: record.clientId,
       scopes: record.scopes as OAuthScope[],
+      resource: record.resource,
     }
   }
 
@@ -400,6 +495,7 @@ export class OAuthService {
     userId: string
     scopes: OAuthScope[]
     familyId: string
+    resource: string | null
   }): Promise<TokenResponse> {
     const accessToken = generateToken('imog_at', 32)
     const refreshToken = generateToken('imog_rt', 32)
@@ -413,6 +509,7 @@ export class OAuthService {
         userId: grant.userId,
         scopes: grant.scopes,
         familyId: grant.familyId,
+        resource: grant.resource,
         expiresAt: new Date(now + ACCESS_TOKEN_TTL_SECONDS * 1000),
       },
       {
@@ -422,6 +519,7 @@ export class OAuthService {
         userId: grant.userId,
         scopes: grant.scopes,
         familyId: grant.familyId,
+        resource: grant.resource,
         expiresAt: new Date(now + REFRESH_TOKEN_TTL_SECONDS * 1000),
       },
     ])

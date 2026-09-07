@@ -324,6 +324,12 @@ export const oauthAuthCodes = pgTable(
     scopes: json<string[]>('scopes').notNull(),
     codeChallenge: text('code_challenge').notNull(),
     codeChallengeMethod: text('code_challenge_method').notNull(),
+    /**
+     * RFC 8707: the protected resource this code was requested for, which the token it
+     * mints is then bound to. Null when the client sent no `resource` — such a token is
+     * accepted at every surface, so codes issued before this column existed keep working.
+     */
+    resource: text('resource'),
     /** Ties this code to the token family it mints, so a replay can revoke exactly those. */
     familyId: uuid('family_id').notNull(),
     /** Set when redeemed, so a replayed code is detectable rather than merely expired. */
@@ -347,6 +353,12 @@ export const oauthTokens = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
     scopes: json<string[]>('scopes').notNull(),
+    /**
+     * The resource identifier this token may be presented at — the site root for the REST
+     * API, `…/mcp` for the connector endpoint. Null means unbound and therefore valid
+     * everywhere, which is what every token issued before RFC 8707 support is.
+     */
+    resource: text('resource'),
     /**
      * Rotation lineage. Presenting an already-rotated refresh token revokes the whole
      * family, which is how a stolen token stops being useful.

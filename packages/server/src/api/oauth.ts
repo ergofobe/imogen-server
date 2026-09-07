@@ -55,14 +55,34 @@ export function createOAuthRoutes() {
     }
 
     // The user must be signed in to consent. Send them to sign in and come back.
+    // Only a session may consent, so no bearer token is ever honoured here and there is
+    // no resource to check one against.
     const principal = await resolvePrincipal(
       services,
       c.req.raw.headers,
       getCookie(c, SESSION_COOKIE),
+      null,
     )
     if (principal?.via !== 'session') {
       const returnTo = `/oauth/authorize?${new URLSearchParams(query).toString()}`
       return c.redirect(`/login?returnTo=${encodeURIComponent(returnTo)}`)
+    }
+
+    // RFC 8707. Settled before the consent screen so the user is never asked to approve a
+    // request that cannot be honoured. imogen binds a token to a single resource, so a
+    // request naming several distinct ones has no answer.
+    let resource: string | undefined
+    try {
+      const named = new Set(
+        (c.req.queries('resource') ?? []).map((value) => services.oauth.canonicalResource(value)),
+      )
+      if (named.size > 1) {
+        return fail('invalid_target', 'a token may be bound to only one resource')
+      }
+      resource = [...named][0]
+    } catch (error) {
+      if (error instanceof OAuthError) return fail(error.code, error.toJSON().error_description)
+      throw error
     }
 
     const scopeList = query.scope?.split(/\s+/).filter(Boolean)
@@ -96,6 +116,7 @@ export function createOAuthRoutes() {
         scopes,
         codeChallenge: query.code_challenge,
         codeChallengeMethod: query.code_challenge_method,
+        resource,
       })
       const url = new URL(redirectUri)
       url.searchParams.set('code', code)
@@ -149,6 +170,7 @@ export function createOAuthRoutes() {
           code,
           codeVerifier,
           redirectUri,
+          resource: field('resource'),
         })
         return c.json(token, 200, { 'Cache-Control': 'no-store' })
       }
@@ -161,6 +183,7 @@ export function createOAuthRoutes() {
           clientSecret,
           refreshToken,
           scope: field('scope'),
+          resource: field('resource'),
         })
         return c.json(token, 200, { 'Cache-Control': 'no-store' })
       }
