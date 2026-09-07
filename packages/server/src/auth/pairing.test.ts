@@ -185,6 +185,66 @@ describe('claiming a ticket', () => {
     expect(unknown.message).toBe(spent.message)
   })
 
+  test('binds the token to the resource the claim named', async () => {
+    const ticket = await pairing.create(userId)
+    const { verifier, challenge } = pkce()
+    // Deliberately not the site root, which is what a server that ignored the request and
+    // substituted a default of its own would also produce.
+    const resource = oauth.resourceIdentifier('/mcp')
+
+    const claim = await pairing.claim(claimInput(ticket.code, challenge, { resource }))
+    const tokens = await oauth.exchangeAuthorizationCode({
+      clientId,
+      code: claim.code,
+      codeVerifier: verifier,
+      redirectUri: REDIRECT,
+      resource,
+    })
+
+    const principal = await oauth.verifyAccessToken(tokens.access_token)
+    expect(principal!.resource).toBe(resource)
+  })
+
+  test('a claim naming nothing still yields a token good at every surface', async () => {
+    const ticket = await pairing.create(userId)
+    const { verifier, challenge } = pkce()
+
+    const claim = await pairing.claim(claimInput(ticket.code, challenge))
+    const tokens = await oauth.exchangeAuthorizationCode({
+      clientId,
+      code: claim.code,
+      codeVerifier: verifier,
+      redirectUri: REDIRECT,
+    })
+
+    const principal = await oauth.verifyAccessToken(tokens.access_token)
+    expect(principal!.resource).toBeNull()
+  })
+
+  test('refuses a resource this server does not publish', async () => {
+    const ticket = await pairing.create(userId)
+
+    await expect(
+      pairing.claim(
+        claimInput(ticket.code, pkce().challenge, { resource: 'https://elsewhere.example.com' }),
+      ),
+    ).rejects.toThrow(OAuthError)
+  })
+
+  test('a refused resource does not spend the ticket', async () => {
+    const ticket = await pairing.create(userId)
+    await pairing
+      .claim(
+        claimInput(ticket.code, pkce().challenge, { resource: 'https://elsewhere.example.com' }),
+      )
+      .catch(() => {})
+
+    // The ticket is redeemed once and the QR code is already off the screen, so burning
+    // it on a request the server never acted on would strand the device for good.
+    const claim = await pairing.claim(claimInput(ticket.code, pkce().challenge))
+    expect(claim.code).toBeString()
+  })
+
   test('refuses a redirect the client did not register', async () => {
     const ticket = await pairing.create(userId)
 
