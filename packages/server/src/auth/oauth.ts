@@ -286,7 +286,19 @@ export class OAuthService {
 
   // --- Authorization codes ---
 
-  async issueAuthorizationCode(input: IssueCodeInput): Promise<string> {
+  /**
+   * Every way {@link issueAuthorizationCode} refuses an input before it writes anything.
+   *
+   * Split out because a caller may need to know the answer earlier than the mint gives it.
+   * `PairingService.claim` does: it spends a single-use ticket on the way here, and a
+   * refusal after that point strands the device instead of asking it to try again. Two
+   * callers keeping their own copy of this list is how the copies drift, so this is the
+   * one that decides and the mint runs it too.
+   *
+   * Hands back the canonical spelling of `input.resource`, or null when it named none, so
+   * the mint records what was checked rather than resolving it a second time.
+   */
+  async assertCanIssueAuthorizationCode(input: IssueCodeInput): Promise<string | null> {
     if (input.codeChallengeMethod !== 'S256') {
       throw new OAuthError('invalid_request', 'code_challenge_method must be S256')
     }
@@ -298,8 +310,11 @@ export class OAuthService {
     if (!client.redirectUris.includes(input.redirectUri)) {
       throw new OAuthError('invalid_redirect_uri', 'redirect_uri is not registered')
     }
+    return input.resource === undefined ? null : this.canonicalResource(input.resource)
+  }
 
-    const resource = input.resource === undefined ? null : this.canonicalResource(input.resource)
+  async issueAuthorizationCode(input: IssueCodeInput): Promise<string> {
+    const resource = await this.assertCanIssueAuthorizationCode(input)
 
     const code = generateToken('imog_code', 32)
     const ttl = input.ttlSeconds ?? AUTH_CODE_TTL_SECONDS

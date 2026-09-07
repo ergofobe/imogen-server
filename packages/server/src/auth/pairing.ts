@@ -10,7 +10,7 @@ import { and, eq, isNull, lt } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { pairingTickets } from '../db/schema.ts'
 import { generateToken, hashToken } from '../lib/tokens.ts'
-import { OAuthError, type OAuthService } from './oauth.ts'
+import { type IssueCodeInput, OAuthError, type OAuthService } from './oauth.ts'
 
 /**
  * What a paired device is given. Everything the phone applications need and nothing
@@ -91,6 +91,27 @@ export class PairingService {
     if (ticket.claimedAt) throw refuse()
     if (ticket.expiresAt.getTime() <= Date.now()) throw refuse()
 
+    const requested = request.scope?.split(/\s+/).filter(Boolean)
+    const scopes =
+      requested && requested.length > 0
+        ? requested.filter((scope: string) => PAIRED_SCOPES.includes(scope))
+        : PAIRED_SCOPES
+
+    const issue: IssueCodeInput = {
+      clientId: request.clientId,
+      userId: ticket.userId,
+      redirectUri: request.redirectUri,
+      scopes: scopes.length > 0 ? scopes : PAIRED_SCOPES,
+      codeChallenge: request.codeChallenge,
+      codeChallengeMethod: request.codeChallengeMethod,
+    }
+
+    // Asked before the ticket is spent, and of the very input the mint will see rather
+    // than a second opinion about it. A refusal after the update does not ask the device
+    // to try again — the code is redeemable once and the QR it came from is already off
+    // the screen, so it strands the device instead.
+    await this.oauth.assertCanIssueAuthorizationCode(issue)
+
     // Claim before minting, so two devices racing on one photographed code cannot both win.
     const claimed = await this.db
       .update(pairingTickets)
@@ -99,20 +120,7 @@ export class PairingService {
       .returning()
     if (claimed.length === 0) throw refuse()
 
-    const requested = request.scope?.split(/\s+/).filter(Boolean)
-    const scopes =
-      requested && requested.length > 0
-        ? requested.filter((scope: string) => PAIRED_SCOPES.includes(scope))
-        : PAIRED_SCOPES
-
-    const code = await this.oauth.issueAuthorizationCode({
-      clientId: request.clientId,
-      userId: ticket.userId,
-      redirectUri: request.redirectUri,
-      scopes: scopes.length > 0 ? scopes : PAIRED_SCOPES,
-      codeChallenge: request.codeChallenge,
-      codeChallengeMethod: request.codeChallengeMethod,
-    })
+    const code = await this.oauth.issueAuthorizationCode(issue)
 
     return { code, redirectUri: request.redirectUri, scope: scopes.join(' ') }
   }

@@ -192,6 +192,35 @@ describe('claiming a ticket', () => {
       pairing.claim(claimInput(ticket.code, pkce().challenge, { redirectUri: 'evil://oauth' })),
     ).rejects.toThrow(OAuthError)
   })
+
+  /**
+   * A refusal the device could correct has to leave it something to correct with.
+   *
+   * The ticket is redeemable once and lives five minutes, and by the time a device has
+   * read the code the QR is off the screen. Spending it on a request the server went on to
+   * refuse does not ask the device to try again — it strands it, and the retry comes back
+   * `invalid_grant` with no hint that the first attempt is what consumed the code.
+   */
+  test.each([
+    ['a redirect the client did not register', { redirectUri: 'evil://oauth' }],
+    ['a client that does not exist', { clientId: crypto.randomUUID() }],
+  ])('a claim refused for %s does not spend the ticket', async (_name, overrides) => {
+    const ticket = await pairing.create(userId)
+
+    await expect(
+      pairing.claim(claimInput(ticket.code, pkce().challenge, overrides)),
+    ).rejects.toThrow(OAuthError)
+
+    const { verifier, challenge } = pkce()
+    const claim = await pairing.claim(claimInput(ticket.code, challenge))
+    const tokens = await oauth.exchangeAuthorizationCode({
+      clientId,
+      code: claim.code,
+      codeVerifier: verifier,
+      redirectUri: REDIRECT,
+    })
+    expect(tokens.access_token).toBeString()
+  })
 })
 
 describe('watching a ticket', () => {
