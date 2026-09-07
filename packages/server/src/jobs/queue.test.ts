@@ -140,6 +140,72 @@ describe('failure handling', () => {
     expect(row!.lastError).toContain('No handler registered')
   })
 
+  /**
+   * A worker that dies mid-job leaves its row `running` forever: `claim` only ever looks
+   * at `queued`, so nothing reclaims it and the work is simply lost. Thirteen jobs sat
+   * that way in production for eleven days, and four of them were `asset.ingest` — which
+   * held back 364 photos that had already been uploaded.
+   */
+  test('reclaims a job a dead worker left running', async () => {
+    const queue = makeQueue()
+    const [job] = await db
+      .insert(jobs)
+      .values({
+        name: 'stranded',
+        payload: {},
+        status: 'running',
+        attempts: 1,
+        maxAttempts: 5,
+        startedAt: new Date(Date.now() - 60 * 60_000),
+      })
+      .returning()
+
+    expect(await queue.reclaimStale()).toBe(1)
+
+    const [row] = await db.select().from(jobs).where(eq(jobs.id, job!.id))
+    expect(row!.status).toBe('queued')
+    expect(row!.startedAt).toBeNull()
+  })
+
+  test('leaves a job that is still genuinely running alone', async () => {
+    const queue = makeQueue()
+    await db.insert(jobs).values({
+      name: 'busy',
+      payload: {},
+      status: 'running',
+      attempts: 1,
+      startedAt: new Date(),
+    })
+
+    expect(await queue.reclaimStale()).toBe(0)
+
+    const [row] = await db.select().from(jobs)
+    expect(row!.status).toBe('running')
+  })
+
+  /**
+   * The crash that strands a job may well be the job's own doing — a photo that kills the
+   * process is reclaimed, retried, and kills it again. `claim` does not check the attempt
+   * limit, so reclaiming such a job forever would be a crash loop rather than a recovery.
+   */
+  test('fails a reclaimed job that is out of attempts rather than looping on it', async () => {
+    const queue = makeQueue()
+    await db.insert(jobs).values({
+      name: 'poison',
+      payload: {},
+      status: 'running',
+      attempts: 5,
+      maxAttempts: 5,
+      startedAt: new Date(Date.now() - 60 * 60_000),
+    })
+
+    expect(await queue.reclaimStale()).toBe(1)
+
+    const [row] = await db.select().from(jobs)
+    expect(row!.status).toBe('failed')
+    expect(row!.finishedAt).not.toBeNull()
+  })
+
   test('one failing job does not stop the next one', async () => {
     const queue = makeQueue()
     const done: string[] = []

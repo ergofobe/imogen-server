@@ -28,6 +28,8 @@ export function registerMaintenanceJobs(queue: JobQueue, deps: MaintenanceDeps):
     await pruneUploads(deps)
   })
   queue.register(PRUNE_JOBS_JOB, async () => {
+    // Before pruning, not after: a job a dead worker stranded is work to recover.
+    await queue.reclaimStale()
     await queue.pruneCompleted(7)
     await deps.sessions.pruneExpired()
   })
