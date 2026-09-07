@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { rmSync } from 'node:fs'
 import { OAuthClient } from '@imogen/sdk'
+import { beginBridgeAuthorization } from './authorize.ts'
 import { runBridge } from './bridge.ts'
 import { credentialsPath, readCredentials, writeCredentials } from './credentials.ts'
 
@@ -86,8 +87,7 @@ async function login(args: string[]) {
   const redirectUri = `http://127.0.0.1:${listener.port}/callback`
 
   try {
-    const client = await oauth.register('imogen CLI', [redirectUri])
-    const pending = await oauth.beginAuthorization(client.client_id, redirectUri)
+    const { clientId, pending } = await beginBridgeAuthorization(oauth, redirectUri)
 
     process.stderr.write(`Opening your browser to authorize this machine.\n`)
     process.stderr.write(`If it does not open, visit:\n\n  ${pending.authorizationUrl}\n\n`)
@@ -101,7 +101,7 @@ async function login(args: string[]) {
     clearTimeout(timeout)
 
     const tokens = await oauth.completeAuthorization(pending, callbackUrl)
-    writeCredentials({ server: baseUrl, clientId: client.client_id, tokens })
+    writeCredentials({ server: baseUrl, clientId, tokens })
     process.stderr.write(`Connected to ${baseUrl}.\nSaved to ${credentialsPath()}\n`)
   } catch (error) {
     process.stderr.write(`Authorization failed: ${(error as Error).message}\n`)
