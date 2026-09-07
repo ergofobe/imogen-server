@@ -29,12 +29,8 @@ export async function runBridge(credentials: Credentials): Promise<void> {
         body: JSON.stringify(message),
       })
 
-      // A notification gets no reply, and neither does its forwarded form.
-      if (response.status === 202 || message.id === undefined || message.id === null) return
-
-      const text = await response.text()
-      if (!text) return
-      send(JSON.parse(text))
+      const reply = await replyTo(message, response)
+      if (reply !== undefined) send(reply)
     } catch (error) {
       if (message.id === undefined || message.id === null) return
       send({
@@ -78,4 +74,49 @@ export async function runBridge(credentials: Credentials): Promise<void> {
       void forward(message)
     }
   }
+}
+
+/**
+ * The reply to write for one forwarded message, or `undefined` when the agent expects none.
+ *
+ * Split out of `forward` so it can be tested without a live stdin: the loop above could take
+ * a `ReadableStream` instead, but parameterising it buys nothing when every decision worth
+ * protecting is in here.
+ *
+ * A JSON-RPC batch is out of scope. A line that parses to an array has no top-level `id`, so
+ * it takes the notification path below and its replies are dropped; the bridge has never
+ * assembled a batch response, and the server only sees batches from clients that negotiate a
+ * protocol version predating their removal.
+ */
+export async function replyTo(message: { id?: unknown }, response: Response): Promise<unknown> {
+  // A notification gets no reply, and neither does its forwarded form — including when the
+  // forward was refused, which is why this stays ahead of every check on the response.
+  if (message.id === undefined || message.id === null) return
+
+  const text = (await response.text()).trim()
+
+  // Past this point the agent is waiting for an answer under `message.id`, and every path has
+  // to produce one. The server refuses before parsing the body, so its own error carries
+  // `id: null` — correct on the wire, and unmatchable by the agent, which then waits forever
+  // instead of reporting the refusal. An empty body is the same hang by another route: a 202
+  // meant for a notification, or a proxy answering for an upstream it dropped.
+  if (!response.ok || !text) {
+    return {
+      jsonrpc: '2.0',
+      id: message.id,
+      error: {
+        code: -32603,
+        message:
+          response.status === 401
+            ? 'imogen rejected the stored credentials. Run: imogen-mcp login --server <url>'
+            : `imogen returned HTTP ${response.status}`,
+        // The server's own account of the failure, which is otherwise lost: an error body is
+        // `{ error: { code, message } }`, not a JSON-RPC message, so it cannot be re-idded and
+        // passed through — but it is the only thing that says *which* request was rejected.
+        ...(text ? { data: text.slice(0, 500) } : {}),
+      },
+    }
+  }
+
+  return JSON.parse(text)
 }
