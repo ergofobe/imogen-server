@@ -86,6 +86,30 @@ describe('failure handling', () => {
     expect(row!.runAt.getTime()).toBeGreaterThan(Date.now())
   })
 
+  /**
+   * Drizzle wraps a driver error in a DrizzleQueryError whose own message is only the
+   * SQL and its parameters — the constraint violation, the deadlock, the dropped
+   * connection all live on `cause`. Recording just `.message` cost us the one detail
+   * worth keeping: twenty failed face jobs in production said nothing but "Failed
+   * query: update people set face_count = ...", and by the time anyone looked, every
+   * other log that could have named the real error had rolled over.
+   */
+  test('records the cause rather than the wrapper it arrived in', async () => {
+    const queue = makeQueue()
+    queue.register('wrapped', async () => {
+      throw new Error('Failed query: update "people" set face_count = $1', {
+        cause: new Error('deadlock detected'),
+      })
+    })
+    await queue.enqueue('wrapped', {}, { maxAttempts: 1 })
+
+    await queue.drain()
+
+    const [row] = await db.select().from(jobs)
+    expect(row!.lastError).toContain('deadlock detected')
+    expect(row!.lastError).toContain('Failed query')
+  })
+
   test('gives up after the attempt limit', async () => {
     const queue = makeQueue()
     let calls = 0

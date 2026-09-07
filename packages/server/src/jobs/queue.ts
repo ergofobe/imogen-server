@@ -25,6 +25,34 @@ export type QueueOptions = {
  * A Postgres-backed queue. A home lab should not need Redis to resize a thumbnail, and
  * `for update skip locked` gives us exactly the claim semantics a broker would.
  */
+/**
+ * Flattens an error and everything it wraps into one line.
+ *
+ * Drizzle reports a driver failure as a wrapper whose own message is nothing but the SQL
+ * and its parameters; the deadlock, the constraint, the dropped connection all sit on
+ * `cause`. Recording only `.message` is what left twenty failed face jobs in production
+ * saying `Failed query: update "people" set face_count = ...` and naming nothing anyone
+ * could act on — and by the time they were read, every other log that knew the answer had
+ * rolled over. The driver's SQLSTATE comes along for the same reason.
+ */
+function describeError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error)
+
+  const chain: string[] = []
+  const seen = new Set<unknown>()
+  let current: unknown = error
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current)
+    const code = (current as { code?: unknown }).code
+    chain.push(typeof code === 'string' ? `${current.message} [${code}]` : current.message)
+    current = current.cause
+  }
+  // A cause is not obliged to be an Error; keep whatever it was rather than dropping it.
+  if (current != null && !(current instanceof Error)) chain.push(String(current))
+
+  return chain.join(': ')
+}
+
 export class JobQueue {
   private readonly handlers = new Map<string, JobHandler>()
   private workers: Promise<void>[] = []
@@ -153,7 +181,7 @@ export class JobQueue {
         .set({ status: 'done', finishedAt: new Date(), lastError: null })
         .where(eq(jobs.id, job.id))
     } catch (error) {
-      await this.fail(job.id, (error as Error).message, job.attempts, job.max_attempts)
+      await this.fail(job.id, describeError(error), job.attempts, job.max_attempts)
     }
   }
 
