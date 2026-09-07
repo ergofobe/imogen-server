@@ -76,6 +76,10 @@ export class PairingService {
    * verifier. That is deliberate — it means a paired device holds exactly the same kind
    * of grant as one that went through the browser, and is revoked in exactly the same
    * place.
+   *
+   * That extends to RFC 8707. A device has no authorization request to carry `resource`
+   * on, so it names one here and the code records it, which is the only way a paired
+   * token can ever be bound to one surface.
    */
   async claim(request: PairingClaimRequest): Promise<PairingClaim> {
     const [ticket] = await this.db
@@ -104,12 +108,14 @@ export class PairingService {
       scopes: scopes.length > 0 ? scopes : PAIRED_SCOPES,
       codeChallenge: request.codeChallenge,
       codeChallengeMethod: request.codeChallengeMethod,
+      ...(request.resource === undefined ? {} : { resource: request.resource }),
     }
 
     // Asked before the ticket is spent, and of the very input the mint will see rather
     // than a second opinion about it. A refusal after the update does not ask the device
     // to try again — the code is redeemable once and the QR it came from is already off
-    // the screen, so it strands the device instead.
+    // the screen, so it strands the device instead. A resource this server does not
+    // publish is refused here for that reason and not by a check of its own.
     await this.oauth.assertCanIssueAuthorizationCode(issue)
 
     // Claim before minting, so two devices racing on one photographed code cannot both win.

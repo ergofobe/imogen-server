@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
+import { createHash, randomBytes } from 'node:crypto'
 import { type FetchLike, ImogenClient, ImogenError, OAuthClient } from '@imogen/sdk'
 import { sql } from 'drizzle-orm'
 import sharp from 'sharp'
@@ -47,7 +48,7 @@ afterAll(async () => {
 beforeEach(async () => {
   cookieJar.length = 0
   await harness.db.execute(
-    sql`truncate users, assets, albums, oauth_clients, oauth_tokens, oauth_auth_codes, jobs, sessions, upload_sessions cascade`,
+    sql`truncate users, assets, albums, oauth_clients, oauth_tokens, oauth_auth_codes, jobs, sessions, upload_sessions, pairing_tickets cascade`,
   )
 })
 
@@ -432,6 +433,77 @@ describe('OAuth client', () => {
     )
 
     expect(mcp.status).toBe(401)
+  })
+
+  test('binds a paired device to the resource its claim named', async () => {
+    await signUp()
+    const ticket = await client.pairing.create()
+
+    // The device's half: a client of its own, a verifier only it holds, and the identifier
+    // read from the server's own document rather than guessed.
+    const registered = await oauth.register('imogen for Android', ['imogen://oauth'])
+    const api = await oauth.discoverProtectedResource()
+    const verifier = randomBytes(32).toString('base64url')
+    const claim = await client.pairing.claim({
+      code: ticket.code,
+      clientId: registered.client_id,
+      redirectUri: 'imogen://oauth',
+      codeChallenge: createHash('sha256').update(verifier).digest('base64url'),
+      codeChallengeMethod: 'S256',
+      resource: api.resource,
+    })
+
+    // What `pair` does inside the four ports that have one: exchange the claim's code
+    // through the SDK's own token path, echoing the resource the claim recorded.
+    const tokens = await oauth.completeAuthorization(
+      {
+        authorizationUrl: '',
+        codeVerifier: verifier,
+        state: 'paired',
+        redirectUri: claim.redirectUri,
+        clientId: registered.client_id,
+        resource: api.resource,
+      },
+      `${claim.redirectUri}?code=${claim.code}&state=paired`,
+    )
+
+    const tokenClient = new ImogenClient({
+      baseUrl: 'http://localhost:3000',
+      token: tokens.access_token,
+      fetch: async (input, init) => app.fetch(new Request(input as RequestInfo, init)),
+    })
+    expect(await tokenClient.assets.list()).toMatchObject({ items: [] })
+
+    // Bound means bound: the phone's token is no more welcome at /mcp than a connector's
+    // would be at the REST API.
+    const mcp = await app.fetch(
+      new Request('http://localhost:3000/mcp', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${tokens.access_token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      }),
+    )
+    expect(mcp.status).toBe(401)
+  })
+
+  test('refuses a claim naming a resource this server does not publish', async () => {
+    await signUp()
+    const ticket = await client.pairing.create()
+    const registered = await oauth.register('imogen for Android', ['imogen://oauth'])
+
+    const promise = client.pairing.claim({
+      code: ticket.code,
+      clientId: registered.client_id,
+      redirectUri: 'imogen://oauth',
+      codeChallenge: createHash('sha256').update('x'.repeat(43)).digest('base64url'),
+      codeChallengeMethod: 'S256',
+      resource: 'https://elsewhere.example.com',
+    })
+
+    await expect(promise).rejects.toThrow(ImogenError)
   })
 
   test('refuses a callback whose state does not match', async () => {
