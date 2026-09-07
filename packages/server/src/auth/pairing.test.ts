@@ -188,7 +188,9 @@ describe('claiming a ticket', () => {
   test('binds the token to the resource the claim named', async () => {
     const ticket = await pairing.create(userId)
     const { verifier, challenge } = pkce()
-    const resource = oauth.resourceIdentifier()
+    // Deliberately not the site root, which is what a server that ignored the request and
+    // substituted a default of its own would also produce.
+    const resource = oauth.resourceIdentifier('/mcp')
 
     const claim = await pairing.claim(claimInput(ticket.code, challenge, { resource }))
     const tokens = await oauth.exchangeAuthorizationCode({
