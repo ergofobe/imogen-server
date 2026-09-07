@@ -38,6 +38,11 @@ Open <http://localhost:3000>. The first account you create becomes the administr
 That is the whole installation. imogen needs Postgres, and the compose file brings one
 up; there is no message broker, no cache, and no sidecar to run.
 
+The compose file pins a released minor, so `docker compose pull` brings you patch
+releases and stops there. It deliberately does not use `:latest`, which moves with every
+commit on `main` — that tag is trunk, and it is what you want only if you are following
+development.
+
 ### Configuration
 
 Everything is an environment variable, validated at start-up — the server refuses to

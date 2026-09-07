@@ -45,6 +45,11 @@ so an edit in `imogen-sdk/` does not show up here until you run `bun install --f
 `git worktree add` does not populate submodules — a fresh worktree needs
 `git submodule update --init` before anything resolves.
 
+That `--force` also rewrites three lines of `bun.lock`, spelling out the nested
+`@imogen/shared` dependency on Zod that the committed file leaves implicit. It is a
+rewrite, not a change: `--frozen-lockfile` accepts the committed file either way, and CI
+runs against that. Leave those lines out of your commit.
+
 ## Before you open a pull request
 
 ```bash
