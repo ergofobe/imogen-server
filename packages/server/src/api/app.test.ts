@@ -1033,8 +1033,29 @@ describe('MCP endpoint', () => {
     return { token: token.access_token, cookie }
   }
 
-  test('initialize works before authenticating, so a client can discover the server', async () => {
+  // initialize is the first request any client makes, so it is the only chance the server
+  // gets to say that authorization is required. Answering it 200 told Claude and Grok
+  // alike that this connector needs no sign-in: both recorded it as connected, never
+  // opened an authorize URL, and never saw a tool. The 401 is the whole handshake.
+  test('initialize without a token is refused, so a client learns to authorize', async () => {
     const response = await rpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })
+
+    expect(response.status).toBe(401)
+    expect(response.headers.get('www-authenticate')).toContain(
+      'resource_metadata="http://localhost:3000/.well-known/oauth-protected-resource/mcp"',
+    )
+  })
+
+  test('ping without a token is refused too, so no probe reads as a live connection', async () => {
+    const response = await rpc({ jsonrpc: '2.0', id: 1, method: 'ping' })
+
+    expect(response.status).toBe(401)
+  })
+
+  test('initialize describes the server once the caller holds a token', async () => {
+    const { token } = await connectorToken()
+
+    const response = await rpc({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }, token)
     const body = (await response.json()) as {
       result: { serverInfo: { name: string; version: string } }
     }
