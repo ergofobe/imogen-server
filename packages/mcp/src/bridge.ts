@@ -29,12 +29,8 @@ export async function runBridge(credentials: Credentials): Promise<void> {
         body: JSON.stringify(message),
       })
 
-      // A notification gets no reply, and neither does its forwarded form.
-      if (response.status === 202 || message.id === undefined || message.id === null) return
-
-      const text = await response.text()
-      if (!text) return
-      send(JSON.parse(text))
+      const reply = await replyTo(message, response)
+      if (reply !== undefined) send(reply)
     } catch (error) {
       if (message.id === undefined || message.id === null) return
       send({
@@ -78,4 +74,37 @@ export async function runBridge(credentials: Credentials): Promise<void> {
       void forward(message)
     }
   }
+}
+
+/**
+ * The reply to write for one forwarded message, or `undefined` when the agent expects none.
+ *
+ * Split out of `forward` so it can be tested at all: the loop above reads `Bun.stdin`,
+ * which a test cannot drive, while every decision worth protecting is in here.
+ */
+export async function replyTo(message: { id?: unknown }, response: Response): Promise<unknown> {
+  // A notification gets no reply, and neither does its forwarded form. This has to stay
+  // ahead of the status check below: a notification that was refused still gets silence.
+  if (response.status === 202 || message.id === undefined || message.id === null) return
+
+  // The server refuses before parsing the body, so its own error carries `id: null` — correct
+  // on the wire, but nothing the agent sent matches it, so forwarding it verbatim leaves the
+  // agent waiting forever instead of reporting the refusal. Answer under the id it used.
+  if (!response.ok) {
+    return {
+      jsonrpc: '2.0',
+      id: message.id,
+      error: {
+        code: -32603,
+        message:
+          response.status === 401
+            ? 'imogen rejected the stored credentials. Run: imogen-mcp login --server <url>'
+            : `imogen returned HTTP ${response.status}`,
+      },
+    }
+  }
+
+  const text = await response.text()
+  if (!text) return
+  return JSON.parse(text)
 }
