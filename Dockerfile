@@ -1,31 +1,31 @@
 # syntax=docker/dockerfile:1
 
-# The build context is the directory holding both imogen-server and imogen-sdk, not this
-# repository:
+# An ordinary context of this repository:
 #
-#     docker build -f imogen-server/Dockerfile -t imogen .
+#     docker build -t imogen .
 #
-# The client packages are resolved from a sibling checkout until they are published, and a
-# build context cannot reach outside itself. Once they are on npm this reverts to an
-# ordinary context of `.` and the two COPY lines below go away.
+# The client packages are a submodule at ./imogen-sdk, so they are inside the context;
+# build from a clone made with --recurse-submodules or the two COPY lines below fail the
+# build outright. Once the packages are on npm those lines go away with the overrides
+# block.
 
 # ---- Build ----------------------------------------------------------------
 FROM oven/bun:1.3-debian AS build
 WORKDIR /app
 
-# /app/../imogen-sdk is where package.json's overrides say the client packages are, so
-# this is the layout the install expects rather than a convenience.
-COPY imogen-sdk/typescript/packages/shared /imogen-sdk/typescript/packages/shared
-COPY imogen-sdk/typescript/packages/sdk /imogen-sdk/typescript/packages/sdk
+# package.json's overrides resolve the client packages at ./imogen-sdk, so they have to
+# be in place for the install rather than arriving later with the rest of the source.
+COPY imogen-sdk/typescript/packages/shared imogen-sdk/typescript/packages/shared
+COPY imogen-sdk/typescript/packages/sdk imogen-sdk/typescript/packages/sdk
 
 # Manifests first, so a dependency layer is only rebuilt when dependencies change.
-COPY imogen-server/package.json imogen-server/bun.lock ./
-COPY imogen-server/packages/server/package.json packages/server/
-COPY imogen-server/packages/mcp/package.json packages/mcp/
-COPY imogen-server/packages/web/package.json packages/web/
+COPY package.json bun.lock ./
+COPY packages/server/package.json packages/server/
+COPY packages/mcp/package.json packages/mcp/
+COPY packages/web/package.json packages/web/
 RUN bun install --frozen-lockfile
 
-COPY imogen-server/ .
+COPY . .
 RUN bun run --filter '@imogen/web' build
 
 # The reference viewer is copied into the web bundle during that build, so the

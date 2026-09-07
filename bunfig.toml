@@ -1,0 +1,5 @@
+[test]
+# imogen-sdk is a submodule, not our source: it carries its own tests and its own
+# biome root config, and its repository's CI is what holds it to them. Without this,
+# a bare `bun test` here walks into it and runs the SDK's suite as if it were ours.
+root = "packages"

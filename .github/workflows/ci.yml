@@ -37,22 +37,13 @@ jobs:
       TEST_DATABASE_URL: postgres://imogen:imogen@localhost:5432/imogen
       NODE_ENV: test
 
-    defaults:
-      run:
-        working-directory: imogen-server
-
     steps:
+      # The client libraries are a submodule, so the commit being tested names the SDK
+      # commit to test it against. Re-running an old commit reproduces what it was
+      # originally green against rather than building against today's SDK.
       - uses: actions/checkout@v5
         with:
-          path: imogen-server
-
-      # The client libraries are a sibling checkout until they are published. The
-      # `overrides` block in package.json resolves them from ../imogen-sdk, so the two
-      # repositories have to sit next to each other here as they do on a workstation.
-      - uses: actions/checkout@v5
-        with:
-          repository: ergofobe/imogen-sdk
-          path: imogen-sdk
+          submodules: recursive
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -65,8 +56,6 @@ jobs:
       # available" and the fixtures silently do not appear. Decoding, which is all the
       # application itself does, needs no plugin.
       - name: Install media tools
-        # Nothing repository-relative here, so it runs wherever it likes.
-        working-directory: .
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -99,11 +88,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          path: imogen-server
-      - uses: actions/checkout@v5
-        with:
-          repository: ergofobe/imogen-sdk
-          path: imogen-sdk
+          submodules: recursive
       - uses: docker/setup-buildx-action@v3
 
       # A pull request still builds, to prove the Dockerfile works, but does not
@@ -134,10 +119,8 @@ jobs:
       - name: Build the image
         uses: docker/build-push-action@v6
         with:
-          # The context holds both repositories: the client packages come from the
-          # sibling checkout, and a build context cannot reach outside itself.
           context: .
-          file: imogen-server/Dockerfile
+          file: Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

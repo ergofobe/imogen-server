@@ -4,14 +4,14 @@ Thanks for looking. imogen is small enough that a patch can land quickly.
 
 ## Getting set up
 
-The client libraries live in a sibling repository, and until they are published to npm
-this one resolves them from a checkout next to it:
+The client libraries live in a separate repository, and until they are published to npm
+this one carries them as a git submodule. Clone with it:
 
 ```bash
-git clone https://github.com/ergofobe/imogen-sdk.git ../imogen-sdk
+git clone --recurse-submodules https://github.com/ergofobe/imogen-server.git
 ```
 
-Then:
+If you already cloned without that, `git submodule update --init` fills it in. Then:
 
 ```bash
 bun install
@@ -22,11 +22,28 @@ bun run dev      # and, in another terminal, bun run dev:web
 ```
 
 The `overrides` block in the root `package.json` is what points `@imogen/sdk` and
-`@imogen/shared` at that checkout. Deleting it is the whole of the change once the packages
-are on npm.
+`@imogen/shared` at `imogen-sdk/`. Deleting it, and the submodule with it, is the whole of
+the change once the packages are on npm.
 
-One wrinkle worth knowing: bun *copies* a `file:` dependency rather than symlinking it, so
-an edit in `../imogen-sdk` does not show up here until you run `bun install --force`.
+Those two paths are spelled `file:imogen-sdk/...` with no leading `./`, which is load
+bearing rather than untidy: with the `./` bun normalises the override and the SDK's own
+nested `@imogen/shared` dependency to two different store keys and installs two copies of
+the Zod schemas, so the server and the SDK would validate against separate instances of
+the same contract. Bare, they dedupe to one.
+
+The submodule pointer is the record of which SDK commit this repository was built and
+tested against, so a change to the SDK lands here as a commit that moves it:
+
+```bash
+git -C imogen-sdk fetch origin
+git -C imogen-sdk checkout <sha>    # detached HEAD: a pointer is a commit, not a branch
+git add imogen-sdk && git commit -m "Move to the current SDK"
+```
+
+Two wrinkles worth knowing. bun *copies* a `file:` dependency rather than symlinking it,
+so an edit in `imogen-sdk/` does not show up here until you run `bun install --force`. And
+`git worktree add` does not populate submodules — a fresh worktree needs
+`git submodule update --init` before anything resolves.
 
 ## Before you open a pull request
 

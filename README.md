@@ -269,7 +269,7 @@ tapping it opens the app directly.
 ## Developing
 
 ```bash
-git clone https://github.com/ergofobe/imogen-server
+git clone --recurse-submodules https://github.com/ergofobe/imogen-server
 cd imogen-server
 bun install
 
