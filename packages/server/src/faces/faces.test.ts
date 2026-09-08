@@ -10,6 +10,7 @@ import type { Database } from '../db/index.ts'
 import { assets, faces, people, users } from '../db/schema.ts'
 import { COVER_SAMPLE } from '../lib/batch.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
+import { CLUSTER } from './cluster.ts'
 import { FaceService } from './faces.ts'
 import { ModelStore } from './models.ts'
 
@@ -145,6 +146,47 @@ async function seedOwner(): Promise<string> {
     .values({ email: `stranger-${randomUUID()}@example.com`, name: 'Stranger' })
     .returning()
   return row!.id
+}
+
+/** Builds one photo containing the given sitters, side by side. */
+async function groupPhoto(fixtures: string[], name: string) {
+  counter++
+  const relative = `${ownerId}/${name}`
+  await mkdir(join(config.libraryDir, ownerId), { recursive: true })
+
+  const size = 640
+  const tiles = await Promise.all(
+    fixtures.map((f) =>
+      sharp(join(FACE_FIXTURES, f)).resize(size, size, { fit: 'cover' }).toBuffer(),
+    ),
+  )
+  await sharp({
+    create: {
+      width: size * fixtures.length + 40,
+      height: size + 40,
+      channels: 3,
+      background: { r: 230, g: 228, b: 224 },
+    },
+  })
+    .composite(tiles.map((input, i) => ({ input, left: 20 + i * size, top: 20 })))
+    .jpeg({ quality: 92 })
+    .toFile(join(config.libraryDir, relative))
+
+  const [row] = await db
+    .insert(assets)
+    .values({
+      ownerId,
+      type: 'image',
+      status: 'ready',
+      originalFilename: name,
+      mimeType: 'image/jpeg',
+      checksum: counter.toString(16).padStart(64, '0'),
+      sizeBytes: 5000,
+      originalPath: relative,
+      capturedAt: new Date(),
+    })
+    .returning()
+  return row!
 }
 
 describe('forgetting a set of assets', () => {
@@ -699,13 +741,102 @@ describe.skipIf(!canRun)('detecting faces', () => {
   })
 })
 
+describe.skipIf(!canRun)('re-scanning a photograph that has confirmed faces', () => {
+  test('a confirmed face survives a re-scan, refreshed in place', async () => {
+    const photo = await addPhoto('person-a.png')
+    await service.processAsset(photo.id)
+    const [before] = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    await db.update(faces).set({ confirmed: true, score: 0.01 }).where(eq(faces.id, before!.id))
+
+    await service.processAsset(photo.id)
+
+    const rows = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.id).toBe(before!.id)
+    expect(rows[0]!.personId).toBe(before!.personId)
+    expect(rows[0]!.confirmed).toBe(true)
+    // The stale 0.01 is gone — the refresh landed on this row rather than skipping it.
+    expect(rows[0]!.score).toBeGreaterThanOrEqual(CLUSTER.minDetectionScore)
+    const people1 = await service.listPeople(ownerId)
+    expect(people1).toHaveLength(1)
+    expect(people1[0]!.faceCount).toBe(1)
+  })
+
+  test('an unassigned confirmed face stays unassigned', async () => {
+    const photo = await addPhoto('person-a.png')
+    await service.processAsset(photo.id)
+    const [before] = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    // The real "this is nobody" path: it both clears personId and sets confirmed.
+    await service.reassignFaces(ownerId, [before!.id], null)
+
+    await service.processAsset(photo.id)
+
+    const rows = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.id).toBe(before!.id)
+    expect(rows[0]!.personId).toBeNull()
+    expect(rows[0]!.confirmed).toBe(true)
+    // Not re-filed into a fresh person — an unassigned face stays unassigned.
+    expect(await service.listPeople(ownerId)).toBeEmpty()
+  })
+
+  test('a confirmed face the detector no longer finds is left exactly as it is', async () => {
+    const photo = await addPhoto('person-a.png')
+    await service.processAsset(photo.id)
+    const [before] = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    await db.update(faces).set({ confirmed: true }).where(eq(faces.id, before!.id))
+
+    // The same asset, edited down to a plain green field: the detector now finds nobody.
+    await sharp({
+      create: { width: 600, height: 400, channels: 3, background: { r: 30, g: 80, b: 50 } },
+    })
+      .png()
+      .toFile(join(config.libraryDir, photo.originalPath))
+
+    expect(await service.processAsset(photo.id)).toBe(0)
+
+    const rows = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.id).toBe(before!.id)
+    expect(rows[0]!.personId).toBe(before!.personId)
+    expect(rows[0]!.confirmed).toBe(true)
+    expect(await service.listPeople(ownerId)).toHaveLength(1)
+  })
+
+  test('a mixed photograph keeps its confirmed face and re-files the rest', async () => {
+    const photo = await groupPhoto(['person-a.png', 'person-b.png', 'person-c.png'], 'mixed.jpg')
+    expect(await service.processAsset(photo.id)).toBe(3)
+
+    const before = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    expect(before).toHaveLength(3)
+    expect(await service.listPeople(ownerId)).toHaveLength(3)
+
+    const confirmedRow = before[0]!
+    await db.update(faces).set({ confirmed: true }).where(eq(faces.id, confirmedRow.id))
+
+    expect(await service.processAsset(photo.id)).toBe(3)
+
+    const after = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    expect(after).toHaveLength(3)
+
+    const survivor = after.find((f) => f.id === confirmedRow.id)
+    expect(survivor?.personId).toBe(confirmedRow.personId)
+    expect(survivor?.confirmed).toBe(true)
+
+    // The other two were re-filed from scratch: new rows, matched back to their people.
+    const others = after.filter((f) => f.id !== confirmedRow.id)
+    expect(others).toHaveLength(2)
+    expect(others.every((f) => !before.some((b) => b.id === f.id))).toBe(true)
+    expect(await service.listPeople(ownerId)).toHaveLength(3)
+  })
+})
+
 /**
  * Photographs that lost their faces before that fix landed still carry them, and nothing
  * re-scans a photograph whose `facesScannedAt` is stamped. Clearing that stamp to force a
- * re-scan is not the repair: `processAsset` deletes an asset's faces and re-files them
- * from scratch, so the new rows come back `confirmed: false` and are re-clustered by
- * centroid — undoing every merge and reassignment a human ever made on that photograph.
- * `mergePeople` and `reassignFaces` set `confirmed` precisely so that cannot happen.
+ * re-scan is not the repair: it embeds and re-clusters every unconfirmed face on the
+ * photograph, which is wasted work on a photograph that already has faces and would
+ * needlessly re-group them.
  *
  * So the repair detects and stops. A photograph that still has faces is left exactly as
  * it is; only one that has genuinely lost them is touched.
@@ -761,9 +892,9 @@ describe.skipIf(!canRun)('repairing a photograph that lost its faces', () => {
   })
 
   /**
-   * The whole reason this pass detects rather than re-scans. A confirmed face is a human's
-   * decision about who somebody is; re-filing it throws that away silently, and a repair
-   * that costs the user their corrections is worse than the stale faces it removes.
+   * A photograph that still has faces is never written to by this pass — not because a
+   * re-scan would discard them (it no longer does), but because detection alone already
+   * answers the question this repair asks, and re-clustering is out of scope for it.
    */
   test('leaves a photograph that still has faces exactly as it found it', async () => {
     const photo = await addPhoto('person-a.png')
@@ -778,6 +909,33 @@ describe.skipIf(!canRun)('repairing a photograph that lost its faces', () => {
     expect(after?.id).toBe(before!.id)
     expect(after?.personId).toBe(before!.personId)
     expect(after?.confirmed).toBe(true)
+  })
+
+  /**
+   * `processAsset` now spares confirmed faces on its own, but `recheckAsset` only ever
+   * clears an asset when detection finds nobody at all — so this is the one case where
+   * a confirmed face's survival depends on `clearFaces` filtering by `confirmed` rather
+   * than on a re-scan never reaching it.
+   */
+  test('spares a confirmed face when it finds nobody', async () => {
+    const photo = await addPhoto('person-a.png')
+    await service.processAsset(photo.id)
+    const [before] = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    await db.update(faces).set({ confirmed: true }).where(eq(faces.id, before!.id))
+
+    await sharp({
+      create: { width: 600, height: 400, channels: 3, background: { r: 30, g: 80, b: 50 } },
+    })
+      .png()
+      .toFile(join(config.libraryDir, photo.originalPath))
+
+    expect(await service.recheckAsset(photo.id)).toBe(false)
+
+    const [after] = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    expect(after?.id).toBe(before!.id)
+    expect(after?.personId).toBe(before!.personId)
+    expect(after?.confirmed).toBe(true)
+    expect(await service.listPeople(ownerId)).toHaveLength(1)
   })
 
   test('reports nothing repaired for a photograph that had no faces anyway', async () => {
@@ -888,47 +1046,6 @@ describe.skipIf(!canRun)('grouping faces into people', () => {
 })
 
 describe.skipIf(!canRun)('photos with several people in them', () => {
-  /** Builds one photo containing the given sitters, side by side. */
-  async function groupPhoto(fixtures: string[], name: string) {
-    counter++
-    const relative = `${ownerId}/${name}`
-    await mkdir(join(config.libraryDir, ownerId), { recursive: true })
-
-    const size = 640
-    const tiles = await Promise.all(
-      fixtures.map((f) =>
-        sharp(join(FACE_FIXTURES, f)).resize(size, size, { fit: 'cover' }).toBuffer(),
-      ),
-    )
-    await sharp({
-      create: {
-        width: size * fixtures.length + 40,
-        height: size + 40,
-        channels: 3,
-        background: { r: 230, g: 228, b: 224 },
-      },
-    })
-      .composite(tiles.map((input, i) => ({ input, left: 20 + i * size, top: 20 })))
-      .jpeg({ quality: 92 })
-      .toFile(join(config.libraryDir, relative))
-
-    const [row] = await db
-      .insert(assets)
-      .values({
-        ownerId,
-        type: 'image',
-        status: 'ready',
-        originalFilename: name,
-        mimeType: 'image/jpeg',
-        checksum: counter.toString(16).padStart(64, '0'),
-        sizeBytes: 5000,
-        originalPath: relative,
-        capturedAt: new Date(),
-      })
-      .returning()
-    return row!
-  }
-
   test('finds every face in the photo', async () => {
     const photo = await groupPhoto(['person-a.png', 'person-b.png', 'person-c.png'], 'group.jpg')
 
