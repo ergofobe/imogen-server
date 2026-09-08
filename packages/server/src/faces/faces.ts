@@ -110,6 +110,13 @@ export class FaceService {
     const [asset] = await this.db.select().from(assets).where(eq(assets.id, assetId)).limit(1)
     if (!asset || asset.vaultedAt || asset.deletedAt || asset.type !== 'image') return 0
 
+    // An ingest that has not finished has no file to look at yet — three uploads
+    // interrupted by a crash sat at `pending` with an empty original_path, and the
+    // detector burned every attempt on them. Deliberately returning before
+    // facesScannedAt is stamped: unlike a landscape, this one must be scanned once
+    // its upload completes.
+    if (asset.status !== 'ready') return 0
+
     const { detection, recognition } = await this.ready()
     const path = this.originalPath(asset.originalPath)
 

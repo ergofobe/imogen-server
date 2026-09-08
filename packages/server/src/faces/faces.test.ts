@@ -340,6 +340,29 @@ describe('the cover sample', () => {
   })
 })
 
+describe('a half-ingested asset', () => {
+  /**
+   * Three uploads on production were interrupted mid-ingest and left at `pending` with
+   * an empty `original_path`. Detection took them anyway, handed sharp the empty path,
+   * and each burned all five attempts on `Input file contains unsupported image format`.
+   */
+  test('an asset whose upload never finished is not scanned', async () => {
+    const asset = await addBareAsset({ status: 'pending', originalPath: '' })
+
+    expect(await service.processAsset(asset.id)).toBe(0)
+    expect(await db.select().from(faces)).toBeEmpty()
+  })
+
+  test('and is left unscanned, so it is picked up once its upload completes', async () => {
+    const asset = await addBareAsset({ status: 'pending', originalPath: '' })
+
+    await service.processAsset(asset.id)
+
+    const [row] = await db.select().from(assets).where(eq(assets.id, asset.id))
+    expect(row!.facesScannedAt).toBeNull()
+  })
+})
+
 describe.skipIf(!canRun)('detecting faces', () => {
   test('finds the face in a portrait', async () => {
     const asset = await addPhoto('person-a.png')
