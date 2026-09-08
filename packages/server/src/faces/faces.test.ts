@@ -836,6 +836,30 @@ describe.skipIf(!canRun)('re-scanning a photograph that has confirmed faces', ()
     expect(people1[0]!.faceCount).toBe(1)
   })
 
+  test('two confirmed faces of one person are each adopted once', async () => {
+    const photo = await groupPhoto(['person-a.png', 'person-a.png'], 'twice.jpg')
+    expect(await service.processAsset(photo.id)).toBe(2)
+    const before = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    expect(before).toHaveLength(2)
+    expect(before[0]!.personId).toBe(before[1]!.personId)
+    await db.update(faces).set({ confirmed: true }).where(eq(faces.assetId, photo.id))
+
+    // Both sitters shift right by more than a tile: neither box overlaps its detection.
+    const shifted = await sharp(join(config.libraryDir, photo.originalPath))
+      .extend({ left: 800, background: '#fff' })
+      .jpeg({ quality: 92 })
+      .toBuffer()
+    await sharp(shifted).toFile(join(config.libraryDir, photo.originalPath))
+
+    expect(await service.processAsset(photo.id)).toBe(2)
+
+    const after = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    expect(after.map((f) => f.id).sort()).toEqual(before.map((f) => f.id).sort())
+    expect(after.every((f) => f.confirmed && f.personId === before[0]!.personId)).toBe(true)
+    expect(after.every((f) => f.x > 700)).toBe(true)
+    expect(await service.listPeople(ownerId)).toHaveLength(1)
+  })
+
   test('a mixed photograph keeps its confirmed face and re-files the rest', async () => {
     const photo = await groupPhoto(['person-a.png', 'person-b.png', 'person-c.png'], 'mixed.jpg')
     expect(await service.processAsset(photo.id)).toBe(3)

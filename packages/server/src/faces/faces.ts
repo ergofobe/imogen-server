@@ -5,14 +5,25 @@ import { assets, faces, people, settings } from '../db/schema.ts'
 import { FACE_BACKFILL_JOB, FACE_MODELS_JOB } from '../jobs/faces.ts'
 import { COVER_SAMPLE } from '../lib/batch.ts'
 import { forbidden, notFound } from '../lib/errors.ts'
-import { bestMatch, CLUSTER, updateCentroid } from './cluster.ts'
+import { bestMatch, CLUSTER, replaceInCentroid, updateCentroid } from './cluster.ts'
 import { detect, type Face } from './detect.ts'
 import type { ModelStore } from './models.ts'
 import { matchBoxes, storedBox } from './overlap.ts'
 import { embedFace } from './recognize.ts'
 
 const ENABLED_KEY = 'faces.enabled'
+/** The handle drizzle passes to a transaction callback. */
 type Tx = Parameters<Parameters<Database['transaction']>[0]>[0]
+
+type ConfirmedFace = {
+  id: string
+  personId: string | null
+  x: number
+  y: number
+  width: number
+  height: number
+  embedding: unknown
+}
 /** How many people the index is asked for before choosing among them. */
 const MATCH_CANDIDATES = 12
 
@@ -157,8 +168,10 @@ export class FaceService {
     // unassign it. But it is offered up. When a new detection clusters onto that face's
     // person, it is the same face found somewhere else, and the human's row takes the new
     // geometry rather than gaining an unconfirmed twin pointing at the wrong pixels.
-    const adoptable = new Map<string, string>()
-    for (const row of orphaned) if (row.personId) adoptable.set(row.personId, row.id)
+    const adoptable = new Map<string, ConfirmedFace[]>()
+    for (const row of orphaned) {
+      if (row.personId) adoptable.set(row.personId, [...(adoptable.get(row.personId) ?? []), row])
+    }
 
     for (const face of unmatched) {
       const embedding = await embedFace(recognition, path, face)
@@ -170,7 +183,7 @@ export class FaceService {
   }
 
   /** Confirmed faces on a photo: what a re-scan must preserve rather than re-file. */
-  private async confirmedFaces(assetId: string) {
+  private async confirmedFaces(assetId: string): Promise<ConfirmedFace[]> {
     return this.db
       .select({
         id: faces.id,
@@ -179,6 +192,7 @@ export class FaceService {
         y: faces.y,
         width: faces.width,
         height: faces.height,
+        embedding: faces.embedding,
       })
       .from(faces)
       .where(and(eq(faces.assetId, assetId), eq(faces.confirmed, true)))
@@ -187,14 +201,14 @@ export class FaceService {
   /**
    * Refreshes a confirmed face's geometry, score, and embedding without moving who it is.
    *
-   * The person's centroid is recomputed in the same locked transaction: the running mean
+   * The person's centroid moves in the same locked transaction: the running mean
    * `recordFace` maintains still contains the embedding this just replaced, and a scan on
    * another worker filing a face of the same person in between would otherwise have its
    * update overwritten.
    */
   private async refreshFace(
     tx: Tx,
-    row: { id: string; personId: string | null },
+    row: ConfirmedFace,
     face: Face,
     embedding: Float32Array,
   ): Promise<void> {
@@ -202,7 +216,25 @@ export class FaceService {
       .update(faces)
       .set({ ...storedBox(face.box), score: face.score, embedding: Array.from(embedding) })
       .where(eq(faces.id, row.id))
-    if (row.personId) await this.recomputeCentroid(row.personId, tx)
+    if (!row.personId) return
+
+    const [person] = await tx
+      .select({ centroid: people.centroid, faceCount: people.faceCount })
+      .from(people)
+      .where(eq(people.id, row.personId))
+      .limit(1)
+    if (!person) return
+
+    const centroid = replaceInCentroid(
+      person.centroid ? new Float32Array(person.centroid as number[]) : null,
+      person.faceCount,
+      new Float32Array(row.embedding as number[]),
+      embedding,
+    )
+    await tx
+      .update(people)
+      .set({ centroid: Array.from(centroid), updatedAt: new Date() })
+      .where(eq(people.id, row.personId))
   }
 
   /** Every write that touches an owner's people happens under this lock; see `recordFace`. */
@@ -292,7 +324,7 @@ export class FaceService {
     assetId: string,
     face: Face,
     embedding: Float32Array,
-    adoptable: Map<string, string> = new Map(),
+    adoptable: Map<string, ConfirmedFace[]> = new Map(),
   ): Promise<string> {
     const vector = Array.from(embedding)
 
@@ -312,11 +344,12 @@ export class FaceService {
 
       let personId: string
       if (match) {
-        // Clustering agrees with the human: this is their face, found somewhere new.
-        const orphan = adoptable.get(match.id)
-        if (orphan !== undefined) {
-          adoptable.delete(match.id)
-          await this.refreshFace(tx, { id: orphan, personId: match.id }, face, embedding)
+        // Clustering agrees with the human: this is their face, found somewhere new. Each
+        // orphaned row is taken once, so a second detection of the same person moves the
+        // next one rather than the same one twice.
+        const orphan = adoptable.get(match.id)?.shift()
+        if (orphan) {
+          await this.refreshFace(tx, orphan, face, embedding)
           return match.id
         }
 

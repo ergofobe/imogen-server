@@ -64,6 +64,28 @@ export function updateCentroid(
   return normalise(out)
 }
 
+/**
+ * Swaps one face's embedding for another in a person's running mean, for a confirmed
+ * face re-embedded by a later scan. The alternative — re-reading every embedding the
+ * person has and averaging again — is exact, but costs a read proportional to how often
+ * they appear, per face, on every re-scan; the same approximation `updateCentroid`
+ * already makes is good enough here.
+ */
+export function replaceInCentroid(
+  centroid: Float32Array | null,
+  faceCount: number,
+  previous: Float32Array,
+  replacement: Float32Array,
+): Float32Array {
+  if (!centroid || faceCount === 0) return normalise(replacement)
+
+  const out = new Float32Array(replacement.length)
+  for (let i = 0; i < replacement.length; i++) {
+    out[i] = (centroid[i]! * faceCount - previous[i]! + replacement[i]!) / faceCount
+  }
+  return normalise(out)
+}
+
 export function cosine(a: Float32Array, b: Float32Array): number {
   let dot = 0
   for (let i = 0; i < a.length; i++) dot += a[i]! * b[i]!
