@@ -12,7 +12,7 @@ import { matchBoxes, storedBox } from './overlap.ts'
 import { embedFace } from './recognize.ts'
 
 const ENABLED_KEY = 'faces.enabled'
-/** The handle drizzle passes to a transaction callback. */
+/** Drizzle does not export its transaction handle; derived so it cannot drift from `Database`. */
 type Tx = Parameters<Parameters<Database['transaction']>[0]>[0]
 
 type ConfirmedFace = {
