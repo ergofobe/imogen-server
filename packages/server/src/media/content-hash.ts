@@ -3,6 +3,9 @@ import { type FileHandle, open, stat } from 'node:fs/promises'
 
 const MAX_JPEG_BYTES = 256 * 1024 * 1024
 const MDAT_CHUNK_BYTES = 1024 * 1024
+// A long fragmented recording is a few thousand moof/mdat pairs; this is generous headroom
+// against a crafted file of millions of 8-byte boxes that would otherwise pin the request.
+const MAX_BOXES = 65536
 
 const SOI = 0xd8
 const EOI = 0xd9
@@ -52,8 +55,10 @@ function hashJpeg(bytes: Uint8Array): string | null {
     if (i + 1 >= bytes.length || bytes[i] !== 0xff) return null
     const marker = bytes[i + 1]!
     if (marker === EOI) {
-      // Anything after EOI (a motion-photo video, an MPF second image) is not the picture.
-      hash.update(bytes.subarray(i, i + 2))
+      // A Pixel Ultra HDR JPEG carries its gain map as an MPF second image after EOI, and a
+      // motion photo carries its video there. A copy missing that trailer is a poorer file,
+      // not the same one, so it must not silently collapse into the richer file's hash.
+      hash.update(bytes.subarray(i))
       return hash.digest('hex')
     }
 
@@ -134,8 +139,10 @@ async function hashIsoBmff(path: string, fileSize: number): Promise<string | nul
     const hash = createHash('sha256')
     let offset = 0
     let sawMdat = false
+    let boxCount = 0
 
     while (offset < fileSize) {
+      if (boxCount++ >= MAX_BOXES) return null
       const { bytesRead } = await handle.read(headerBuf, 0, Math.min(16, fileSize - offset), offset)
       if (bytesRead < 8) return null
       const box = readBoxHeader(headerBuf.subarray(0, bytesRead), offset, fileSize)
@@ -154,48 +161,6 @@ async function hashIsoBmff(path: string, fileSize: number): Promise<string | nul
   } finally {
     await handle.close()
   }
-}
-
-/** In-memory counterpart to `hashIsoBmff`, for buffers small enough to already be resident. */
-function hashIsoBmffBuffer(bytes: Uint8Array): string | null {
-  const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-  const hash = createHash('sha256')
-  let offset = 0
-  let sawMdat = false
-
-  while (offset < buf.length) {
-    if (offset + 8 > buf.length) return null
-    const box = readBoxHeader(buf.subarray(offset, offset + 16), offset, buf.length)
-    if (box === null) return null
-
-    if (box.type === 'mdat') {
-      sawMdat = true
-      hash.update(buf.subarray(box.payloadStart, box.payloadEnd))
-    }
-    offset = box.payloadEnd
-  }
-
-  return sawMdat ? hash.digest('hex') : null
-}
-
-export function contentHashOf(bytes: Uint8Array): string | null {
-  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === SOI) {
-    try {
-      return hashJpeg(bytes)
-    } catch {
-      return null
-    }
-  }
-
-  if (bytes.length >= 8 && Buffer.from(bytes.subarray(4, 8)).toString('ascii') === 'ftyp') {
-    try {
-      return hashIsoBmffBuffer(bytes)
-    } catch {
-      return null
-    }
-  }
-
-  return null
 }
 
 export async function contentHash(absolutePath: string): Promise<string | null> {
@@ -221,12 +186,13 @@ export async function contentHash(absolutePath: string): Promise<string | null> 
 
   if (headBuf[0] === 0xff && headBuf[1] === SOI) {
     if (size > MAX_JPEG_BYTES) return null
+    let bytes: Uint8Array
     try {
-      const bytes = new Uint8Array(await Bun.file(absolutePath).arrayBuffer())
-      return hashJpeg(bytes)
+      bytes = new Uint8Array(await Bun.file(absolutePath).arrayBuffer())
     } catch {
       return null
     }
+    return hashJpeg(bytes)
   }
 
   if (headBuf.subarray(4, 8).toString('ascii') === 'ftyp') {

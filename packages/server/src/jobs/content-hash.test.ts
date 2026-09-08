@@ -3,7 +3,7 @@ import { eq, inArray, isNotNull, sql } from 'drizzle-orm'
 import sharp from 'sharp'
 import type { Database } from '../db/index.ts'
 import { assets, jobs, settings, users } from '../db/schema.ts'
-import { contentHashOf } from '../media/content-hash.ts'
+import { contentHash } from '../media/content-hash.ts'
 import { LocalStorage } from '../media/storage.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
 import {
@@ -96,7 +96,7 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
     await queue.drain()
 
     const [jpegRow] = await db.select().from(assets).where(eq(assets.id, jpegAsset.id))
-    expect(jpegRow!.contentHash).toBe(contentHashOf(jpeg))
+    expect(jpegRow!.contentHash).toBe(await contentHash(storage.absolutePath(jpegPath)))
 
     const [unknownRow] = await db.select().from(assets).where(eq(assets.id, unknownAsset.id))
     expect(unknownRow!.contentHash).toBeNull()
@@ -120,7 +120,7 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
     await queue.drain()
 
     const [row] = await db.select().from(assets).where(eq(assets.id, trashed.id))
-    expect(row!.contentHash).toBe(contentHashOf(jpeg))
+    expect(row!.contentHash).toBe(await contentHash(storage.absolutePath(path)))
   })
 
   test('skips a row whose file is missing on disk without failing the job', async () => {
@@ -173,7 +173,8 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
 
     const rows = await db.select().from(assets).where(inArray(assets.id, ids))
     expect(rows).toHaveLength(52)
-    for (const row of rows) expect(row.contentHash).toBe(contentHashOf(jpeg))
+    const expectedHash = await contentHash(storage.absolutePath(path))
+    for (const row of rows) expect(row.contentHash).toBe(expectedHash)
 
     const [row] = await db
       .select({ count: sql<number>`count(*)::int` })
