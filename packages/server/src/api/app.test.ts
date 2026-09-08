@@ -415,6 +415,42 @@ describe('uploading', () => {
     expect((await harness.db.select({ id: assets.id }).from(assets)).length).toBe(1)
   })
 
+  test('the exact-bytes match wins over content twins, however many the library holds', async () => {
+    // A library that predates the content hash can already hold several copies of one
+    // photograph. A re-upload of one of them must come back as that one, not a sibling.
+    const { cookie, user } = await signUp()
+    const photo = await makePhoto()
+    const first = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
+    const [row] = await harness.db.select().from(assets).where(eq(assets.id, first.asset.id))
+
+    const twin = await withComment(photo)
+    const twinChecksum = createHash('sha256')
+      .update(new Uint8Array(await twin.arrayBuffer()))
+      .digest('hex')
+    const sibling = (checksum: string) => ({
+      ownerId: user.id,
+      type: row!.type,
+      originalFilename: row!.originalFilename,
+      mimeType: row!.mimeType,
+      checksum,
+      contentHash: row!.contentHash,
+      sizeBytes: row!.sizeBytes,
+      originalPath: row!.originalPath,
+      capturedAt: row!.capturedAt,
+    })
+    for (let i = 0; i < 4; i++) await harness.db.insert(assets).values(sibling(`${i}`.repeat(64)))
+    const [exact] = await harness.db
+      .insert(assets)
+      .values(sibling(twinChecksum))
+      .returning({ id: assets.id })
+
+    const response = await upload(cookie, twin)
+    const result = (await response.json()) as { asset: { id: string }; duplicate: boolean }
+
+    expect(result.duplicate).toBe(true)
+    expect(result.asset.id).toBe(exact!.id)
+  })
+
   test('a video whose metadata atoms were rewritten is a duplicate', async () => {
     const { cookie } = await signUp()
     const payload = randomBytes(4096)

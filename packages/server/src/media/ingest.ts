@@ -246,8 +246,10 @@ export class IngestService {
     return this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`ingest:${ownerId}`}))`)
 
-      const matches = await tx
-        .select({ id: assets.id, checksum: assets.checksum, contentHash: assets.contentHash })
+      // A library filled before the content hash existed can hold several twins of one
+      // photograph, so the exact-bytes row is ranked first rather than found by luck.
+      const [existing] = await tx
+        .select({ id: assets.id })
         .from(assets)
         .where(
           and(
@@ -259,11 +261,12 @@ export class IngestService {
             ),
           ),
         )
-        .limit(3)
-      const existing =
-        matches.find((m) => m.checksum === values.checksum) ??
-        matches.find((m) => m.contentHash === values.contentHash) ??
-        matches[0]
+        .orderBy(
+          sql`case when ${assets.checksum} = ${values.checksum} then 0
+                   when ${assets.contentHash} = ${values.contentHash ?? ''} then 1
+                   else 2 end`,
+        )
+        .limit(1)
       if (existing) return { id: existing.id, duplicate: true }
 
       const [user] = await tx

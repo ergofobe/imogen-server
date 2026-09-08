@@ -7,7 +7,7 @@ import {
   UploadSession,
   UploadSessionCreate,
 } from '@imogen/shared'
-import { and, eq, or } from 'drizzle-orm'
+import { and, eq, or, sql } from 'drizzle-orm'
 import { type AppEnv, requireAuth, requireScope } from '../auth/middleware.ts'
 import { assets, uploadSessions } from '../db/schema.ts'
 import { badRequest, conflict, notFound } from '../lib/errors.ts'
@@ -60,6 +60,7 @@ export function createUploadRoutes() {
               ),
             ),
           )
+          .orderBy(sql`case when ${assets.checksum} = ${body.checksum ?? ''} then 0 else 1 end`)
           .limit(1)
         if (existing) {
           const asset = await services.assets.get(principal.user.id, existing.id)
