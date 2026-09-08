@@ -647,6 +647,35 @@ describe.skipIf(!canRun)('detecting faces', () => {
   })
 
   /**
+   * "Replaces" has to hold when the replacement is nothing at all. The delete that clears
+   * a photo's old faces sat below the `usable.length === 0` early return, so a scan that
+   * found nobody left the previous scan's faces in place for ever — and an edited photo,
+   * a tuned `minDetectionScore`, or an upgraded detector all reach exactly that path.
+   * The faces then still counted toward their person and could still be that person's
+   * cover, putting a crop of something no longer in the photograph on the People page.
+   */
+  test('a re-scan that now finds nobody clears the faces the last one found', async () => {
+    const photo = await addPhoto('person-a.png')
+    await service.processAsset(photo.id)
+    expect(await service.facesForAsset(ownerId, photo.id)).toHaveLength(1)
+    const [person] = await service.listPeople(ownerId)
+
+    // The same asset, edited down to a plain green field.
+    await sharp({
+      create: { width: 600, height: 400, channels: 3, background: { r: 30, g: 80, b: 50 } },
+    })
+      .png()
+      .toFile(join(config.libraryDir, photo.originalPath))
+
+    expect(await service.processAsset(photo.id)).toBe(0)
+
+    expect(await service.facesForAsset(ownerId, photo.id)).toBeEmpty()
+    // They were only ever in that photograph, so the recount takes them with it — which
+    // it can only do if the scan still recounts after finding nothing.
+    expect(await db.select().from(people).where(eq(people.id, person!.id))).toBeEmpty()
+  })
+
+  /**
    * The people a scan recounts are collected *before* its faces are deleted, and this is
    * why. Re-scanning a photograph that now shows somebody else empties whoever used to be
    * in it, and nothing else in the pass will ever mention them again — collect the ids
