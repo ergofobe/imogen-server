@@ -56,6 +56,12 @@ export type ProcessResult = {
   duration: number | null
   /** Null when the file carried no capture time. Callers apply their own fallback. */
   capturedAt: Date | null
+  /**
+   * Whether `capturedAt` is anchored to a real UTC offset rather than read as UTC because
+   * the file did not say. A caller holding a timestamp the device already resolved should
+   * keep it over an unanchored reading.
+   */
+  capturedAtHasOffset: boolean
   exif: ExifData | null
   location: GeoPoint | null
   placeholderColor: string | null
@@ -78,6 +84,7 @@ function emptyResult(type: AssetType, error: string | null = null): ProcessResul
     height: null,
     duration: null,
     capturedAt: null,
+    capturedAtHasOffset: false,
     exif: null,
     location: null,
     placeholderColor: null,
@@ -91,7 +98,7 @@ function toHex(r: number, g: number, b: number): string {
   return `#${[r, g, b].map((v) => Math.round(v).toString(16).padStart(2, '0')).join('')}`
 }
 
-/** EXIF dates carry no timezone, so treat them as UTC rather than guessing the server's. */
+/** ffprobe writes `creation_time` as ISO-8601, normally already carrying its `Z`. */
 function asDate(value: unknown): Date | null {
   if (value instanceof Date && !Number.isNaN(value.getTime())) return value
   if (typeof value === 'string') {
@@ -99,6 +106,80 @@ function asDate(value: unknown): Date | null {
     if (!Number.isNaN(parsed.getTime())) return parsed
   }
   return null
+}
+
+/**
+ * `2026:08:04 16:52:52`, optionally with subseconds and, rarely, a zone written inline.
+ *
+ * EXIF specifies colons and a full time, but the reader this replaced went through
+ * `new Date`, which was looser. Hyphenated dates, a bare date, and a trailing `UTC` (a
+ * Picasa artifact) all reach real libraries, and tightening them into "no capture time"
+ * would push those photographs onto their file mtime — a regression dressed as rigour.
+ */
+const EXIF_DATE =
+  /^(\d{4})[:-](\d{2})[:-](\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3})\d*)?)?\s*(Z|UTC|[+-]\d{2}:?\d{2})?$/
+
+/** Minutes east of UTC. EXIF writes blanks when the camera never knew its offset. */
+function offsetMinutes(value: unknown): number | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (trimmed === 'Z' || trimmed === 'UTC') return 0
+  const match = /^([+-])(\d{2}):?(\d{2})$/.exec(trimmed)
+  if (!match) return null
+  const hours = Number(match[2])
+  const minutes = Number(match[3])
+  if (hours > 14 || minutes > 59) return null
+  return (match[1] === '-' ? -1 : 1) * (hours * 60 + minutes)
+}
+
+/**
+ * Resolves an EXIF wall clock against its companion offset tag.
+ *
+ * With an offset the pair names an instant and needs no interpretation. Without one there
+ * is no way to place it, and the only reading that survives being moved between machines
+ * is UTC — deriving it from the server's own zone makes the same file mean different
+ * things in different deployments, which is the bug this replaced.
+ */
+export function exifInstant(
+  value: unknown,
+  offsetTag: unknown,
+  subSeconds?: unknown,
+): { at: Date; hasOffset: boolean } | null {
+  if (typeof value !== 'string') return null
+  const match = EXIF_DATE.exec(value.trim())
+  if (!match) return null
+
+  const [year, month, day] = match.slice(1, 4).map(Number)
+  // A date with no time at all means midnight, which is what the old reader made of it.
+  const [hour, minute, second] = match
+    .slice(4, 7)
+    .map((part) => (part === undefined ? 0 : Number(part)))
+  // Date.UTC rolls anything out of range into a neighbouring day rather than refusing it,
+  // so every field is checked before it is handed over. `0000:00:00 00:00:00` is how a
+  // camera writes "no idea", `0001:01:01` is a spilled MinValue, and Date.UTC would read
+  // both two-digit years as 19xx. The 31st of February is caught by the round trip below.
+  if (year! < 1000 || month! < 1 || month! > 12 || day! < 1 || day! > 31) return null
+  if (hour! > 23 || minute! > 59 || second! > 59) return null
+
+  const milliseconds = subSecondMilliseconds(match[7] ?? subSeconds)
+  const wall = Date.UTC(year!, month! - 1, day!, hour!, minute!, second!, milliseconds)
+  const asWritten = new Date(wall)
+  if (asWritten.getUTCMonth() !== month! - 1 || asWritten.getUTCDate() !== day!) return null
+
+  const offset = offsetMinutes(match[8]) ?? offsetMinutes(offsetTag)
+  return { at: new Date(wall - (offset ?? 0) * 60_000), hasOffset: offset !== null }
+}
+
+/**
+ * EXIF keeps fractional seconds in a separate tag, as digits after an implied decimal
+ * point: `421` is 421ms, `4` is 400ms. Dropping them would round a client's timestamp
+ * down by up to a second for no reason.
+ */
+function subSecondMilliseconds(value: unknown): number {
+  const digits = typeof value === 'number' ? String(value) : value
+  if (typeof digits !== 'string') return 0
+  const match = /^(\d{1,3})\d*$/.exec(digits.trim())
+  return match ? Number(match[1]!.padEnd(3, '0')) : 0
 }
 
 export class MediaPipeline {
@@ -187,6 +268,11 @@ export class MediaPipeline {
       result.height = probe.height
       result.duration = probe.duration
       result.capturedAt = probe.creationTime
+      // Never anchored. ffprobe prints `creation_time` with a `Z` whether or not the
+      // container held one, and phones routinely write a local wall clock into an mp4
+      // `mvhd` box that the spec says is UTC. The `Z` is ffprobe's, not the camera's, so
+      // it is not evidence of an offset and a client's own timestamp still outranks it.
+      result.capturedAtHasOffset = false
     }
 
     // Seek a little way in: the first frame of a phone video is often black.
@@ -205,11 +291,23 @@ export class MediaPipeline {
   }
 
   private async readExif(path: string, result: ProcessResult): Promise<void> {
-    const parsed = await exifr.parse(path, { tiff: true, exif: true, gps: true }).catch(() => null)
+    // `reviveValues: false` keeps the date tags as the strings EXIF actually stores. Left
+    // on, exifr hands back a Date it built in the server's own timezone, which silently
+    // reintroduces the guess this code exists to avoid. It turns off revivers for a few
+    // other tags too, none of which are read below; GPS is computed before that step.
+    const parsed = await exifr
+      .parse(path, { tiff: true, exif: true, gps: true, reviveValues: false })
+      .catch(() => null)
     if (!parsed) return
 
-    result.capturedAt =
-      asDate(parsed.DateTimeOriginal) ?? asDate(parsed.CreateDate) ?? asDate(parsed.ModifyDate)
+    // Each date tag has its own offset companion, and they do not describe the same
+    // moment, so the pairs must not be crossed.
+    const captured =
+      exifInstant(parsed.DateTimeOriginal, parsed.OffsetTimeOriginal, parsed.SubSecTimeOriginal) ??
+      exifInstant(parsed.CreateDate, parsed.OffsetTimeDigitized, parsed.SubSecTimeDigitized) ??
+      exifInstant(parsed.ModifyDate, parsed.OffsetTime, parsed.SubSecTime)
+    result.capturedAt = captured?.at ?? null
+    result.capturedAtHasOffset = captured?.hasOffset ?? false
 
     result.exif = {
       make: parsed.Make ?? null,

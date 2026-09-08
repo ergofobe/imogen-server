@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import sharp from 'sharp'
-import { MediaPipeline } from './pipeline.ts'
+import { exifInstant, MediaPipeline } from './pipeline.ts'
 import { hashFile, LocalStorage } from './storage.ts'
 
 const workDir = mkdtempSync(join(tmpdir(), 'imogen-media-'))
@@ -256,6 +256,108 @@ describe('metadata extraction', () => {
 
     expect(result.capturedAt).toBeNull()
   })
+
+  test.skipIf(!exiftoolAvailable)('anchors a capture time to its EXIF offset', async () => {
+    const withOffset = join(workDir, 'offset.jpg')
+    await Bun.write(withOffset, Bun.file(jpegPath))
+    // +09:00 is neither UTC nor any zone this suite is likely to run in, so a reader that
+    // ignores the offset lands on a different instant wherever the test runs.
+    await Bun.$`exiftool -overwrite_original "-DateTimeOriginal=2026:08:04 16:52:52" "-OffsetTimeOriginal=+09:00" ${withOffset}`
+      .quiet()
+      .nothrow()
+
+    const result = await pipeline.process(withOffset, {
+      mimeType: 'image/jpeg',
+      filename: 'offset.jpg',
+    })
+
+    expect(result.capturedAt?.toISOString()).toBe('2026-08-04T07:52:52.000Z')
+    expect(result.capturedAtHasOffset).toBe(true)
+  })
+
+  test.skipIf(!exiftoolAvailable)('keeps the subsecond digits EXIF stores separately', async () => {
+    const subsecond = join(workDir, 'subsecond.jpg')
+    await Bun.write(subsecond, Bun.file(jpegPath))
+    await Bun.$`exiftool -overwrite_original "-DateTimeOriginal=2026:09:03 01:07:02" "-SubSecTimeOriginal=421" "-OffsetTimeOriginal=+00:00" ${subsecond}`
+      .quiet()
+      .nothrow()
+
+    const result = await pipeline.process(subsecond, {
+      mimeType: 'image/jpeg',
+      filename: 'subsecond.jpg',
+    })
+
+    expect(result.capturedAt?.toISOString()).toBe('2026-09-03T01:07:02.421Z')
+  })
+
+  test.skipIf(!exiftoolAvailable)('refuses a capture time no camera could have taken', async () => {
+    // A spilled `DateTime.MinValue`. Date.UTC maps years under 100 into the 1900s, so this
+    // reads as a perfectly plausible 1901-01-01 unless it is refused outright.
+    const minValue = join(workDir, 'min-value-date.jpg')
+    await Bun.write(minValue, Bun.file(jpegPath))
+    await Bun.$`exiftool -overwrite_original -m "-DateTimeOriginal=0001:01:01 00:00:00" ${minValue}`
+      .quiet()
+      .nothrow()
+    // exiftool silently declines some impossible dates, which would make this pass for the
+    // wrong reason -- the file would simply carry no capture time at all.
+    expect(await Bun.$`exiftool -s3 -DateTimeOriginal ${minValue}`.text()).toContain('0001')
+
+    const result = await pipeline.process(minValue, {
+      mimeType: 'image/jpeg',
+      filename: 'min-value-date.jpg',
+    })
+
+    expect(result.capturedAt).toBeNull()
+  })
+
+  test('refuses a wall clock whose fields are out of range', async () => {
+    // 70 minutes past the hour lands on the same day, so the date round trip cannot catch
+    // it; without an explicit bound it would silently store 11:10.
+    expect(exifInstant('2026:02:10 10:70:00', undefined)).toBeNull()
+    expect(exifInstant('2026:02:10 10:00:61', undefined)).toBeNull()
+    expect(exifInstant('2026:02:31 10:00:00', undefined)).toBeNull()
+  })
+
+  test('keeps reading the looser forms the previous reader accepted', async () => {
+    // All three reach real libraries. Refusing them would drop the photograph onto its
+    // file mtime, which is worse than a wall clock read as UTC.
+    expect(exifInstant('2009-09-23 17:40:52', undefined)?.at.toISOString()).toBe(
+      '2009-09-23T17:40:52.000Z',
+    )
+    expect(exifInstant('2009:09:23 17:40:52 UTC', undefined)).toEqual({
+      at: new Date('2009-09-23T17:40:52.000Z'),
+      hasOffset: true,
+    })
+    expect(exifInstant('2010:07:06', undefined)?.at.toISOString()).toBe('2010-07-06T00:00:00.000Z')
+  })
+
+  test.skipIf(!exiftoolAvailable)(
+    'reads a zone-less capture time as UTC whatever zone the server keeps',
+    async () => {
+      const zoneless = join(workDir, 'zoneless.jpg')
+      await Bun.write(zoneless, Bun.file(jpegPath))
+      await Bun.$`exiftool -overwrite_original "-DateTimeOriginal=2019:07:04 11:22:33" ${zoneless}`
+        .quiet()
+        .nothrow()
+
+      // `bun test` runs as UTC, and a process on UTC is exactly the one that never notices
+      // a wall clock being read in local time. Ask the question from somewhere else.
+      const previous = process.env.TZ
+      process.env.TZ = 'Pacific/Auckland'
+      try {
+        const result = await pipeline.process(zoneless, {
+          mimeType: 'image/jpeg',
+          filename: 'zoneless.jpg',
+        })
+
+        expect(result.capturedAt?.toISOString()).toBe('2019-07-04T11:22:33.000Z')
+        expect(result.capturedAtHasOffset).toBe(false)
+      } finally {
+        if (previous === undefined) delete process.env.TZ
+        else process.env.TZ = previous
+      }
+    },
+  )
 })
 
 describe('video processing', () => {
@@ -271,6 +373,17 @@ describe('video processing', () => {
     expect(result.duration).toBeCloseTo(2, 0)
     expect(result.thumbnail).not.toBeNull()
     expect((await sharp(result.thumbnail!).metadata()).format).toBe('webp')
+  })
+
+  test("does not treat ffprobe's creation time as carrying an offset", async () => {
+    const result = await pipeline.process(videoPath, {
+      mimeType: 'video/mp4',
+      filename: 'clip.mp4',
+    })
+
+    // ffprobe prints a `Z` regardless of what the container held, so it cannot stand in
+    // for an offset the camera recorded.
+    expect(result.capturedAtHasOffset).toBe(false)
   })
 })
 
