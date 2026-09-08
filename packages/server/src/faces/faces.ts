@@ -6,8 +6,9 @@ import { FACE_BACKFILL_JOB, FACE_MODELS_JOB } from '../jobs/faces.ts'
 import { COVER_SAMPLE } from '../lib/batch.ts'
 import { forbidden, notFound } from '../lib/errors.ts'
 import { bestMatch, CLUSTER, updateCentroid } from './cluster.ts'
-import { detect } from './detect.ts'
+import { detect, type Face } from './detect.ts'
 import type { ModelStore } from './models.ts'
+import { matchBoxes } from './overlap.ts'
 import { embedFace } from './recognize.ts'
 
 const ENABLED_KEY = 'faces.enabled'
@@ -119,42 +120,104 @@ export class FaceService {
 
     const { detection, recognition } = await this.ready()
     const path = this.originalPath(asset.originalPath)
+
+    const confirmed = await this.confirmedFaces(assetId)
     const usable = await this.detectUsable(detection, path)
 
     // A landscape with no faces in it has still been looked at, and must not come back
     // round on the next backfill.
     await this.db.update(assets).set({ facesScannedAt: new Date() }).where(eq(assets.id, assetId))
 
-    // Re-processing a photo replaces its faces rather than duplicating them — including
-    // when the replacement is nothing at all. This used to sit below an early return on
-    // `usable.length === 0`, so a scan that found nobody kept the previous scan's faces
-    // for ever: an edited photo, a tuned threshold or a new detector all land here.
-    // Nothing below needs a guard of its own — no faces means no embeddings to file, and
-    // an empty set of people to recount is one `refreshCounts` declines to open.
-    const touched = await this.clearFaces(assetId)
+    // A confirmed face is a human's decision about who is in the photo; matching it back
+    // to a detection by geometry, rather than by re-clustering its embedding, lets the
+    // machine refresh where the face is and what it looks like without ever touching who
+    // it says it is.
+    const { pairs, unmatched } = matchBoxes(confirmed, usable)
 
-    for (const face of usable) {
+    // Re-processing a photo replaces its unconfirmed faces rather than duplicating them —
+    // including when the replacement is nothing at all. This used to clear every face on
+    // the photo and sat below an early return on `usable.length === 0`, so a scan that
+    // found nobody kept the previous scan's faces for ever: an edited photo, a tuned
+    // threshold or a new detector all land here.
+    const touched = await this.clearFaces(assetId)
+    const recentre = new Set<string>()
+
+    for (const { confirmed: row, detection: face } of pairs) {
+      const embedding = await embedFace(recognition, path, face)
+      await this.refreshConfirmedFace(row.id, face, embedding)
+      if (row.personId) {
+        touched.add(row.personId)
+        recentre.add(row.personId)
+      }
+    }
+
+    // A confirmed face that matched nothing stays exactly as it is. The detector missing
+    // a face it once found — a tuned threshold, a different model, a heavier crop — is far
+    // more common than a person genuinely leaving a photograph, and a human can unassign
+    // it; the machine cannot know better than the human who said it was there.
+    for (const face of unmatched) {
       const embedding = await embedFace(recognition, path, face)
       touched.add(await this.recordFace(asset.ownerId, assetId, face, embedding))
     }
+
+    // The matched faces' embeddings moved under their people, so the running-mean
+    // centroid built from the old ones no longer describes them. Unmatched faces already
+    // update their person's centroid inside `recordFace`.
+    for (const personId of recentre) await this.recomputeCentroid(personId)
 
     await this.refreshCounts(asset.ownerId, [...touched])
     return usable.length
   }
 
+  /** Confirmed faces on a photo: what a re-scan must preserve rather than re-file. */
+  private async confirmedFaces(assetId: string) {
+    return this.db
+      .select({
+        id: faces.id,
+        personId: faces.personId,
+        x: faces.x,
+        y: faces.y,
+        width: faces.width,
+        height: faces.height,
+      })
+      .from(faces)
+      .where(and(eq(faces.assetId, assetId), eq(faces.confirmed, true)))
+  }
+
+  /** Refreshes a confirmed face's geometry, score, and embedding without moving who it is. */
+  private async refreshConfirmedFace(
+    faceId: string,
+    face: Face,
+    embedding: Float32Array,
+  ): Promise<void> {
+    await this.db
+      .update(faces)
+      .set({
+        x: Math.round(face.box[0]),
+        y: Math.round(face.box[1]),
+        width: Math.round(face.box[2] - face.box[0]),
+        height: Math.round(face.box[3] - face.box[1]),
+        score: face.score,
+        embedding: Array.from(embedding),
+      })
+      .where(eq(faces.id, faceId))
+  }
+
   /**
-   * Removes a photo's faces and names the people who were in them.
+   * Removes a photo's unconfirmed faces and names the people who were in them.
    *
-   * One statement rather than a select and then a delete: whoever loses their last face
-   * here has to be recounted afterwards or they linger in the People list with a count
-   * they no longer have, and once the rows are gone nothing names them. `returning` makes
-   * "which people did this affect" a property of the delete itself, so the two cannot
-   * drift apart.
+   * Confirmed faces are a human's decision and are spared, whether or not this scan's
+   * detections matched them — only `processAsset`'s own matching step decides what
+   * happens to them. One statement rather than a select and then a delete: whoever loses
+   * their last face here has to be recounted afterwards or they linger in the People list
+   * with a count they no longer have, and once the rows are gone nothing names them.
+   * `returning` makes "which people did this affect" a property of the delete itself, so
+   * the two cannot drift apart.
    */
   private async clearFaces(assetId: string): Promise<Set<string>> {
     const removed = await this.db
       .delete(faces)
-      .where(eq(faces.assetId, assetId))
+      .where(and(eq(faces.assetId, assetId), eq(faces.confirmed, false)))
       .returning({ personId: faces.personId })
 
     return new Set(removed.map((row) => row.personId).filter((id): id is string => id !== null))
@@ -174,12 +237,10 @@ export class FaceService {
    * them if it does not. Reports whether anything was repaired.
    *
    * This is the repair for libraries that lost faces before `processAsset` learned to
-   * clear them, and it deliberately stops at detection. Re-scanning would be the obvious
-   * repair and is the wrong one: `processAsset` deletes an asset's faces and re-files them
-   * from scratch, so every row comes back `confirmed: false` and is re-clustered by
-   * centroid — undoing each merge and reassignment a human made on that photograph, which
-   * is the exact thing `confirmed` exists to prevent. A repair that costs somebody their
-   * corrections is worse than the stale faces it removes.
+   * clear them, and it deliberately stops at detection rather than re-scanning. It exists
+   * only to answer "does this photograph still have anyone in it", so embedding is wasted
+   * work on one that does — and re-filing its unconfirmed faces would re-cluster them,
+   * shuffling groupings that a repair has no business changing.
    *
    * So a photograph that still has faces is not written to at all, and one that has lost
    * them keeps no embedding work either: detection alone settles it.
