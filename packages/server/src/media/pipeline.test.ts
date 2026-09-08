@@ -256,6 +256,52 @@ describe('metadata extraction', () => {
 
     expect(result.capturedAt).toBeNull()
   })
+
+  test.skipIf(!exiftoolAvailable)('anchors a capture time to its EXIF offset', async () => {
+    const withOffset = join(workDir, 'offset.jpg')
+    await Bun.write(withOffset, Bun.file(jpegPath))
+    // +09:00 is neither UTC nor any zone this suite is likely to run in, so a reader that
+    // ignores the offset lands on a different instant wherever the test runs.
+    await Bun.$`exiftool -overwrite_original "-DateTimeOriginal=2026:08:04 16:52:52" "-OffsetTimeOriginal=+09:00" ${withOffset}`
+      .quiet()
+      .nothrow()
+
+    const result = await pipeline.process(withOffset, {
+      mimeType: 'image/jpeg',
+      filename: 'offset.jpg',
+    })
+
+    expect(result.capturedAt?.toISOString()).toBe('2026-08-04T07:52:52.000Z')
+    expect(result.capturedAtHasOffset).toBe(true)
+  })
+
+  test.skipIf(!exiftoolAvailable)(
+    'reads a zone-less capture time as UTC whatever zone the server keeps',
+    async () => {
+      const zoneless = join(workDir, 'zoneless.jpg')
+      await Bun.write(zoneless, Bun.file(jpegPath))
+      await Bun.$`exiftool -overwrite_original "-DateTimeOriginal=2019:07:04 11:22:33" ${zoneless}`
+        .quiet()
+        .nothrow()
+
+      // `bun test` runs as UTC, and a process on UTC is exactly the one that never notices
+      // a wall clock being read in local time. Ask the question from somewhere else.
+      const previous = process.env.TZ
+      process.env.TZ = 'Pacific/Auckland'
+      try {
+        const result = await pipeline.process(zoneless, {
+          mimeType: 'image/jpeg',
+          filename: 'zoneless.jpg',
+        })
+
+        expect(result.capturedAt?.toISOString()).toBe('2019-07-04T11:22:33.000Z')
+        expect(result.capturedAtHasOffset).toBe(false)
+      } finally {
+        if (previous === undefined) delete process.env.TZ
+        else process.env.TZ = previous
+      }
+    },
+  )
 })
 
 describe('video processing', () => {

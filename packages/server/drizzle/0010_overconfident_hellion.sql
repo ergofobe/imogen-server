@@ -1,0 +1,1 @@
+ALTER TABLE "assets" ADD COLUMN "captured_at_from_client" boolean DEFAULT false NOT NULL;

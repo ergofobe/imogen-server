@@ -130,6 +130,12 @@ export const assets = pgTable(
     capturedAt: timestamp('captured_at', { withTimezone: true }).notNull(),
     capturedAtIsExact: boolean('captured_at_is_exact').notNull().default(false),
     /**
+     * Whether `capturedAt` came from the client rather than the file's modified time. A
+     * client resolves the instant on the device, so it outranks a zone-less EXIF wall
+     * clock; an mtime does not, and loses to one.
+     */
+    capturedAtFromClient: boolean('captured_at_from_client').notNull().default(false),
+    /**
      * The capture date before the owner corrected it, so a correction can be undone.
      *
      * Null until the first correction. We never rewrite the uploaded file, so the

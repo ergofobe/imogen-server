@@ -52,9 +52,11 @@ export class IngestService {
     const { size } = await stat(input.tempPath)
 
     // Capture time is provisional until the pipeline reads EXIF, but the library path
-    // depends on it, so use the best guess available now.
-    const provisionalCapturedAt = input.metadata.capturedAt
-      ? new Date(input.metadata.capturedAt)
+    // depends on it, so use the best guess available now. Whether it came from the client
+    // is derived from the same value, so the flag cannot drift from what was stored.
+    const fromClient = input.metadata.capturedAt
+    const provisionalCapturedAt = fromClient
+      ? new Date(fromClient)
       : await fileModifiedTime(input.tempPath)
 
     const claim = await this.claimChecksum(input.ownerId, checksum, size, {
@@ -65,6 +67,7 @@ export class IngestService {
       originalPath: '',
       capturedAt: provisionalCapturedAt,
       capturedAtIsExact: false,
+      capturedAtFromClient: fromClient !== undefined,
       favorite: input.metadata.favorite ?? false,
       deviceAssetId: input.metadata.deviceAssetId ?? null,
       description: input.metadata.description ?? null,
@@ -161,8 +164,14 @@ export class IngestService {
     }
 
     // EXIF beats the provisional timestamp; a scanned photo should sort by when it was
-    // taken, not when it was uploaded.
-    const capturedAt = result.capturedAt ?? asset.capturedAt
+    // taken, not when it was uploaded. But only an EXIF time carrying its offset is
+    // actually an instant. Without one, reading the wall clock as UTC moves the
+    // photograph by the device's offset -- four hours for a phone in New York, enough to
+    // land it on the previous day in a timeline bucketed by UTC date -- so a capture time
+    // the client already resolved is the better answer. The unanchored reading is still
+    // better than a file mtime, which is what the provisional value falls back to.
+    const keepClientTime = asset.capturedAtFromClient && !result.capturedAtHasOffset
+    const capturedAt = keepClientTime ? asset.capturedAt : (result.capturedAt ?? asset.capturedAt)
     // A file whose EXIF carries no coordinates leaves whatever is already on the row
     // alone. Writing null here would erase a location the uploader supplied, or one the
     // owner typed in, the moment the pipeline got round to the photograph.

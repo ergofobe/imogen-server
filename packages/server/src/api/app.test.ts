@@ -69,10 +69,37 @@ async function makePhoto(name = 'photo.jpg') {
   return new File([new Uint8Array(buffer)], name, { type: 'image/jpeg' })
 }
 
-async function upload(cookie: string, file: File) {
+/**
+ * The same gradient with EXIF attached. sharp writes the tags directly, so these tests do
+ * not need exiftool on the machine the way the pipeline's own fixtures do.
+ */
+async function makePhotoWithExif(name: string, tags: Record<string, string>) {
+  const seed = [...name].reduce((acc, ch) => (acc * 31 + ch.charCodeAt(0)) % 251, 7)
+  const buffer = await sharp({
+    create: {
+      width: 800,
+      height: 600,
+      channels: 3,
+      background: { r: seed, g: (seed * 3) % 256, b: (seed * 7) % 256 },
+    },
+  })
+    .withMetadata({ exif: { IFD2: tags } })
+    .jpeg()
+    .toBuffer()
+  return new File([new Uint8Array(buffer)], name, { type: 'image/jpeg' })
+}
+
+async function upload(cookie: string, file: File, fields: Record<string, string> = {}) {
   const form = new FormData()
   form.set('file', file)
+  for (const [key, value] of Object.entries(fields)) form.set(key, value)
   return request('/api/v1/assets', { method: 'POST', headers: { Cookie: cookie }, body: form })
+}
+
+/** The stored capture time, after the pipeline has had its say. */
+async function capturedAtOf(cookie: string, assetId: string) {
+  const response = await request(`/api/v1/assets/${assetId}`, { headers: { Cookie: cookie } })
+  return ((await response.json()) as { capturedAt: string }).capturedAt
 }
 
 describe('health and docs', () => {
@@ -251,6 +278,41 @@ describe('uploading', () => {
     })
     expect(thumbnail.status).toBe(200)
     expect(thumbnail.headers.get('content-type')).toBe('image/webp')
+  })
+
+  test('a client capture time outlives an EXIF wall clock with no offset', async () => {
+    const { cookie } = await signUp()
+    // What the device resolved for itself, which needs no guessing. The EXIF tag below is
+    // that same moment written down without its zone -- the server must not prefer it.
+    const fromDevice = '2026-09-03T01:07:02.421Z'
+    const photo = await makePhotoWithExif('device-time.jpg', {
+      DateTimeOriginal: '2026:09:02 21:07:02',
+    })
+
+    const uploaded = (await (await upload(cookie, photo, { capturedAt: fromDevice })).json()) as {
+      asset: { id: string }
+    }
+    await services.queue.drain()
+
+    expect(new Date(await capturedAtOf(cookie, uploaded.asset.id)).toISOString()).toBe(fromDevice)
+  })
+
+  test('an EXIF offset outranks the capture time the client sent', async () => {
+    const { cookie } = await signUp()
+    const photo = await makePhotoWithExif('offset-time.jpg', {
+      DateTimeOriginal: '2026:08:04 16:52:52',
+      OffsetTimeOriginal: '+09:00',
+    })
+
+    const uploaded = (await (
+      await upload(cookie, photo, { capturedAt: '2026-08-04T16:52:52.000Z' })
+    ).json()) as { asset: { id: string } }
+    await services.queue.drain()
+
+    // 16:52:52+09:00. The camera placed the moment in time itself; nothing here is a guess.
+    expect(new Date(await capturedAtOf(cookie, uploaded.asset.id)).toISOString()).toBe(
+      '2026-08-04T07:52:52.000Z',
+    )
   })
 
   test('re-uploading the same bytes returns the original rather than a copy', async () => {

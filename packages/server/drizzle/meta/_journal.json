@@ -71,6 +71,13 @@
       "when": 1788736573818,
       "tag": "0009_tidy_gideon",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1788842233322,
+      "tag": "0010_overconfident_hellion",
+      "breakpoints": true
     }
   ]
 }
