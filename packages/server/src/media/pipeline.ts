@@ -110,17 +110,20 @@ function asDate(value: unknown): Date | null {
 
 /**
  * `2026:08:04 16:52:52`, optionally with subseconds and, rarely, a zone written inline.
- * EXIF specifies colons throughout, but hyphens in the date turn up often enough that
- * rejecting them would lose capture times the previous reader accepted.
+ *
+ * EXIF specifies colons and a full time, but the reader this replaced went through
+ * `new Date`, which was looser. Hyphenated dates, a bare date, and a trailing `UTC` (a
+ * Picasa artifact) all reach real libraries, and tightening them into "no capture time"
+ * would push those photographs onto their file mtime — a regression dressed as rigour.
  */
 const EXIF_DATE =
-  /^(\d{4})[:-](\d{2})[:-](\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3})\d*)?\s*(Z|[+-]\d{2}:?\d{2})?$/
+  /^(\d{4})[:-](\d{2})[:-](\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3})\d*)?)?\s*(Z|UTC|[+-]\d{2}:?\d{2})?$/
 
 /** Minutes east of UTC. EXIF writes blanks when the camera never knew its offset. */
 function offsetMinutes(value: unknown): number | null {
   if (typeof value !== 'string') return null
   const trimmed = value.trim()
-  if (trimmed === 'Z') return 0
+  if (trimmed === 'Z' || trimmed === 'UTC') return 0
   const match = /^([+-])(\d{2}):?(\d{2})$/.exec(trimmed)
   if (!match) return null
   const hours = Number(match[2])
@@ -137,7 +140,7 @@ function offsetMinutes(value: unknown): number | null {
  * is UTC — deriving it from the server's own zone makes the same file mean different
  * things in different deployments, which is the bug this replaced.
  */
-function exifInstant(
+export function exifInstant(
   value: unknown,
   offsetTag: unknown,
   subSeconds?: unknown,
@@ -146,7 +149,11 @@ function exifInstant(
   const match = EXIF_DATE.exec(value.trim())
   if (!match) return null
 
-  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number)
+  const [year, month, day] = match.slice(1, 4).map(Number)
+  // A date with no time at all means midnight, which is what the old reader made of it.
+  const [hour, minute, second] = match
+    .slice(4, 7)
+    .map((part) => (part === undefined ? 0 : Number(part)))
   // Date.UTC rolls anything out of range into a neighbouring day rather than refusing it,
   // so every field is checked before it is handed over. `0000:00:00 00:00:00` is how a
   // camera writes "no idea", `0001:01:01` is a spilled MinValue, and Date.UTC would read
@@ -286,8 +293,8 @@ export class MediaPipeline {
   private async readExif(path: string, result: ProcessResult): Promise<void> {
     // `reviveValues: false` keeps the date tags as the strings EXIF actually stores. Left
     // on, exifr hands back a Date it built in the server's own timezone, which silently
-    // reintroduces the guess this code exists to avoid. Nothing else in this block changes
-    // shape under the flag.
+    // reintroduces the guess this code exists to avoid. It turns off revivers for a few
+    // other tags too, none of which are read below; GPS is computed before that step.
     const parsed = await exifr
       .parse(path, { tiff: true, exif: true, gps: true, reviveValues: false })
       .catch(() => null)

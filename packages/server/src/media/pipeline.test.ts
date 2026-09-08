@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import sharp from 'sharp'
-import { MediaPipeline } from './pipeline.ts'
+import { exifInstant, MediaPipeline } from './pipeline.ts'
 import { hashFile, LocalStorage } from './storage.ts'
 
 const workDir = mkdtempSync(join(tmpdir(), 'imogen-media-'))
@@ -290,24 +290,45 @@ describe('metadata extraction', () => {
     expect(result.capturedAt?.toISOString()).toBe('2026-09-03T01:07:02.421Z')
   })
 
-  test.skipIf(!exiftoolAvailable)('refuses a capture time a camera never filled in', async () => {
-    for (const [name, written] of [
-      ['blank-date.jpg', '0000:00:00 00:00:00'],
-      // A spilled `DateTime.MinValue`. Date.UTC maps years under 100 into the 1900s, so
-      // this one reads as a perfectly plausible 1901-01-01 unless it is refused outright.
-      ['min-value-date.jpg', '0001:01:01 00:00:00'],
-    ] as const) {
-      const path = join(workDir, name)
-      await Bun.write(path, Bun.file(jpegPath))
-      await Bun.$`exiftool -overwrite_original -m ${`-DateTimeOriginal=${written}`} ${path}`
-        .quiet()
-        .nothrow()
+  test.skipIf(!exiftoolAvailable)('refuses a capture time no camera could have taken', async () => {
+    // A spilled `DateTime.MinValue`. Date.UTC maps years under 100 into the 1900s, so this
+    // reads as a perfectly plausible 1901-01-01 unless it is refused outright.
+    const minValue = join(workDir, 'min-value-date.jpg')
+    await Bun.write(minValue, Bun.file(jpegPath))
+    await Bun.$`exiftool -overwrite_original -m "-DateTimeOriginal=0001:01:01 00:00:00" ${minValue}`
+      .quiet()
+      .nothrow()
+    // exiftool silently declines some impossible dates, which would make this pass for the
+    // wrong reason -- the file would simply carry no capture time at all.
+    expect(await Bun.$`exiftool -s3 -DateTimeOriginal ${minValue}`.text()).toContain('0001')
 
-      const result = await pipeline.process(path, { mimeType: 'image/jpeg', filename: name })
+    const result = await pipeline.process(minValue, {
+      mimeType: 'image/jpeg',
+      filename: 'min-value-date.jpg',
+    })
 
-      // Rolling either into a real day files the photograph under a date nobody chose.
-      expect(result.capturedAt).toBeNull()
-    }
+    expect(result.capturedAt).toBeNull()
+  })
+
+  test('refuses a wall clock whose fields are out of range', async () => {
+    // 70 minutes past the hour lands on the same day, so the date round trip cannot catch
+    // it; without an explicit bound it would silently store 11:10.
+    expect(exifInstant('2026:02:10 10:70:00', undefined)).toBeNull()
+    expect(exifInstant('2026:02:10 10:00:61', undefined)).toBeNull()
+    expect(exifInstant('2026:02:31 10:00:00', undefined)).toBeNull()
+  })
+
+  test('keeps reading the looser forms the previous reader accepted', async () => {
+    // All three reach real libraries. Refusing them would drop the photograph onto its
+    // file mtime, which is worse than a wall clock read as UTC.
+    expect(exifInstant('2009-09-23 17:40:52', undefined)?.at.toISOString()).toBe(
+      '2009-09-23T17:40:52.000Z',
+    )
+    expect(exifInstant('2009:09:23 17:40:52 UTC', undefined)).toEqual({
+      at: new Date('2009-09-23T17:40:52.000Z'),
+      hasOffset: true,
+    })
+    expect(exifInstant('2010:07:06', undefined)?.at.toISOString()).toBe('2010-07-06T00:00:00.000Z')
   })
 
   test.skipIf(!exiftoolAvailable)(

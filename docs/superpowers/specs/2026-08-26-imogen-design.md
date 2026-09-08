@@ -171,9 +171,12 @@ never rotates.
 ### 6.4 Metadata
 
 `exifr` extracts capture time, GPS, camera make and model, lens, and orientation. Capture
-time resolution order: EXIF `DateTimeOriginal`, then client-supplied `capturedAt`, then
-file mtime, then upload time. Getting this order right is what makes the timeline correct
-for scanned photos and screenshots alike.
+time resolution order: EXIF `DateTimeOriginal` **with its `OffsetTimeOriginal`**, then
+client-supplied `capturedAt`, then an EXIF wall clock with no offset read as UTC, then file
+mtime, then upload time. An EXIF time only outranks the client when the file says which
+zone it was written in; without that it is a wall clock, and the client already resolved
+the instant. Getting this order right is what makes the timeline correct for scanned
+photos and screenshots alike.
 
 ### 6.5 Jobs
 

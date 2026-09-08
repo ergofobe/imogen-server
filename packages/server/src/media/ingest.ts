@@ -67,7 +67,7 @@ export class IngestService {
       originalPath: '',
       capturedAt: provisionalCapturedAt,
       capturedAtIsExact: false,
-      capturedAtFromClient: fromClient !== undefined,
+      capturedAtFromClient: Boolean(fromClient),
       favorite: input.metadata.favorite ?? false,
       deviceAssetId: input.metadata.deviceAssetId ?? null,
       description: input.metadata.description ?? null,
