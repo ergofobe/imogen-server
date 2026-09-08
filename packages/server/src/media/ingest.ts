@@ -5,7 +5,7 @@ import type { Database } from '../db/index.ts'
 import { assetFiles, assets, users } from '../db/schema.ts'
 import { conflict, quotaExceeded, unsupportedMediaType } from '../lib/errors.ts'
 import { contentHash } from './content-hash.ts'
-import { findExistingAsset } from './identity.ts'
+import { claimExistingAsset } from './identity.ts'
 import type { MediaPipeline } from './pipeline.ts'
 import { toAsset } from './serialize.ts'
 import { derivativePath, hashFile, libraryPath, type StorageDriver } from './storage.ts'
@@ -243,7 +243,7 @@ export class IngestService {
     return this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`ingest:${ownerId}`}))`)
 
-      const existing = await findExistingAsset(tx, ownerId, values)
+      const existing = await claimExistingAsset(tx, ownerId, values)
       if (existing) return { id: existing, duplicate: true }
 
       const [user] = await tx

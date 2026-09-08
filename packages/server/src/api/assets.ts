@@ -120,7 +120,8 @@ export function createAssetRoutes() {
       summary: 'Upload one photo or video',
       description:
         'Multipart upload. Re-uploading bytes that already exist returns the existing ' +
-        'asset with `duplicate: true` rather than storing a second copy.',
+        'asset with `duplicate: true` rather than storing a second copy. A copy that was ' +
+        'in the trash is restored.',
       security: security(),
       middleware: [requireScope('library:write')] as const,
       request: {

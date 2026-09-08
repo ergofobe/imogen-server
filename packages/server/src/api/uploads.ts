@@ -11,7 +11,7 @@ import { and, eq } from 'drizzle-orm'
 import { type AppEnv, requireAuth, requireScope } from '../auth/middleware.ts'
 import { uploadSessions } from '../db/schema.ts'
 import { badRequest, conflict, notFound } from '../lib/errors.ts'
-import { findExistingAsset } from '../media/identity.ts'
+import { claimExistingAsset } from '../media/identity.ts'
 import { created, ERROR_RESPONSES, ok, security } from './openapi.ts'
 
 const SESSION_TTL_HOURS = 24
@@ -35,7 +35,8 @@ export function createUploadRoutes() {
       summary: 'Begin a resumable upload',
       description:
         'Supply the checksum if you know it and the server will tell you immediately ' +
-        'whether it already has the file, so nothing is transferred twice.',
+        'whether it already has the file, so nothing is transferred twice. A copy that ' +
+        'was in the trash is restored.',
       security: security(),
       middleware: [requireScope('library:write')] as const,
       request: { body: { content: { 'application/json': { schema: UploadSessionCreate } } } },
@@ -48,9 +49,16 @@ export function createUploadRoutes() {
 
       // The same two keys the client can know before sending bytes; the content hash
       // needs the bytes, so ingest checks that one after the transfer.
-      const existing = await findExistingAsset(services.db, principal.user.id, body)
+      const existing = await claimExistingAsset(services.db, principal.user.id, body)
       if (existing) {
-        const asset = await services.assets.get(principal.user.id, existing)
+        // The caller is presenting the photograph's own bytes, so the vault's read guard
+        // (an id alone must not be enough to see what was put away) is not what is at
+        // stake, and the direct upload path already answers with the asset. One rule on
+        // both paths; a 403 here would name the vault in its message and turn a phone's
+        // backup of that photograph into a permanent failure. See #65.
+        const asset = await services.assets.get(principal.user.id, existing, {
+          includeVaulted: true,
+        })
         return c.json(
           {
             id: crypto.randomUUID(),
