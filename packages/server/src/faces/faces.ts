@@ -126,11 +126,9 @@ export class FaceService {
         f.box[2] - f.box[0] >= CLUSTER.minFaceSize && f.box[3] - f.box[1] >= CLUSTER.minFaceSize,
     )
 
-    // Recorded before the early return: a landscape with no faces in it has still been
-    // looked at, and must not come back round on the next backfill.
+    // A landscape with no faces in it has still been looked at, and must not come back
+    // round on the next backfill.
     await this.db.update(assets).set({ facesScannedAt: new Date() }).where(eq(assets.id, assetId))
-
-    if (usable.length === 0) return 0
 
     // Collected before the delete below, and that ordering is the whole point: re-scanning
     // a photograph that now shows somebody else empties whoever used to be in it, and once
@@ -147,7 +145,12 @@ export class FaceService {
         .filter((id): id is string => id !== null),
     )
 
-    // Re-processing a photo replaces its faces rather than duplicating them.
+    // Re-processing a photo replaces its faces rather than duplicating them — including
+    // when the replacement is nothing at all. This used to sit below an early return on
+    // `usable.length === 0`, so a scan that found nobody kept the previous scan's faces
+    // for ever: an edited photo, a tuned threshold or a new detector all land here.
+    // Nothing below needs a guard of its own — no faces means no embeddings to file, and
+    // an empty set of people to recount is one `refreshCounts` declines to open.
     await this.db.delete(faces).where(eq(faces.assetId, assetId))
 
     for (const face of usable) {
