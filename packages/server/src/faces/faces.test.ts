@@ -699,6 +699,99 @@ describe.skipIf(!canRun)('detecting faces', () => {
   })
 })
 
+/**
+ * Photographs that lost their faces before that fix landed still carry them, and nothing
+ * re-scans a photograph whose `facesScannedAt` is stamped. Clearing that stamp to force a
+ * re-scan is not the repair: `processAsset` deletes an asset's faces and re-files them
+ * from scratch, so the new rows come back `confirmed: false` and are re-clustered by
+ * centroid — undoing every merge and reassignment a human ever made on that photograph.
+ * `mergePeople` and `reassignFaces` set `confirmed` precisely so that cannot happen.
+ *
+ * So the repair detects and stops. A photograph that still has faces is left exactly as
+ * it is; only one that has genuinely lost them is touched.
+ */
+describe('re-checking a photograph for faces it has lost', () => {
+  test('does nothing while the feature is off', async () => {
+    await service.setEnabled(false)
+    const asset = await addBareAsset()
+    const [person] = await db.insert(people).values({ ownerId }).returning()
+    await addFace(asset.id, person!.id)
+
+    expect(await service.recheckAsset(asset.id)).toBe(false)
+    expect(await db.select().from(faces)).toHaveLength(1)
+  })
+
+  test('never opens a vaulted photograph', async () => {
+    const asset = await addBareAsset({ vaultedAt: new Date() })
+    const [person] = await db.insert(people).values({ ownerId }).returning()
+    await addFace(asset.id, person!.id)
+
+    expect(await service.recheckAsset(asset.id)).toBe(false)
+    expect(await db.select().from(faces)).toHaveLength(1)
+  })
+
+  test('never opens a trashed photograph', async () => {
+    const asset = await addBareAsset({ deletedAt: new Date() })
+    const [person] = await db.insert(people).values({ ownerId }).returning()
+    await addFace(asset.id, person!.id)
+
+    expect(await service.recheckAsset(asset.id)).toBe(false)
+    expect(await db.select().from(faces)).toHaveLength(1)
+  })
+})
+
+describe.skipIf(!canRun)('repairing a photograph that lost its faces', () => {
+  test('removes the faces of a photograph that no longer shows anyone', async () => {
+    const photo = await addPhoto('person-a.png')
+    await service.processAsset(photo.id)
+    const [person] = await service.listPeople(ownerId)
+
+    // Exactly the state the bug left behind: faces on record, scanned, and an image that
+    // no longer has anybody in it.
+    await sharp({
+      create: { width: 600, height: 400, channels: 3, background: { r: 30, g: 80, b: 50 } },
+    })
+      .png()
+      .toFile(join(config.libraryDir, photo.originalPath))
+
+    expect(await service.recheckAsset(photo.id)).toBe(true)
+
+    expect(await service.facesForAsset(ownerId, photo.id)).toBeEmpty()
+    expect(await db.select().from(people).where(eq(people.id, person!.id))).toBeEmpty()
+  })
+
+  /**
+   * The whole reason this pass detects rather than re-scans. A confirmed face is a human's
+   * decision about who somebody is; re-filing it throws that away silently, and a repair
+   * that costs the user their corrections is worse than the stale faces it removes.
+   */
+  test('leaves a photograph that still has faces exactly as it found it', async () => {
+    const photo = await addPhoto('person-a.png')
+    await service.processAsset(photo.id)
+    const [before] = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    await db.update(faces).set({ confirmed: true }).where(eq(faces.id, before!.id))
+
+    expect(await service.recheckAsset(photo.id)).toBe(false)
+
+    const [after] = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    // The same row, not a replacement wearing the same face.
+    expect(after?.id).toBe(before!.id)
+    expect(after?.personId).toBe(before!.personId)
+    expect(after?.confirmed).toBe(true)
+  })
+
+  test('reports nothing repaired for a photograph that had no faces anyway', async () => {
+    const photo = await addPhoto('person-a.png')
+    await sharp({
+      create: { width: 600, height: 400, channels: 3, background: { r: 30, g: 80, b: 50 } },
+    })
+      .png()
+      .toFile(join(config.libraryDir, photo.originalPath))
+
+    expect(await service.recheckAsset(photo.id)).toBe(false)
+  })
+})
+
 describe.skipIf(!canRun)('grouping faces into people', () => {
   test('groups the same person photographed differently', async () => {
     const a = await addPhoto('person-a.png')
