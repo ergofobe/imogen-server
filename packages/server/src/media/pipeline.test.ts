@@ -286,8 +286,9 @@ describe('image processing', () => {
    * already rotated and `width`/`height` are reported post-rotation -- so a client that
    * applies it would turn the photograph twice.
    */
-  test('records the orientation the file stored, as a number', async () => {
-    for (const orientation of [1, 3, 6, 8]) {
+  test.each([1, 3, 6, 8])(
+    'records orientation %i as the number the file stored',
+    async (orientation) => {
       const path = join(workDir, `orientation-${orientation}.jpg`)
       await sharp(jpegPath).withMetadata({ orientation }).toFile(path)
 
@@ -297,8 +298,8 @@ describe('image processing', () => {
       })
 
       expect(result.exif?.orientation).toBe(orientation)
-    }
-  })
+    },
+  )
 })
 
 describe('metadata extraction', () => {
