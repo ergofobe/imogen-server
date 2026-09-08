@@ -1,0 +1,2 @@
+ALTER TABLE "assets" ADD COLUMN "content_hash" text;--> statement-breakpoint
+CREATE INDEX "assets_owner_content_hash_idx" ON "assets" USING btree ("owner_id","content_hash") WHERE "assets"."content_hash" is not null;

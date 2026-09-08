@@ -121,6 +121,12 @@ export const assets = pgTable(
     originalFilename: text('original_filename').notNull(),
     mimeType: text('mime_type').notNull(),
     checksum: text('checksum').notNull(),
+    /**
+     * SHA-256 of the media payload alone (JPEG scan data, ISO-BMFF `mdat`), so a copy
+     * whose metadata container an export pipeline rewrote still reads as the same
+     * photograph. Null when the container is one the hasher does not understand.
+     */
+    contentHash: text('content_hash'),
     sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull(),
     /** Path relative to the library root, so the data directory can move. */
     originalPath: text('original_path').notNull(),
@@ -190,6 +196,11 @@ export const assets = pgTable(
     uniqueIndex('assets_owner_device_asset_key')
       .on(t.ownerId, t.deviceAssetId)
       .where(sql`${t.deviceAssetId} is not null`),
+    // Not unique: libraries filled before the hash existed already hold twins, and
+    // finding those is what the index is for as much as preventing new ones.
+    index('assets_owner_content_hash_idx')
+      .on(t.ownerId, t.contentHash)
+      .where(sql`${t.contentHash} is not null`),
     // The timeline's only hot query: owner's live assets, newest first, tie-broken by id.
     index('assets_timeline_idx')
       .on(t.ownerId, t.capturedAt.desc(), t.id.desc())

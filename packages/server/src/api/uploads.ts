@@ -7,7 +7,7 @@ import {
   UploadSession,
   UploadSessionCreate,
 } from '@imogen/shared'
-import { and, eq } from 'drizzle-orm'
+import { and, eq, or } from 'drizzle-orm'
 import { type AppEnv, requireAuth, requireScope } from '../auth/middleware.ts'
 import { assets, uploadSessions } from '../db/schema.ts'
 import { badRequest, conflict, notFound } from '../lib/errors.ts'
@@ -45,11 +45,21 @@ export function createUploadRoutes() {
       const principal = c.get('principal')
       const body = c.req.valid('json')
 
-      if (body.checksum) {
+      // The same two keys the client can know before sending bytes; the content hash
+      // needs the bytes, so ingest checks that one after the transfer.
+      if (body.checksum || body.deviceAssetId) {
         const [existing] = await services.db
           .select()
           .from(assets)
-          .where(and(eq(assets.ownerId, principal.user.id), eq(assets.checksum, body.checksum)))
+          .where(
+            and(
+              eq(assets.ownerId, principal.user.id),
+              or(
+                body.checksum ? eq(assets.checksum, body.checksum) : undefined,
+                body.deviceAssetId ? eq(assets.deviceAssetId, body.deviceAssetId) : undefined,
+              ),
+            ),
+          )
           .limit(1)
         if (existing) {
           const asset = await services.assets.get(principal.user.id, existing.id)
