@@ -803,6 +803,39 @@ describe.skipIf(!canRun)('re-scanning a photograph that has confirmed faces', ()
     expect(await service.listPeople(ownerId)).toHaveLength(1)
   })
 
+  /**
+   * Geometry is only the first way of recognising a confirmed face. Boxes recorded before
+   * an orientation fix, or by a different detector, can miss the new detection entirely,
+   * and leaving the row alone would then hand the fresh detection to `recordFace` — which
+   * clusters it onto the same person, so one face becomes two rows, the confirmed one
+   * pointing at the wrong pixels. When clustering agrees on the person, the human's row
+   * adopts the new detection instead.
+   */
+  test('a confirmed face whose box has moved is adopted by its person’s next detection', async () => {
+    const photo = await addPhoto('person-a.png')
+    await service.processAsset(photo.id)
+    const [before] = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    await db.update(faces).set({ confirmed: true }).where(eq(faces.id, before!.id))
+
+    // The same sitter, now far to the right of where the box says: no overlap at all.
+    await sharp(join(FACE_FIXTURES, 'person-a.png'))
+      .extend({ left: 800, background: '#fff' })
+      .png()
+      .toFile(join(config.libraryDir, photo.originalPath))
+
+    expect(await service.processAsset(photo.id)).toBe(1)
+
+    const rows = await db.select().from(faces).where(eq(faces.assetId, photo.id))
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.id).toBe(before!.id)
+    expect(rows[0]!.personId).toBe(before!.personId)
+    expect(rows[0]!.confirmed).toBe(true)
+    expect(rows[0]!.x).toBeGreaterThan(before!.x + 400)
+    const people1 = await service.listPeople(ownerId)
+    expect(people1).toHaveLength(1)
+    expect(people1[0]!.faceCount).toBe(1)
+  })
+
   test('a mixed photograph keeps its confirmed face and re-files the rest', async () => {
     const photo = await groupPhoto(['person-a.png', 'person-b.png', 'person-c.png'], 'mixed.jpg')
     expect(await service.processAsset(photo.id)).toBe(3)

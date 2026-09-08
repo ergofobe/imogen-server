@@ -516,7 +516,7 @@ export const faces = pgTable(
     /**
      * Set when a human confirmed or corrected the grouping. A re-scan keeps a confirmed
      * face's person and this flag, refreshing only its geometry and embedding from the
-     * fresh detection it matches — only a human moves or removes it after that.
+     * detection that turns out to be it — only a human moves or removes it after that.
      */
     confirmed: boolean('confirmed').notNull().default(false),
     createdAt,

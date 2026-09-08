@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { type Corners, corners, iou, matchBoxes } from './overlap.ts'
+import { type Corners, corners, iou, matchBoxes, storedBox } from './overlap.ts'
 
 describe('iou', () => {
   test('identical boxes overlap completely', () => {
@@ -21,6 +21,10 @@ describe('iou', () => {
 
   test('a stored box converts to the corners the detector emits', () => {
     expect(corners({ x: 5, y: 10, width: 20, height: 30 })).toEqual([5, 10, 25, 40])
+  })
+
+  test('the detector’s corners round to the whole pixels the table stores', () => {
+    expect(storedBox([5.4, 10.6, 25.5, 40.2])).toEqual({ x: 5, y: 11, width: 20, height: 30 })
   })
 })
 
@@ -56,11 +60,12 @@ describe('matchBoxes', () => {
     ]
     const detected = [{ box: [0, 0, 10, 10] as Corners }]
 
-    const { pairs, unmatched } = matchBoxes(confirmed, detected)
+    const { pairs, unmatched, orphaned } = matchBoxes(confirmed, detected)
 
     expect(pairs).toHaveLength(1)
     expect(pairs[0]!.confirmed).toBe(confirmed[0]!)
     expect(unmatched).toBeEmpty()
+    expect(orphaned).toEqual([confirmed[1]!])
   })
 
   test('leftover detections come back unmatched', () => {
@@ -71,5 +76,16 @@ describe('matchBoxes', () => {
 
     expect(pairs).toBeEmpty()
     expect(unmatched).toEqual(detected)
+  })
+
+  test('a confirmed face nothing was detected near comes back orphaned', () => {
+    const confirmed = [{ x: 0, y: 0, width: 10, height: 10 }]
+    const detected = [{ box: [200, 200, 210, 210] as Corners }]
+
+    const { pairs, unmatched, orphaned } = matchBoxes(confirmed, detected)
+
+    expect(pairs).toBeEmpty()
+    expect(unmatched).toEqual(detected)
+    expect(orphaned).toEqual(confirmed)
   })
 })

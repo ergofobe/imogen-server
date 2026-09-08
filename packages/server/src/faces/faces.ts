@@ -8,10 +8,11 @@ import { forbidden, notFound } from '../lib/errors.ts'
 import { bestMatch, CLUSTER, updateCentroid } from './cluster.ts'
 import { detect, type Face } from './detect.ts'
 import type { ModelStore } from './models.ts'
-import { matchBoxes } from './overlap.ts'
+import { matchBoxes, storedBox } from './overlap.ts'
 import { embedFace } from './recognize.ts'
 
 const ENABLED_KEY = 'faces.enabled'
+type Tx = Parameters<Parameters<Database['transaction']>[0]>[0]
 /** How many people the index is asked for before choosing among them. */
 const MATCH_CANDIDATES = 12
 
@@ -131,12 +132,8 @@ export class FaceService {
     // A confirmed face is a human's decision about who is in the photo; matching it back
     // to a detection by geometry, rather than by re-clustering its embedding, lets the
     // machine refresh where the face is and what it looks like without ever touching who
-    // it says it is. One that matches no detection is in neither list and stays exactly
-    // as it is: the detector missing a face it once found — a tuned threshold, a
-    // different model, a heavier crop — is far more common than a person genuinely
-    // leaving a photograph, and a human can unassign it; the machine cannot know better
-    // than the human who said it was there.
-    const { pairs, unmatched } = matchBoxes(confirmed, usable)
+    // it says it is.
+    const { pairs, unmatched, orphaned } = matchBoxes(confirmed, usable)
 
     // Re-processing a photo replaces its unconfirmed faces rather than duplicating them —
     // including when the replacement is nothing at all. This used to clear every face on
@@ -144,26 +141,29 @@ export class FaceService {
     // found nobody kept the previous scan's faces for ever: an edited photo, a tuned
     // threshold or a new detector all land here.
     const touched = await this.clearFaces(assetId)
-    const recentre = new Set<string>()
 
+    // Matched faces are refreshed before anything new is filed: filing compares against
+    // each person's centroid, and a centroid still built from the embedding that has just
+    // been replaced would describe someone the library no longer holds.
     for (const { confirmed: row, detection: face } of pairs) {
       const embedding = await embedFace(recognition, path, face)
-      await this.refreshConfirmedFace(row.id, face, embedding)
-      if (row.personId) {
-        touched.add(row.personId)
-        recentre.add(row.personId)
-      }
+      await this.locked(asset.ownerId, (tx) => this.refreshFace(tx, row, face, embedding))
+      if (row.personId) touched.add(row.personId)
     }
+
+    // A confirmed face nothing was detected near is not deleted: the detector missing a
+    // face it once found — a tuned threshold, a different model, a re-decoded original —
+    // is far more common than a person genuinely leaving a photograph, and a human can
+    // unassign it. But it is offered up. When a new detection clusters onto that face's
+    // person, it is the same face found somewhere else, and the human's row takes the new
+    // geometry rather than gaining an unconfirmed twin pointing at the wrong pixels.
+    const adoptable = new Map<string, string>()
+    for (const row of orphaned) if (row.personId) adoptable.set(row.personId, row.id)
 
     for (const face of unmatched) {
       const embedding = await embedFace(recognition, path, face)
-      touched.add(await this.recordFace(asset.ownerId, assetId, face, embedding))
+      touched.add(await this.recordFace(asset.ownerId, assetId, face, embedding, adoptable))
     }
-
-    // The matched faces' embeddings moved under their people, so the running-mean
-    // centroid built from the old ones no longer describes them. Unmatched faces already
-    // update their person's centroid inside `recordFace`.
-    for (const personId of recentre) await this.recomputeCentroid(personId)
 
     await this.refreshCounts(asset.ownerId, [...touched])
     return usable.length
@@ -184,23 +184,33 @@ export class FaceService {
       .where(and(eq(faces.assetId, assetId), eq(faces.confirmed, true)))
   }
 
-  /** Refreshes a confirmed face's geometry, score, and embedding without moving who it is. */
-  private async refreshConfirmedFace(
-    faceId: string,
+  /**
+   * Refreshes a confirmed face's geometry, score, and embedding without moving who it is.
+   *
+   * The person's centroid is recomputed in the same locked transaction: the running mean
+   * `recordFace` maintains still contains the embedding this just replaced, and a scan on
+   * another worker filing a face of the same person in between would otherwise have its
+   * update overwritten.
+   */
+  private async refreshFace(
+    tx: Tx,
+    row: { id: string; personId: string | null },
     face: Face,
     embedding: Float32Array,
   ): Promise<void> {
-    await this.db
+    await tx
       .update(faces)
-      .set({
-        x: Math.round(face.box[0]),
-        y: Math.round(face.box[1]),
-        width: Math.round(face.box[2] - face.box[0]),
-        height: Math.round(face.box[3] - face.box[1]),
-        score: face.score,
-        embedding: Array.from(embedding),
-      })
-      .where(eq(faces.id, faceId))
+      .set({ ...storedBox(face.box), score: face.score, embedding: Array.from(embedding) })
+      .where(eq(faces.id, row.id))
+    if (row.personId) await this.recomputeCentroid(row.personId, tx)
+  }
+
+  /** Every write that touches an owner's people happens under this lock; see `recordFace`. */
+  private locked<T>(ownerId: string, fn: (tx: Tx) => Promise<T>): Promise<T> {
+    return this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`faces:${ownerId}`}))`)
+      return fn(tx)
+    })
   }
 
   /**
@@ -280,14 +290,13 @@ export class FaceService {
   private async recordFace(
     ownerId: string,
     assetId: string,
-    face: { box: [number, number, number, number]; score: number },
+    face: Face,
     embedding: Float32Array,
+    adoptable: Map<string, string> = new Map(),
   ): Promise<string> {
     const vector = Array.from(embedding)
 
-    return this.db.transaction(async (tx) => {
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`faces:${ownerId}`}))`)
-
+    return this.locked(ownerId, async (tx) => {
       // The index narrows the field; the threshold decision is made in one place.
       const nearby = await tx
         .select({ id: people.id, centroid: people.centroid, faceCount: people.faceCount })
@@ -303,6 +312,14 @@ export class FaceService {
 
       let personId: string
       if (match) {
+        // Clustering agrees with the human: this is their face, found somewhere new.
+        const orphan = adoptable.get(match.id)
+        if (orphan !== undefined) {
+          adoptable.delete(match.id)
+          await this.refreshFace(tx, { id: orphan, personId: match.id }, face, embedding)
+          return match.id
+        }
+
         const existing = nearby.find((p) => p.id === match.id)!
         const centroid = updateCentroid(match.centroid, existing.faceCount, embedding)
         await tx
@@ -326,10 +343,7 @@ export class FaceService {
         assetId,
         ownerId,
         personId,
-        x: Math.round(face.box[0]),
-        y: Math.round(face.box[1]),
-        width: Math.round(face.box[2] - face.box[0]),
-        height: Math.round(face.box[3] - face.box[1]),
+        ...storedBox(face.box),
         score: face.score,
         embedding: vector,
       })
@@ -371,9 +385,7 @@ export class FaceService {
     const facesInScope = personIds ? sql`and ${inArray(sql`f.person_id`, personIds)}` : sql``
     const peopleInScope = personIds ? sql`and ${inArray(people.id, personIds)}` : sql``
 
-    await this.db.transaction(async (tx) => {
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`faces:${ownerId}`}))`)
-
+    await this.locked(ownerId, async (tx) => {
       await tx.execute(sql`
         update ${people} set face_count = counted.total, cover_face_id = counted.cover
         from (
@@ -480,7 +492,7 @@ export class FaceService {
       .returning({ id: faces.id })
 
     await this.db.delete(people).where(inArray(people.id, others))
-    await this.recomputeCentroid(keepId)
+    await this.locked(ownerId, (tx) => this.recomputeCentroid(keepId, tx))
     await this.refreshCounts(ownerId)
     void keep
     return moved.length
@@ -494,12 +506,12 @@ export class FaceService {
       .set({ personId, confirmed: true })
       .where(and(eq(faces.ownerId, ownerId), inArray(faces.id, faceIds)))
 
-    if (personId) await this.recomputeCentroid(personId)
+    if (personId) await this.locked(ownerId, (tx) => this.recomputeCentroid(personId, tx))
     await this.refreshCounts(ownerId)
   }
 
-  private async recomputeCentroid(personId: string): Promise<void> {
-    const rows = await this.db
+  private async recomputeCentroid(personId: string, tx: Tx): Promise<void> {
+    const rows = await tx
       .select({ embedding: faces.embedding })
       .from(faces)
       .where(eq(faces.personId, personId))
@@ -518,7 +530,7 @@ export class FaceService {
     }
     norm = Math.sqrt(norm) || 1
 
-    await this.db
+    await tx
       .update(people)
       .set({
         centroid: Array.from(mean, (v) => v / norm),

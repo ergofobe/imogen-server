@@ -37,16 +37,27 @@ export function corners(box: Box): Corners {
   return [box.x, box.y, box.x + box.width, box.y + box.height]
 }
 
+/** The detector's corners as the `faces` table stores them: whole pixels of the original. */
+export function storedBox(box: Corners): Box {
+  return {
+    x: Math.round(box[0]),
+    y: Math.round(box[1]),
+    width: Math.round(box[2] - box[0]),
+    height: Math.round(box[3] - box[1]),
+  }
+}
+
 /**
  * Greedily pairs each confirmed box with its best-overlapping detection, each side used
  * at most once, so two confirmed faces can never both claim the same detection and one
- * detection can never refresh two confirmed rows.
+ * detection can never refresh two confirmed rows. What is left over comes back on both
+ * sides: detections nobody claimed, and confirmed faces nothing was found near.
  */
 export function matchBoxes<C extends Box, D extends Detection>(
   confirmed: C[],
   detected: D[],
   threshold: number = MATCH_IOU_THRESHOLD,
-): { pairs: Array<{ confirmed: C; detection: D }>; unmatched: D[] } {
+): { pairs: Array<{ confirmed: C; detection: D }>; unmatched: D[]; orphaned: C[] } {
   const candidates: Array<{ ci: number; di: number; score: number }> = []
   for (let ci = 0; ci < confirmed.length; ci++) {
     for (let di = 0; di < detected.length; di++) {
@@ -66,6 +77,9 @@ export function matchBoxes<C extends Box, D extends Detection>(
     pairs.push({ confirmed: confirmed[ci]!, detection: detected[di]! })
   }
 
-  const unmatched = detected.filter((_, di) => !usedDetected.has(di))
-  return { pairs, unmatched }
+  return {
+    pairs,
+    unmatched: detected.filter((_, di) => !usedDetected.has(di)),
+    orphaned: confirmed.filter((_, ci) => !usedConfirmed.has(ci)),
+  }
 }
