@@ -1,6 +1,7 @@
 import type { OAuthScope } from '@imogen/shared'
 import { z } from 'zod'
 import type { Principal } from '../lib/context.ts'
+import { isUsableCoordinate } from '../media/serialize.ts'
 import type { Services } from '../services.ts'
 
 export type ToolContext = { services: Services; principal: Principal }
@@ -369,7 +370,7 @@ function toAssetShape(row: {
     width: row.width,
     height: row.height,
     location:
-      row.latitude !== null && row.longitude !== null
+      isUsableCoordinate(row.latitude) && isUsableCoordinate(row.longitude)
         ? { latitude: row.latitude, longitude: row.longitude, place: row.place }
         : null,
     exif: row.exif as { make: string | null; model: string | null } | null,
