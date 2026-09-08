@@ -1,10 +1,11 @@
 import { rm, stat } from 'node:fs/promises'
 import type { AssetUploadMetadata, AssetUploadResult } from '@imogen/shared'
-import { and, eq, or, sql } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { assetFiles, assets, users } from '../db/schema.ts'
 import { conflict, quotaExceeded, unsupportedMediaType } from '../lib/errors.ts'
 import { contentHash } from './content-hash.ts'
+import { findExistingAsset } from './identity.ts'
 import type { MediaPipeline } from './pipeline.ts'
 import { toAsset } from './serialize.ts'
 import { derivativePath, hashFile, libraryPath, type StorageDriver } from './storage.ts'
@@ -233,10 +234,6 @@ export class IngestService {
    * by a concurrent duplicate upload, before `ingest` has moved the bytes into the
    * library, and `usedBytes` is still incremented outside this transaction. Both are
    * pre-existing and out of scope here.
-   *
-   * A trashed asset still counts, as it always has for the checksum: the unique index
-   * would refuse a second row anyway, and the content hash follows the same rule so the
-   * three keys cannot disagree about what "already have it" means.
    */
   private async claimIdentity(
     ownerId: string,
@@ -246,28 +243,8 @@ export class IngestService {
     return this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`ingest:${ownerId}`}))`)
 
-      // A library filled before the content hash existed can hold several twins of one
-      // photograph, so the exact-bytes row is ranked first rather than found by luck.
-      const [existing] = await tx
-        .select({ id: assets.id })
-        .from(assets)
-        .where(
-          and(
-            eq(assets.ownerId, ownerId),
-            or(
-              eq(assets.checksum, values.checksum),
-              values.contentHash ? eq(assets.contentHash, values.contentHash) : undefined,
-              values.deviceAssetId ? eq(assets.deviceAssetId, values.deviceAssetId) : undefined,
-            ),
-          ),
-        )
-        .orderBy(
-          sql`case when ${assets.checksum} = ${values.checksum} then 0
-                   when ${assets.contentHash} = ${values.contentHash ?? ''} then 1
-                   else 2 end`,
-        )
-        .limit(1)
-      if (existing) return { id: existing.id, duplicate: true }
+      const existing = await findExistingAsset(tx, ownerId, values)
+      if (existing) return { id: existing, duplicate: true }
 
       const [user] = await tx
         .select({ quotaBytes: users.quotaBytes, usedBytes: users.usedBytes })

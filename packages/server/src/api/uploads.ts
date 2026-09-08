@@ -7,10 +7,11 @@ import {
   UploadSession,
   UploadSessionCreate,
 } from '@imogen/shared'
-import { and, eq, or, sql } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { type AppEnv, requireAuth, requireScope } from '../auth/middleware.ts'
-import { assets, uploadSessions } from '../db/schema.ts'
+import { uploadSessions } from '../db/schema.ts'
 import { badRequest, conflict, notFound } from '../lib/errors.ts'
+import { findExistingAsset } from '../media/identity.ts'
 import { created, ERROR_RESPONSES, ok, security } from './openapi.ts'
 
 const SESSION_TTL_HOURS = 24
@@ -47,34 +48,19 @@ export function createUploadRoutes() {
 
       // The same two keys the client can know before sending bytes; the content hash
       // needs the bytes, so ingest checks that one after the transfer.
-      if (body.checksum || body.deviceAssetId) {
-        const [existing] = await services.db
-          .select()
-          .from(assets)
-          .where(
-            and(
-              eq(assets.ownerId, principal.user.id),
-              or(
-                body.checksum ? eq(assets.checksum, body.checksum) : undefined,
-                body.deviceAssetId ? eq(assets.deviceAssetId, body.deviceAssetId) : undefined,
-              ),
-            ),
-          )
-          .orderBy(sql`case when ${assets.checksum} = ${body.checksum ?? ''} then 0 else 1 end`)
-          .limit(1)
-        if (existing) {
-          const asset = await services.assets.get(principal.user.id, existing.id)
-          return c.json(
-            {
-              id: crypto.randomUUID(),
-              offset: body.sizeBytes,
-              sizeBytes: body.sizeBytes,
-              expiresAt: new Date().toISOString(),
-              existing: { asset, duplicate: true },
-            },
-            201,
-          )
-        }
+      const existing = await findExistingAsset(services.db, principal.user.id, body)
+      if (existing) {
+        const asset = await services.assets.get(principal.user.id, existing)
+        return c.json(
+          {
+            id: crypto.randomUUID(),
+            offset: body.sizeBytes,
+            sizeBytes: body.sizeBytes,
+            expiresAt: new Date().toISOString(),
+            existing: { asset, duplicate: true },
+          },
+          201,
+        )
       }
 
       await mkdir(services.config.uploadsDir, { recursive: true })

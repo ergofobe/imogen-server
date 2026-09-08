@@ -1,8 +1,9 @@
 import { and, eq, gt, isNull } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
-import { assets, settings } from '../db/schema.ts'
+import { assets } from '../db/schema.ts'
 import { contentHash } from '../media/content-hash.ts'
 import type { StorageDriver } from '../media/storage.ts'
+import { isDone, markDone } from './done.ts'
 import type { JobQueue } from './queue.ts'
 
 export const CONTENT_HASH_BACKFILL_JOB = 'assets.contentHashBackfill'
@@ -55,7 +56,7 @@ export function registerContentHashJobs(queue: JobQueue, deps: ContentHashJobDep
     // starts the pass again rather than calling a library backfilled that is not: a
     // second look at an asset costs one hash read and changes nothing, while a skipped
     // one keeps its null content_hash for good.
-    await markContentHashBackfillDone(deps.db)
+    await markDone(deps.db, DONE_KEY)
   })
 }
 
@@ -77,16 +78,6 @@ function pendingContentHash(db: Database, limit: number, after: string | null) {
     .limit(limit)
 }
 
-async function markContentHashBackfillDone(db: Database): Promise<void> {
-  await db
-    .insert(settings)
-    .values({ key: DONE_KEY, value: { done: true } })
-    .onConflictDoUpdate({
-      target: settings.key,
-      set: { value: { done: true }, updatedAt: new Date() },
-    })
-}
-
 /**
  * Queues the content-hash backfill, once per server. Called at boot.
  *
@@ -94,8 +85,7 @@ async function markContentHashBackfillDone(db: Database): Promise<void> {
  * has reached the end of the library that predates it.
  */
 export async function scheduleContentHashBackfill(queue: JobQueue, db: Database): Promise<boolean> {
-  const [done] = await db.select().from(settings).where(eq(settings.key, DONE_KEY)).limit(1)
-  if (done) return false
+  if (await isDone(db, DONE_KEY)) return false
 
   await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, {})
   return true
