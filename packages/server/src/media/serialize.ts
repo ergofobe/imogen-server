@@ -39,9 +39,9 @@ export function toAsset(row: AssetRow): Asset {
  * `JSON.stringify` then writes it out as `null` because JSON has no NaN literal. That
  * hands the client a location object with a null coordinate, which no port's model
  * allows, so the response fails to deserialise instead of simply arriving without a
- * location. Exported because every payload carrying coordinates has to agree on this.
+ * location.
  */
-export function isUsableCoordinate(value: number | null): value is number {
+function isUsableCoordinate(value: number | null): value is number {
   return value !== null && Number.isFinite(value)
 }
 

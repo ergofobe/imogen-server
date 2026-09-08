@@ -3,7 +3,7 @@ import { sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { assets, users } from '../db/schema.ts'
 import { createTestDatabase } from '../test/harness.ts'
-import { isUsableCoordinate, toAsset } from './serialize.ts'
+import { toAsset } from './serialize.ts'
 
 const harness = await createTestDatabase()
 const db: Database = harness.db
@@ -81,18 +81,5 @@ describe('location', () => {
     const row = await addAsset({ latitude: 38.7223, longitude: -9.1393, altitude: Number.NaN })
 
     expect(toAsset(row).location?.altitude).toBeNull()
-  })
-})
-
-describe('isUsableCoordinate', () => {
-  test('accepts a finite number, including zero', () => {
-    expect(isUsableCoordinate(0)).toBe(true)
-    expect(isUsableCoordinate(-9.1393)).toBe(true)
-  })
-
-  test('rejects the values that survive a null check but mean nothing', () => {
-    expect(isUsableCoordinate(null)).toBe(false)
-    expect(isUsableCoordinate(Number.NaN)).toBe(false)
-    expect(isUsableCoordinate(Number.POSITIVE_INFINITY)).toBe(false)
   })
 })

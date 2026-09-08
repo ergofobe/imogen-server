@@ -314,9 +314,29 @@ describe('metadata extraction', () => {
 
   /**
    * Built by hand rather than with exiftool, which normalises a rational away: the point
-   * of the fixture is the malformed denominator, and a writer that tidies it up produces
-   * a file that cannot reproduce the bug.
+   * of the fixture below is the malformed denominator, and a writer that tidies it up
+   * produces a file that cannot reproduce the bug.
+   *
+   * This case exists to keep the next one honest. Asserting only that a malformed
+   * coordinate yields no location would pass just as well if the hand-built segment
+   * stopped being read at all, so the same builder has to be shown reading back.
    */
+  test('reads a coordinate from a hand-built GPS segment', async () => {
+    const withGoodGps = join(workDir, 'gps-handbuilt.jpg')
+    await makeJpegWithGpsRationals(withGoodGps, {
+      latitude: [38, 1, 43, 1, 20, 1],
+      longitude: [12, 1, 30, 1, 0, 1],
+    })
+
+    const result = await pipeline.process(withGoodGps, {
+      mimeType: 'image/jpeg',
+      filename: 'gps-handbuilt.jpg',
+    })
+
+    expect(result.location?.latitude).toBeCloseTo(38.7222, 3)
+    expect(result.location?.longitude).toBeCloseTo(12.5, 3)
+  })
+
   test('refuses a GPS coordinate that divides by zero', async () => {
     const withBadGps = join(workDir, 'gps-nan.jpg')
     await makeJpegWithGpsRationals(withBadGps, {
