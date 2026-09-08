@@ -121,18 +121,22 @@ async function addBareAsset(overrides: Partial<typeof assets.$inferInsert> = {})
   return row!
 }
 
-async function addFace(assetId: string, personId: string, faceOwnerId = ownerId) {
-  await db.insert(faces).values({
-    assetId,
-    ownerId: faceOwnerId,
-    personId,
-    x: 0,
-    y: 0,
-    width: 10,
-    height: 10,
-    score: 0.9,
-    embedding: Array(512).fill(0),
-  })
+async function addFace(assetId: string, personId: string, faceOwnerId = ownerId, score = 0.9) {
+  const [row] = await db
+    .insert(faces)
+    .values({
+      assetId,
+      ownerId: faceOwnerId,
+      personId,
+      x: 0,
+      y: 0,
+      width: 10,
+      height: 10,
+      score,
+      embedding: Array(512).fill(0),
+    })
+    .returning({ id: faces.id })
+  return row!.id
 }
 
 async function seedOwner(): Promise<string> {
@@ -203,6 +207,150 @@ describe('forgetting a set of assets', () => {
     await service.forgetAssets([], ownerId)
 
     expect(await db.select().from(people).where(eq(people.id, orphan!.id))).toHaveLength(1)
+  })
+})
+
+/**
+ * Scanning one photograph can only change the people in that photograph, so recounting
+ * the owner's entire library afterwards rewrites thousands of rows to the values they
+ * already held. One production owner has 5,758 people and 28,320 assets: a backfill
+ * meant 28,320 full rewrites of 5,758 rows apiece, every one of them under the
+ * per-owner lock that #41 added, and every one leaving 5,758 dead tuples on a table
+ * carrying an HNSW index.
+ *
+ * Naming the people to recount is what makes that proportional to the photograph. The
+ * statements are otherwise untouched — same lock, same transaction, same visible-only
+ * join — so the constraints below have to keep holding under the narrower scope, and
+ * that is what these check.
+ */
+describe('recounting a named set of people', () => {
+  test('leaves the owner’s other people completely alone', async () => {
+    const asset = await addBareAsset()
+    const [touched] = await db.insert(people).values({ ownerId, name: 'Touched' }).returning()
+    // Deliberately wrong, and deliberately not in the scope: an unscoped recount
+    // corrects it, which is exactly the 5,758-row rewrite being removed.
+    const [bystander] = await db
+      .insert(people)
+      .values({ ownerId, name: 'Bystander', faceCount: 99 })
+      .returning()
+    await addFace(asset.id, touched!.id)
+
+    await service.refreshCounts(ownerId, [touched!.id])
+
+    const [after] = await db.select().from(people).where(eq(people.id, bystander!.id))
+    expect(after?.faceCount).toBe(99)
+    const [counted] = await db.select().from(people).where(eq(people.id, touched!.id))
+    expect(counted?.faceCount).toBe(1)
+  })
+
+  test('still deletes a named person left with no visible faces', async () => {
+    const [emptied] = await db.insert(people).values({ ownerId, name: 'Emptied' }).returning()
+    const [kept] = await db.insert(people).values({ ownerId, name: 'Kept' }).returning()
+    const asset = await addBareAsset()
+    await addFace(asset.id, kept!.id)
+
+    await service.refreshCounts(ownerId, [emptied!.id])
+
+    expect(await db.select().from(people).where(eq(people.id, emptied!.id))).toBeEmpty()
+    expect(await db.select().from(people).where(eq(people.id, kept!.id))).toHaveLength(1)
+  })
+
+  /**
+   * An empty person outside the scope survives. Scanning a photograph is no longer the
+   * thing that tidies up people it has nothing to do with — `refreshFor`, `forgetAssets`,
+   * `mergePeople` and `reassignFaces` all still sweep the whole owner.
+   */
+  test('does not delete an empty person outside the scope', async () => {
+    const [orphan] = await db.insert(people).values({ ownerId, name: 'Orphan' }).returning()
+    const [named] = await db.insert(people).values({ ownerId, name: 'Named' }).returning()
+    const asset = await addBareAsset()
+    await addFace(asset.id, named!.id)
+
+    await service.refreshCounts(ownerId, [named!.id])
+
+    expect(await db.select().from(people).where(eq(people.id, orphan!.id))).toHaveLength(1)
+  })
+
+  test('counts no vaulted or trashed photo, and deletes a person left with only those', async () => {
+    const visible = await addBareAsset()
+    const vaulted = await addBareAsset({ vaultedAt: new Date() })
+    const trashed = await addBareAsset({ deletedAt: new Date() })
+    const [person] = await db.insert(people).values({ ownerId, name: 'Seen' }).returning()
+    const [hidden] = await db.insert(people).values({ ownerId, name: 'Unseen' }).returning()
+    await addFace(visible.id, person!.id)
+    await addFace(vaulted.id, person!.id)
+    await addFace(trashed.id, person!.id)
+    await addFace(vaulted.id, hidden!.id)
+
+    await service.refreshCounts(ownerId, [person!.id, hidden!.id])
+
+    const [counted] = await db.select().from(people).where(eq(people.id, person!.id))
+    expect(counted?.faceCount).toBe(1)
+    // Every photograph they appeared in is gone from view, so they are too.
+    expect(await db.select().from(people).where(eq(people.id, hidden!.id))).toBeEmpty()
+  })
+
+  /**
+   * The cover is the highest-scoring face the owner can actually see. A better shot that
+   * has been vaulted must not win it — that would put a vaulted photograph's crop on the
+   * People page, which is the whole thing the vault is for.
+   */
+  test('covers with the highest-scoring visible face, not a better vaulted one', async () => {
+    const visible = await addBareAsset()
+    const vaulted = await addBareAsset({ vaultedAt: new Date() })
+    const [person] = await db.insert(people).values({ ownerId, name: 'Covered' }).returning()
+    await addFace(visible.id, person!.id, ownerId, 0.5)
+    const best = await addFace(visible.id, person!.id, ownerId, 0.8)
+    await addFace(vaulted.id, person!.id, ownerId, 0.99)
+
+    await service.refreshCounts(ownerId, [person!.id])
+
+    const [covered] = await db.select().from(people).where(eq(people.id, person!.id))
+    expect(covered?.coverFaceId).toBe(best)
+  })
+
+  test('recounts every person the owner has when none are named', async () => {
+    const asset = await addBareAsset()
+    const [stale] = await db
+      .insert(people)
+      .values({ ownerId, name: 'Stale', faceCount: 99 })
+      .returning()
+    await addFace(asset.id, stale!.id)
+
+    await service.refreshCounts(ownerId)
+
+    const [after] = await db.select().from(people).where(eq(people.id, stale!.id))
+    expect(after?.faceCount).toBe(1)
+  })
+
+  /**
+   * `inArray(col, [])` renders as `false`, and an empty scope must mean "no people" rather
+   * than quietly falling back to the whole owner — a scan that touched nobody would
+   * otherwise still pay for the sweep it is meant to avoid.
+   */
+  test('touches nothing at all for an empty scope', async () => {
+    const [orphan] = await db
+      .insert(people)
+      .values({ ownerId, name: 'Orphan', faceCount: 99 })
+      .returning()
+
+    await service.refreshCounts(ownerId, [])
+
+    const [after] = await db.select().from(people).where(eq(people.id, orphan!.id))
+    expect(after?.faceCount).toBe(99)
+  })
+
+  test('cannot recount another owner’s person even when their id is named', async () => {
+    const stranger = await seedOwner()
+    const [theirs] = await db
+      .insert(people)
+      .values({ ownerId: stranger, name: 'Stranger', faceCount: 99 })
+      .returning()
+
+    await service.refreshCounts(ownerId, [theirs!.id])
+
+    const [after] = await db.select().from(people).where(eq(people.id, theirs!.id))
+    expect(after?.faceCount).toBe(99)
   })
 })
 
@@ -497,6 +645,29 @@ describe.skipIf(!canRun)('detecting faces', () => {
 
     expect(await service.facesForAsset(ownerId, asset.id)).toHaveLength(1)
   })
+
+  /**
+   * The people a scan recounts are collected *before* its faces are deleted, and this is
+   * why. Re-scanning a photograph that now shows somebody else empties whoever used to be
+   * in it, and nothing else in the pass will ever mention them again — collect the ids
+   * afterwards and the emptied person is outside the scope, survives the cleanup, and
+   * lingers in the People list with a face count they no longer have.
+   */
+  test('deletes a person whose only photograph no longer shows them', async () => {
+    const photo = await addPhoto('person-a.png')
+    await service.processAsset(photo.id)
+    const before = await service.listPeople(ownerId)
+    expect(before).toHaveLength(1)
+
+    await sharp(join(FACE_FIXTURES, 'person-b.png')).toFile(
+      join(config.libraryDir, photo.originalPath),
+    )
+    await service.processAsset(photo.id)
+
+    const after = await service.listPeople(ownerId)
+    expect(after).toHaveLength(1)
+    expect(after[0]!.id).not.toBe(before[0]!.id)
+  })
 })
 
 describe.skipIf(!canRun)('grouping faces into people', () => {
@@ -685,6 +856,33 @@ describe.skipIf(!canRun)('photos with several people in them', () => {
     const stored = await db.select().from(faces)
     expect(stored).toHaveLength(3)
     expect(stored.every((f) => f.personId !== null)).toBe(true)
+  })
+
+  /**
+   * The `forgetAssets` counterpart of this ("recounting exactly once") exists because a
+   * selection can run to tens of thousands of assets. This one exists because a *library*
+   * can run to thousands of people: recounting all of them after each photograph is what
+   * made a 28,320-asset backfill rewrite 5,758 rows 28,320 times over.
+   */
+  test('recounts the people in the photograph, not the whole library', async () => {
+    const [bystander] = await db
+      .insert(people)
+      .values({ ownerId, name: 'Bystander', faceCount: 99 })
+      .returning()
+    const photo = await groupPhoto(['person-a.png', 'person-b.png'], 'together.jpg')
+    const recounts = spyOn(service, 'refreshCounts')
+
+    try {
+      await service.processAsset(photo.id)
+
+      expect(recounts).toHaveBeenCalledTimes(1)
+      expect(recounts.mock.calls[0]![1]).toHaveLength(2)
+      // Nobody in this photograph, so its recount does not rewrite them.
+      const [after] = await db.select().from(people).where(eq(people.id, bystander!.id))
+      expect(after?.faceCount).toBe(99)
+    } finally {
+      recounts.mockRestore()
+    }
   })
 
   test('vaulting a group photo removes it from everybody', async () => {

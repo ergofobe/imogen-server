@@ -132,15 +132,30 @@ export class FaceService {
 
     if (usable.length === 0) return 0
 
+    // Collected before the delete below, and that ordering is the whole point: re-scanning
+    // a photograph that now shows somebody else empties whoever used to be in it, and once
+    // their faces are gone nothing names them again. Recount them and they are cleaned up;
+    // miss them and they linger in the People list with a count they no longer have.
+    const touched = new Set(
+      (
+        await this.db
+          .selectDistinct({ personId: faces.personId })
+          .from(faces)
+          .where(eq(faces.assetId, assetId))
+      )
+        .map((row) => row.personId)
+        .filter((id): id is string => id !== null),
+    )
+
     // Re-processing a photo replaces its faces rather than duplicating them.
     await this.db.delete(faces).where(eq(faces.assetId, assetId))
 
     for (const face of usable) {
       const embedding = await embedFace(recognition, path, face)
-      await this.recordFace(asset.ownerId, assetId, face, embedding)
+      touched.add(await this.recordFace(asset.ownerId, assetId, face, embedding))
     }
 
-    await this.refreshCounts(asset.ownerId)
+    await this.refreshCounts(asset.ownerId, [...touched])
     return usable.length
   }
 
@@ -231,11 +246,27 @@ export class FaceService {
    * person being chosen and their face being written, and finally the 10s `lock_timeout`
    * taking the server down with it.
    *
-   * Serialising recounts per owner costs throughput on a backfill. It is not the reason
-   * the backfill is slow — `processAsset` calling this once per photo is — and that is
-   * worth fixing separately rather than by leaving the lock off.
+   * Serialising recounts per owner costs throughput on a backfill, which is why naming
+   * the people to recount matters. `personIds` narrows both statements to those people;
+   * omitted, every one of the owner's is recounted, which is what trash, restore, merge
+   * and reassign all want. Scanning one photograph does not: it can only change the
+   * people in that photograph, so recounting the rest rewrites thousands of rows to the
+   * values they already held. Against the production owner above that was 5,758 rows per
+   * photograph across 28,320 photographs, every rewrite leaving a dead tuple on a table
+   * carrying an HNSW index, and every one of them queued behind this lock.
+   *
+   * Narrowing is safe because both quantities are local: `face_count` and `cover_face_id`
+   * are functions of one person's own faces, and only a person with a face on the changed
+   * asset can have either of them move.
    */
-  async refreshCounts(ownerId: string): Promise<void> {
+  async refreshCounts(ownerId: string, personIds?: string[]): Promise<void> {
+    // Naming nobody means nobody — distinct from naming no one *in particular*, which is
+    // what an absent scope means. A scan that touched no person owes no recount at all.
+    if (personIds?.length === 0) return
+
+    const facesInScope = personIds ? sql`and ${inArray(sql`f.person_id`, personIds)}` : sql``
+    const peopleInScope = personIds ? sql`and ${inArray(people.id, personIds)}` : sql``
+
     await this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`faces:${ownerId}`}))`)
 
@@ -250,6 +281,7 @@ export class FaceService {
           where f.owner_id = ${ownerId}
             and a.vaulted_at is null
             and a.deleted_at is null
+            ${facesInScope}
           group by f.person_id
         ) as counted
         where ${people.id} = counted.person_id and ${people.ownerId} = ${ownerId}
@@ -259,6 +291,7 @@ export class FaceService {
       await tx.execute(sql`
         delete from ${people}
         where ${people.ownerId} = ${ownerId}
+          ${peopleInScope}
           and not exists (
             select 1 from ${faces} f
             join ${assets} a on a.id = f.asset_id
