@@ -275,6 +275,41 @@ describe('metadata extraction', () => {
     expect(result.capturedAtHasOffset).toBe(true)
   })
 
+  test.skipIf(!exiftoolAvailable)('keeps the subsecond digits EXIF stores separately', async () => {
+    const subsecond = join(workDir, 'subsecond.jpg')
+    await Bun.write(subsecond, Bun.file(jpegPath))
+    await Bun.$`exiftool -overwrite_original "-DateTimeOriginal=2026:09:03 01:07:02" "-SubSecTimeOriginal=421" "-OffsetTimeOriginal=+00:00" ${subsecond}`
+      .quiet()
+      .nothrow()
+
+    const result = await pipeline.process(subsecond, {
+      mimeType: 'image/jpeg',
+      filename: 'subsecond.jpg',
+    })
+
+    expect(result.capturedAt?.toISOString()).toBe('2026-09-03T01:07:02.421Z')
+  })
+
+  test.skipIf(!exiftoolAvailable)('refuses a capture time a camera never filled in', async () => {
+    for (const [name, written] of [
+      ['blank-date.jpg', '0000:00:00 00:00:00'],
+      // A spilled `DateTime.MinValue`. Date.UTC maps years under 100 into the 1900s, so
+      // this one reads as a perfectly plausible 1901-01-01 unless it is refused outright.
+      ['min-value-date.jpg', '0001:01:01 00:00:00'],
+    ] as const) {
+      const path = join(workDir, name)
+      await Bun.write(path, Bun.file(jpegPath))
+      await Bun.$`exiftool -overwrite_original -m ${`-DateTimeOriginal=${written}`} ${path}`
+        .quiet()
+        .nothrow()
+
+      const result = await pipeline.process(path, { mimeType: 'image/jpeg', filename: name })
+
+      // Rolling either into a real day files the photograph under a date nobody chose.
+      expect(result.capturedAt).toBeNull()
+    }
+  })
+
   test.skipIf(!exiftoolAvailable)(
     'reads a zone-less capture time as UTC whatever zone the server keeps',
     async () => {
@@ -317,6 +352,17 @@ describe('video processing', () => {
     expect(result.duration).toBeCloseTo(2, 0)
     expect(result.thumbnail).not.toBeNull()
     expect((await sharp(result.thumbnail!).metadata()).format).toBe('webp')
+  })
+
+  test("does not treat ffprobe's creation time as carrying an offset", async () => {
+    const result = await pipeline.process(videoPath, {
+      mimeType: 'video/mp4',
+      filename: 'clip.mp4',
+    })
+
+    // ffprobe prints a `Z` regardless of what the container held, so it cannot stand in
+    // for an offset the camera recorded.
+    expect(result.capturedAtHasOffset).toBe(false)
   })
 })
 

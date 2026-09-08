@@ -315,6 +315,23 @@ describe('uploading', () => {
     )
   })
 
+  test('a zone-less EXIF time still beats the file modified time', async () => {
+    const { cookie } = await signUp()
+    // No `capturedAt` field: the provisional value is the upload's mtime, which is now.
+    // An unanchored EXIF reading is a guess about the zone, but it is not a guess about
+    // the day, so it has to win here -- otherwise a scan lands in the present.
+    const photo = await makePhotoWithExif('scanned.jpg', {
+      DateTimeOriginal: '1974:06:01 14:00:00',
+    })
+
+    const uploaded = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
+    await services.queue.drain()
+
+    expect(new Date(await capturedAtOf(cookie, uploaded.asset.id)).toISOString()).toBe(
+      '1974-06-01T14:00:00.000Z',
+    )
+  })
+
   test('re-uploading the same bytes returns the original rather than a copy', async () => {
     const { cookie } = await signUp()
     const photo = await makePhoto()
