@@ -320,11 +320,15 @@ export class MediaPipeline {
       orientation: typeof parsed.Orientation === 'number' ? parsed.Orientation : null,
     }
 
-    if (typeof parsed.latitude === 'number' && typeof parsed.longitude === 'number') {
+    // `typeof NaN` is 'number', and a GPS rational with a zero denominator decodes to
+    // exactly that, so a coordinate has to be tested for a usable value rather than for a
+    // type. Storing the NaN would put a location on the row that reaches a client as a
+    // null coordinate, which its model has no room for.
+    if (Number.isFinite(parsed.latitude) && Number.isFinite(parsed.longitude)) {
       result.location = {
         latitude: parsed.latitude,
         longitude: parsed.longitude,
-        altitude: typeof parsed.GPSAltitude === 'number' ? parsed.GPSAltitude : null,
+        altitude: Number.isFinite(parsed.GPSAltitude) ? parsed.GPSAltitude : null,
         place: null,
       }
     }

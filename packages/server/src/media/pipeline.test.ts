@@ -33,6 +33,70 @@ async function makeJpeg(path: string, width = 1600, height = 1200) {
   return path
 }
 
+/**
+ * A JPEG carrying a GPS IFD whose rationals are written verbatim, so a fixture can hold
+ * numerator/denominator pairs that no EXIF writer would willingly produce.
+ */
+async function makeJpegWithGpsRationals(
+  path: string,
+  coords: { latitude: number[]; longitude: number[] },
+) {
+  const rationals = Buffer.alloc(48)
+  const words = [...coords.latitude, ...coords.longitude]
+  words.forEach((word, i) => {
+    rationals.writeUInt32LE(word, i * 4)
+  })
+
+  const gpsIfdOffset = 8 + 2 + 12 + 4 // TIFF header, then a one-entry IFD0
+  const ratOffset = gpsIfdOffset + (2 + 4 * 12 + 4)
+  const tiff = Buffer.alloc(ratOffset + rationals.length)
+
+  tiff.write('II', 0, 'ascii')
+  tiff.writeUInt16LE(42, 2)
+  tiff.writeUInt32LE(8, 4)
+
+  tiff.writeUInt16LE(1, 8)
+  tiff.writeUInt16LE(0x8825, 10) // GPSInfoIFDPointer
+  tiff.writeUInt16LE(4, 12)
+  tiff.writeUInt32LE(1, 14)
+  tiff.writeUInt32LE(gpsIfdOffset, 18)
+  tiff.writeUInt32LE(0, 22) // no IFD1
+
+  let at = gpsIfdOffset
+  tiff.writeUInt16LE(4, at)
+  at += 2
+  const entry = (tag: number, type: number, count: number, value: number | string) => {
+    tiff.writeUInt16LE(tag, at)
+    tiff.writeUInt16LE(type, at + 2)
+    tiff.writeUInt32LE(count, at + 4)
+    if (typeof value === 'string') tiff.write(value, at + 8, 'ascii')
+    else tiff.writeUInt32LE(value, at + 8)
+    at += 12
+  }
+  entry(0x0001, 2, 2, 'N\0') // GPSLatitudeRef
+  entry(0x0002, 5, 3, ratOffset) // GPSLatitude
+  entry(0x0003, 2, 2, 'E\0') // GPSLongitudeRef
+  entry(0x0004, 5, 3, ratOffset + 24) // GPSLongitude
+  tiff.writeUInt32LE(0, at)
+  rationals.copy(tiff, ratOffset)
+
+  const payload = Buffer.concat([Buffer.from('Exif\0\0', 'ascii'), tiff])
+  const app1 = Buffer.concat([
+    Buffer.from([0xff, 0xe1]),
+    Buffer.from([(payload.length + 2) >> 8, (payload.length + 2) & 0xff]),
+    payload,
+  ])
+
+  const base = await sharp({
+    create: { width: 32, height: 32, channels: 3, background: '#888' },
+  })
+    .jpeg()
+    .toBuffer()
+  // Splice the segment in directly after SOI, where a decoder expects APP1.
+  await Bun.write(path, Buffer.concat([base.subarray(0, 2), app1, base.subarray(2)]))
+  return path
+}
+
 /** Whether a command exists on this machine, so a fixture can degrade instead of lying. */
 async function hasCommand(command: string): Promise<boolean> {
   return (await Bun.spawn(['which', command], { stdout: 'ignore', stderr: 'ignore' }).exited) === 0
@@ -246,6 +310,47 @@ describe('metadata extraction', () => {
 
     expect(result.location?.latitude).toBeCloseTo(38.7223, 2)
     expect(result.location?.longitude).toBeCloseTo(-9.1393, 2)
+  })
+
+  /**
+   * Built by hand rather than with exiftool, which normalises a rational away: the point
+   * of the fixture below is the malformed denominator, and a writer that tidies it up
+   * produces a file that cannot reproduce the bug.
+   *
+   * This case exists to keep the next one honest. Asserting only that a malformed
+   * coordinate yields no location would pass just as well if the hand-built segment
+   * stopped being read at all, so the same builder has to be shown reading back.
+   */
+  test('reads a coordinate from a hand-built GPS segment', async () => {
+    const withGoodGps = join(workDir, 'gps-handbuilt.jpg')
+    await makeJpegWithGpsRationals(withGoodGps, {
+      latitude: [38, 1, 43, 1, 20, 1],
+      longitude: [12, 1, 30, 1, 0, 1],
+    })
+
+    const result = await pipeline.process(withGoodGps, {
+      mimeType: 'image/jpeg',
+      filename: 'gps-handbuilt.jpg',
+    })
+
+    expect(result.location?.latitude).toBeCloseTo(38.7222, 3)
+    expect(result.location?.longitude).toBeCloseTo(12.5, 3)
+  })
+
+  test('refuses a GPS coordinate that divides by zero', async () => {
+    const withBadGps = join(workDir, 'gps-nan.jpg')
+    await makeJpegWithGpsRationals(withBadGps, {
+      // 0/0 degrees: NaN once exifr divides it out, but still `typeof 'number'`.
+      latitude: [0, 0, 0, 1, 0, 1],
+      longitude: [12, 1, 30, 1, 0, 1],
+    })
+
+    const result = await pipeline.process(withBadGps, {
+      mimeType: 'image/jpeg',
+      filename: 'gps-nan.jpg',
+    })
+
+    expect(result.location).toBeNull()
   })
 
   test('reports no capture time rather than inventing one', async () => {

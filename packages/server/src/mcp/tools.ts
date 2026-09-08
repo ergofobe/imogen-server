@@ -1,6 +1,7 @@
 import type { OAuthScope } from '@imogen/shared'
 import { z } from 'zod'
 import type { Principal } from '../lib/context.ts'
+import { toAsset } from '../media/serialize.ts'
 import type { Services } from '../services.ts'
 
 export type ToolContext = { services: Services; principal: Principal }
@@ -286,7 +287,7 @@ export const TOOLS: Tool[] = [
       return json({
         person: person.name,
         count: filtered.length,
-        photos: filtered.map((p) => summarize(toAssetShape(p))),
+        photos: filtered.map((p) => summarize(toAsset(p))),
       })
     },
   },
@@ -342,38 +343,6 @@ function formatBytes(bytes: number): string {
     unit++
   }
   return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`
-}
-
-/** The service returns database rows; summarize() expects the API shape. */
-function toAssetShape(row: {
-  id: string
-  originalFilename: string
-  type: string
-  capturedAt: Date
-  description: string | null
-  favorite: boolean
-  width: number | null
-  height: number | null
-  latitude: number | null
-  longitude: number | null
-  place: string | null
-  exif: unknown
-}) {
-  return {
-    id: row.id,
-    originalFilename: row.originalFilename,
-    type: row.type,
-    capturedAt: row.capturedAt.toISOString(),
-    description: row.description,
-    favorite: row.favorite,
-    width: row.width,
-    height: row.height,
-    location:
-      row.latitude !== null && row.longitude !== null
-        ? { latitude: row.latitude, longitude: row.longitude, place: row.place }
-        : null,
-    exif: row.exif as { make: string | null; model: string | null } | null,
-  }
 }
 
 export const TOOLS_BY_NAME = new Map(TOOLS.map((t) => [t.name, t]))
