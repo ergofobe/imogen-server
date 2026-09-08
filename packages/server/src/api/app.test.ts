@@ -132,6 +132,45 @@ async function capturedAtOf(cookie: string, assetId: string) {
   return ((await response.json()) as { capturedAt: string }).capturedAt
 }
 
+async function checksumOf(file: File) {
+  return createHash('sha256')
+    .update(new Uint8Array(await file.arrayBuffer()))
+    .digest('hex')
+}
+
+async function deletedAtOf(assetId: string) {
+  const [row] = await harness.db
+    .select({ deletedAt: assets.deletedAt })
+    .from(assets)
+    .where(eq(assets.id, assetId))
+  return row!.deletedAt
+}
+
+/**
+ * A second row for the same photograph, the way a library that predates the content
+ * hash holds one. The checksum is unique per owner, so every caller supplies it.
+ */
+async function siblingOf(
+  row: typeof assets.$inferSelect,
+  overrides: Partial<typeof assets.$inferInsert> & { checksum: string },
+) {
+  const [inserted] = await harness.db
+    .insert(assets)
+    .values({
+      ownerId: row.ownerId,
+      type: row.type,
+      originalFilename: row.originalFilename,
+      mimeType: row.mimeType,
+      contentHash: row.contentHash,
+      sizeBytes: row.sizeBytes,
+      originalPath: row.originalPath,
+      capturedAt: row.capturedAt,
+      ...overrides,
+    })
+    .returning({ id: assets.id })
+  return inserted!.id
+}
+
 describe('health and docs', () => {
   test('health check answers without authentication', async () => {
     const response = await request('/api/v1/health')
@@ -418,37 +457,20 @@ describe('uploading', () => {
   test('the exact-bytes match wins over content twins, however many the library holds', async () => {
     // A library that predates the content hash can already hold several copies of one
     // photograph. A re-upload of one of them must come back as that one, not a sibling.
-    const { cookie, user } = await signUp()
+    const { cookie } = await signUp()
     const photo = await makePhoto()
     const first = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
     const [row] = await harness.db.select().from(assets).where(eq(assets.id, first.asset.id))
 
     const twin = await withComment(photo)
-    const twinChecksum = createHash('sha256')
-      .update(new Uint8Array(await twin.arrayBuffer()))
-      .digest('hex')
-    const sibling = (checksum: string) => ({
-      ownerId: user.id,
-      type: row!.type,
-      originalFilename: row!.originalFilename,
-      mimeType: row!.mimeType,
-      checksum,
-      contentHash: row!.contentHash,
-      sizeBytes: row!.sizeBytes,
-      originalPath: row!.originalPath,
-      capturedAt: row!.capturedAt,
-    })
-    for (let i = 0; i < 4; i++) await harness.db.insert(assets).values(sibling(`${i}`.repeat(64)))
-    const [exact] = await harness.db
-      .insert(assets)
-      .values(sibling(twinChecksum))
-      .returning({ id: assets.id })
+    for (let i = 0; i < 4; i++) await siblingOf(row!, { checksum: `${i}`.repeat(64) })
+    const exact = await siblingOf(row!, { checksum: await checksumOf(twin) })
 
     const response = await upload(cookie, twin)
     const result = (await response.json()) as { asset: { id: string }; duplicate: boolean }
 
     expect(result.duplicate).toBe(true)
-    expect(result.asset.id).toBe(exact!.id)
+    expect(result.asset.id).toBe(exact)
   })
 
   test('a video whose metadata atoms were rewritten is a duplicate', async () => {
@@ -538,31 +560,23 @@ describe('uploading', () => {
     expect(second.duplicate).toBe(true)
     expect(second.asset.id).toBe(first.asset.id)
     expect(second.asset.deletedAt).toBeNull()
-    const [row] = await harness.db
-      .select({ deletedAt: assets.deletedAt })
-      .from(assets)
-      .where(eq(assets.id, first.asset.id))
-    expect(row!.deletedAt).toBeNull()
+    expect(await deletedAtOf(first.asset.id)).toBeNull()
   })
 
   test('a metadata-rewritten twin of a trashed photograph restores it too', async () => {
     // The content hash reaches the trash the same way the checksum does (#60), so a
-    // Takeout re-export of a trashed photo must come back live as well, not as a
-    // duplicate of something about to be swept.
+    // Takeout re-export of a trashed photo must come back live as well.
     const { cookie } = await signUp()
     const photo = await makePhoto()
     const first = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
     await jsonRequest('/api/v1/assets/trash', 'POST', { assetIds: [first.asset.id] }, cookie)
 
     const response = await upload(cookie, await withComment(photo))
-    const second = (await response.json()) as {
-      asset: { id: string; deletedAt: string | null }
-      duplicate: boolean
-    }
+    const second = (await response.json()) as { asset: { id: string }; duplicate: boolean }
 
     expect(second.duplicate).toBe(true)
     expect(second.asset.id).toBe(first.asset.id)
-    expect(second.asset.deletedAt).toBeNull()
+    expect(await deletedAtOf(first.asset.id)).toBeNull()
   })
 
   test('beginning a resumable upload of a trashed photograph restores it before any bytes move', async () => {
@@ -594,71 +608,77 @@ describe('uploading', () => {
     expect(session.existing?.duplicate).toBe(true)
     expect(session.existing?.asset.id).toBe(first.asset.id)
     expect(session.existing?.asset.deletedAt).toBeNull()
-    const [row] = await harness.db
-      .select({ deletedAt: assets.deletedAt })
-      .from(assets)
-      .where(eq(assets.id, first.asset.id))
-    expect(row!.deletedAt).toBeNull()
+    expect(await deletedAtOf(first.asset.id)).toBeNull()
   })
 
   test('a live twin wins over a trashed exact copy', async () => {
     // The photograph is already in the library, live, under rewritten metadata. Restoring
     // the trashed exact-bytes row instead would hand the owner the very pair of copies
-    // #60 exists to prevent. Liveness outranks how sure the key is.
-    const { cookie, user } = await signUp()
+    // #60 exists to prevent.
+    const { cookie } = await signUp()
     const photo = await makePhoto()
-    const twin = await withComment(photo)
-    const live = (await (await upload(cookie, twin)).json()) as { asset: { id: string } }
+    const live = (await (await upload(cookie, await withComment(photo))).json()) as {
+      asset: { id: string }
+    }
     const [row] = await harness.db.select().from(assets).where(eq(assets.id, live.asset.id))
-    const exactChecksum = createHash('sha256')
-      .update(new Uint8Array(await photo.arrayBuffer()))
-      .digest('hex')
-    const [trashed] = await harness.db
-      .insert(assets)
-      .values({
-        ownerId: user.id,
-        type: row!.type,
-        originalFilename: row!.originalFilename,
-        mimeType: row!.mimeType,
-        checksum: exactChecksum,
-        contentHash: row!.contentHash,
-        sizeBytes: row!.sizeBytes,
-        originalPath: row!.originalPath,
-        capturedAt: row!.capturedAt,
-        deletedAt: new Date(),
-      })
-      .returning({ id: assets.id })
+    const trashed = await siblingOf(row!, {
+      checksum: await checksumOf(photo),
+      deletedAt: new Date(),
+    })
 
     const response = await upload(cookie, photo)
     const result = (await response.json()) as { asset: { id: string }; duplicate: boolean }
 
     expect(result.duplicate).toBe(true)
     expect(result.asset.id).toBe(live.asset.id)
-    const [still] = await harness.db
-      .select({ deletedAt: assets.deletedAt })
-      .from(assets)
-      .where(eq(assets.id, trashed!.id))
-    expect(still!.deletedAt).not.toBeNull()
+    expect(await deletedAtOf(trashed)).not.toBeNull()
+  })
+
+  test('a trashed exact copy wins over a live photograph that only shares a device asset id', async () => {
+    // Liveness settles ties between rows that hold the same photograph. A device asset id
+    // is the client's word, not the bytes; when the bytes name a photograph in the trash,
+    // that is the one the owner is asking for, whatever id the client attached.
+    const { cookie } = await signUp()
+    const photo = await makePhoto()
+    const first = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
+    const [row] = await harness.db.select().from(assets).where(eq(assets.id, first.asset.id))
+    await jsonRequest('/api/v1/assets/trash', 'POST', { assetIds: [first.asset.id] }, cookie)
+    const other = await siblingOf(row!, {
+      checksum: '9'.repeat(64),
+      contentHash: 'b'.repeat(64),
+      deviceAssetId: 'android:1:9',
+    })
+
+    const response = await upload(cookie, photo, { deviceAssetId: 'android:1:9' })
+    const result = (await response.json()) as { asset: { id: string }; duplicate: boolean }
+
+    expect(result.duplicate).toBe(true)
+    expect(result.asset.id).toBe(first.asset.id)
+    expect(await deletedAtOf(first.asset.id)).toBeNull()
+    expect(await deletedAtOf(other)).toBeNull()
   })
 
   test('a twin of a vaulted photograph answers the same on both upload paths', async () => {
     // One rule, and it is the direct path's: `duplicate: true` with the asset, whether or
-    // not the caller can see the vault. The caller is presenting the photograph's own
-    // bytes, so the vault's promise -- that knowing an id is not enough to read what was
-    // put away -- is not what is at stake. A 403 would name the vault in its message and
-    // turn a phone's backup of that photograph into a permanent failure. See #65.
+    // not the caller can see the vault. A checksum or content match is the caller holding
+    // the photograph's own bytes, so the vault's promise -- that knowing an id is not
+    // enough to read what was put away -- is not what is at stake. A 403 would name the
+    // vault in its message and turn a phone's backup of that photograph into a permanent
+    // failure. See #65.
     const { cookie } = await signUp()
     const photo = await makePhoto()
     const first = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
     await harness.db.execute(sql`update assets set vaulted_at = now() where id = ${first.asset.id}`)
 
-    const checksum = createHash('sha256')
-      .update(new Uint8Array(await photo.arrayBuffer()))
-      .digest('hex')
     const begun = await jsonRequest(
       '/api/v1/uploads',
       'POST',
-      { filename: 'photo.jpg', sizeBytes: photo.size, mimeType: 'image/jpeg', checksum },
+      {
+        filename: 'photo.jpg',
+        sizeBytes: photo.size,
+        mimeType: 'image/jpeg',
+        checksum: await checksumOf(photo),
+      },
       cookie,
     )
     const session = (await begun.json()) as {
@@ -678,6 +698,50 @@ describe('uploading', () => {
     const rows = await harness.db.select({ vaultedAt: assets.vaultedAt }).from(assets)
     expect(rows.length).toBe(1)
     expect(rows[0]!.vaultedAt).not.toBeNull()
+  })
+
+  test('a device asset id alone never reaches a vaulted photograph', async () => {
+    // A device asset id is a string the client chose, and a guess at one must not be
+    // answered with a record the vault is hiding. The fast path finds nothing and lets
+    // the bytes come. Different bytes under that id are a new photograph, stored without
+    // the id, which the vaulted row keeps under its unique index; the same bytes are the
+    // caller proving possession, and are a duplicate as anywhere else.
+    const { cookie } = await signUp()
+    const photo = await makePhoto('vaulted.jpg')
+    const fields = { deviceAssetId: 'android:1:65' }
+    const first = (await (await upload(cookie, photo, fields)).json()) as { asset: { id: string } }
+    await harness.db.execute(sql`update assets set vaulted_at = now() where id = ${first.asset.id}`)
+
+    const begun = await jsonRequest(
+      '/api/v1/uploads',
+      'POST',
+      { filename: 'edited.jpg', sizeBytes: 1234, mimeType: 'image/jpeg', ...fields },
+      cookie,
+    )
+    const session = (await begun.json()) as { offset: number; existing: unknown }
+    expect(begun.status).toBe(201)
+    expect(session.existing).toBeNull()
+    expect(session.offset).toBe(0)
+
+    const edited = await upload(cookie, await makePhoto('edited.jpg'), fields)
+    const stored = (await edited.json()) as { asset: { id: string }; duplicate: boolean }
+    expect(edited.status).toBe(201)
+    expect(stored.duplicate).toBe(false)
+    expect(stored.asset.id).not.toBe(first.asset.id)
+    const rows = await harness.db
+      .select({ id: assets.id, deviceAssetId: assets.deviceAssetId, vaultedAt: assets.vaultedAt })
+      .from(assets)
+    expect(rows.find((r) => r.id === first.asset.id)).toMatchObject({
+      deviceAssetId: 'android:1:65',
+    })
+    expect(rows.find((r) => r.id === first.asset.id)?.vaultedAt).not.toBeNull()
+    expect(rows.find((r) => r.id === stored.asset.id)?.deviceAssetId).toBeNull()
+
+    const same = await upload(cookie, photo, fields)
+    const proven = (await same.json()) as { asset: { id: string }; duplicate: boolean }
+    expect(same.status).toBe(200)
+    expect(proven.duplicate).toBe(true)
+    expect(proven.asset.id).toBe(first.asset.id)
   })
 
   test('beginning a resumable upload with a known device asset id answers without bytes', async () => {

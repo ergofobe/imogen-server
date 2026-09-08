@@ -12,6 +12,7 @@ import { type AppEnv, requireAuth, requireScope } from '../auth/middleware.ts'
 import { uploadSessions } from '../db/schema.ts'
 import { badRequest, conflict, notFound } from '../lib/errors.ts'
 import { claimExistingAsset } from '../media/identity.ts'
+import { toAsset } from '../media/serialize.ts'
 import { created, ERROR_RESPONSES, ok, security } from './openapi.ts'
 
 const SESSION_TTL_HOURS = 24
@@ -49,23 +50,19 @@ export function createUploadRoutes() {
 
       // The same two keys the client can know before sending bytes; the content hash
       // needs the bytes, so ingest checks that one after the transfer.
+      // Serialised the way the direct path serialises its duplicate, so the two paths
+      // answer alike, vault included: which matches may reach a vaulted photograph is
+      // decided in the claim, not here (#65).
       const existing = await claimExistingAsset(services.db, principal.user.id, body)
       if (existing) {
-        // The caller is presenting the photograph's own bytes, so the vault's read guard
-        // (an id alone must not be enough to see what was put away) is not what is at
-        // stake, and the direct upload path already answers with the asset. One rule on
-        // both paths; a 403 here would name the vault in its message and turn a phone's
-        // backup of that photograph into a permanent failure. See #65.
-        const asset = await services.assets.get(principal.user.id, existing, {
-          includeVaulted: true,
-        })
+        if (existing.restored) await services.faces.refreshFor(principal.user.id)
         return c.json(
           {
             id: crypto.randomUUID(),
             offset: body.sizeBytes,
             sizeBytes: body.sizeBytes,
             expiresAt: new Date().toISOString(),
-            existing: { asset, duplicate: true },
+            existing: { asset: toAsset(existing.row), duplicate: true },
           },
           201,
         )
@@ -195,13 +192,14 @@ export function createUploadRoutes() {
       // rather than refused after its bytes have all arrived.
       const metadata = AssetUploadMetadata.safeParse(row.metadata ?? {})
       try {
-        const result = await services.ingest.ingest({
+        const { restored, ...result } = await services.ingest.ingest({
           ownerId: principal.user.id,
           tempPath: row.tempPath,
           filename: row.filename,
           mimeType: row.mimeType,
           metadata: metadata.success ? metadata.data : {},
         })
+        if (restored) await services.faces.refreshFor(principal.user.id)
         return c.json(result, 201)
       } finally {
         // The session is spent either way; ingest has taken or discarded the file.

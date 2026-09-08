@@ -5,12 +5,19 @@ import type { Database } from '../db/index.ts'
 import { assetFiles, assets, users } from '../db/schema.ts'
 import { conflict, quotaExceeded, unsupportedMediaType } from '../lib/errors.ts'
 import { contentHash } from './content-hash.ts'
-import { claimExistingAsset } from './identity.ts'
+import { type AssetRow, claimExistingAsset, deviceAssetIdIsVaulted } from './identity.ts'
 import type { MediaPipeline } from './pipeline.ts'
 import { toAsset } from './serialize.ts'
 import { derivativePath, hashFile, libraryPath, type StorageDriver } from './storage.ts'
 
 export const INGEST_JOB = 'asset.ingest'
+
+/**
+ * The wire result, plus whether the match came back from the trash. The routes read
+ * that to recount people afterwards, the way the restore route does; it never leaves
+ * the server.
+ */
+export type IngestResult = AssetUploadResult & { restored: boolean }
 
 export type IngestInput = {
   ownerId: string
@@ -43,7 +50,7 @@ export class IngestService {
    * lock held only across awaits like these can never be abandoned by a client that
    * disconnects, because there is nothing left to disconnect from. See #9.
    */
-  async ingest(input: IngestInput): Promise<AssetUploadResult> {
+  async ingest(input: IngestInput): Promise<IngestResult> {
     const type = this.pipeline.classify(input.mimeType, input.filename)
     if (!type) {
       await rm(input.tempPath, { force: true })
@@ -86,7 +93,7 @@ export class IngestService {
     if (claim.duplicate) {
       // Already have this photograph. Drop the copy rather than storing it twice.
       await rm(input.tempPath, { force: true })
-      return { asset: await this.hydrate(claim.id), duplicate: true }
+      return { asset: toAsset(claim.row), duplicate: true, restored: claim.restored }
     }
 
     const assetId = claim.id
@@ -121,7 +128,7 @@ export class IngestService {
 
     await this.enqueue(INGEST_JOB, { assetId })
 
-    return { asset: await this.hydrate(assetId), duplicate: false }
+    return { asset: await this.hydrate(assetId), duplicate: false, restored: false }
   }
 
   /** Generates derivatives and fills in metadata. Runs in a worker, never on a request. */
@@ -239,12 +246,14 @@ export class IngestService {
     ownerId: string,
     size: number,
     values: Omit<typeof assets.$inferInsert, 'ownerId' | 'sizeBytes'>,
-  ): Promise<{ id: string; duplicate: boolean }> {
+  ): Promise<
+    { duplicate: true; row: AssetRow; restored: boolean } | { duplicate: false; id: string }
+  > {
     return this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`ingest:${ownerId}`}))`)
 
       const existing = await claimExistingAsset(tx, ownerId, values)
-      if (existing) return { id: existing, duplicate: true }
+      if (existing) return { duplicate: true, ...existing }
 
       const [user] = await tx
         .select({ quotaBytes: users.quotaBytes, usedBytes: users.usedBytes })
@@ -255,11 +264,18 @@ export class IngestService {
         throw quotaExceeded('This upload would exceed your storage quota')
       }
 
+      // A vaulted photograph is matched only by its bytes, so bytes that share only its
+      // device asset id are a new asset, and one that cannot carry the id while the
+      // vaulted row holds it under the unique index.
+      const deviceAssetId =
+        values.deviceAssetId && (await deviceAssetIdIsVaulted(tx, ownerId, values.deviceAssetId))
+          ? null
+          : values.deviceAssetId
       const [row] = await tx
         .insert(assets)
-        .values({ ownerId, sizeBytes: size, ...values })
+        .values({ ownerId, sizeBytes: size, ...values, deviceAssetId })
         .returning({ id: assets.id })
-      return { id: row!.id, duplicate: false }
+      return { duplicate: false, id: row!.id }
     })
   }
 

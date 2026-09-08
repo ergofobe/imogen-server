@@ -168,14 +168,17 @@ export function createAssetRoutes() {
         throw badRequest('Invalid upload metadata', fieldErrors(metadata.error))
       }
 
+      const ownerId = c.get('principal').user.id
       const tempPath = await spool(services.config.uploadsDir, file)
-      const result = await services.ingest.ingest({
-        ownerId: c.get('principal').user.id,
+      const { restored, ...result } = await services.ingest.ingest({
+        ownerId,
         tempPath,
         filename: file.name || 'upload',
         mimeType: file.type || 'application/octet-stream',
         metadata: metadata.data,
       })
+      // A photograph back from the trash has its faces still; only the counts move.
+      if (restored) await services.faces.refreshFor(ownerId)
       return c.json(result, result.duplicate ? 200 : 201)
     },
   )
