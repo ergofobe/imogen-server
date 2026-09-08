@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createApp } from './app.ts'
+import { scheduleContentHashBackfill } from './jobs/content-hash.ts'
 import { scheduleFaceRepair } from './jobs/faces.ts'
 import { scheduleMaintenance } from './jobs/maintenance.ts'
 import { loadConfig } from './lib/config.ts'
@@ -27,6 +28,13 @@ await scheduleMaintenance(services.queue)
 // and nothing re-scans a photograph already marked scanned. Runs once, then records that
 // it has.
 await scheduleFaceRepair(services.queue, services.db, services.faces)
+
+// Every asset uploaded before content_hash existed still reads as null, so a re-export
+// twin of one of them would not be recognised. Runs once, then records that it has.
+// Unattended on purpose, unlike the repairs #54 wants an administrator to start: this
+// fills a derived column from the original file and touches nothing a person can see or
+// would ever need to undo, so it is an index build, not a rewrite.
+await scheduleContentHashBackfill(services.queue, services.db)
 
 const server = Bun.serve({
   port: config.port,

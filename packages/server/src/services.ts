@@ -8,6 +8,7 @@ import { SessionService } from './auth/sessions.ts'
 import { createDatabase, type Database } from './db/index.ts'
 import { FaceService } from './faces/faces.ts'
 import { ModelStore } from './faces/models.ts'
+import { registerContentHashJobs } from './jobs/content-hash.ts'
 import { FACE_DETECT_JOB, registerFaceJobs } from './jobs/faces.ts'
 import { registerMaintenanceJobs } from './jobs/maintenance.ts'
 import { JobQueue } from './jobs/queue.ts'
@@ -90,6 +91,7 @@ export function createServices(config: Config, database?: Database): Services {
   })
   registerMaintenanceJobs(queue, { db, config, library, thumbnails, sessions, settings })
   registerFaceJobs(queue, { db, faces, models, queue })
+  registerContentHashJobs(queue, { db, storage: library })
 
   return {
     config,

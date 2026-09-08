@@ -1,9 +1,11 @@
 import { rm, stat } from 'node:fs/promises'
 import type { AssetUploadMetadata, AssetUploadResult } from '@imogen/shared'
-import { and, eq, sql } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { assetFiles, assets, users } from '../db/schema.ts'
 import { conflict, quotaExceeded, unsupportedMediaType } from '../lib/errors.ts'
+import { contentHash } from './content-hash.ts'
+import { findExistingAsset } from './identity.ts'
 import type { MediaPipeline } from './pipeline.ts'
 import { toAsset } from './serialize.ts'
 import { derivativePath, hashFile, libraryPath, type StorageDriver } from './storage.ts'
@@ -37,7 +39,7 @@ export class IngestService {
    *
    * Every await in here is server-side (hashing a temp file, a query, a filesystem
    * move); nothing waits on the client, whose bytes are already fully spooled to
-   * `input.tempPath` by the time this runs. That matters for `claimChecksum`, below: a
+   * `input.tempPath` by the time this runs. That matters for `claimIdentity`, below: a
    * lock held only across awaits like these can never be abandoned by a client that
    * disconnects, because there is nothing left to disconnect from. See #9.
    */
@@ -48,8 +50,11 @@ export class IngestService {
       throw unsupportedMediaType(`imogen cannot store "${input.filename}"`)
     }
 
-    const checksum = await hashFile(input.tempPath)
-    const { size } = await stat(input.tempPath)
+    const [checksum, content, { size }] = await Promise.all([
+      hashFile(input.tempPath),
+      contentHash(input.tempPath),
+      stat(input.tempPath),
+    ])
 
     // Capture time is provisional until the pipeline reads EXIF, but the library path
     // depends on it, so use the best guess available now. Whether it came from the client
@@ -59,7 +64,9 @@ export class IngestService {
       ? new Date(fromClient)
       : await fileModifiedTime(input.tempPath)
 
-    const claim = await this.claimChecksum(input.ownerId, checksum, size, {
+    const claim = await this.claimIdentity(input.ownerId, size, {
+      checksum,
+      contentHash: content,
       type,
       status: 'pending',
       originalFilename: input.metadata.filename ?? input.filename,
@@ -77,7 +84,7 @@ export class IngestService {
     })
 
     if (claim.duplicate) {
-      // Already have these exact bytes. Drop the copy rather than storing it twice.
+      // Already have this photograph. Drop the copy rather than storing it twice.
       await rm(input.tempPath, { force: true })
       return { asset: await this.hydrate(claim.id), duplicate: true }
     }
@@ -201,15 +208,24 @@ export class IngestService {
   }
 
   /**
-   * Finds the existing asset for this checksum, or reserves one, atomically.
+   * Finds the asset the owner already has for this upload, or reserves one, atomically.
    *
-   * Two uploads of the same file arriving together must not both pass the dedup check
-   * and both insert — one would then trip the unique index and fail outright instead of
-   * coming back a tidy `duplicate: true`. A per-checksum advisory lock serialises that
-   * narrow window, the same pattern `FaceService.recordFace` uses for a per-owner one.
+   * Three things identify an upload as a photograph already in the library, checked in
+   * order of confidence: the file checksum (the same bytes), the content hash (the same
+   * media payload under rewritten metadata — every export pipeline does this, see #60),
+   * and the client's own device asset id (a re-sent id is the client saying "this is
+   * that one", even when it has edited the file since, see #61). Refusing the last with
+   * a 409 was rejected: a reinstalled phone app would retry it forever.
+   *
+   * Two uploads arriving together must not both pass those checks and both insert — one
+   * would then trip a unique index and fail outright instead of coming back a tidy
+   * `duplicate: true`, and for the content hash, which is deliberately not unique, both
+   * would land. A per-owner advisory lock serialises that narrow window, the same
+   * pattern `FaceService.recordFace` uses; it is per owner rather than per key because
+   * one upload now claims three keys at once.
    *
    * The lock lives entirely inside this transaction, alongside the quota check and the
-   * insert it guards — three quick queries, nothing else. `lock_timeout` and
+   * insert it guards — a few quick queries, nothing else. `lock_timeout` and
    * `statement_timeout` on the pool (see `db/index.ts`) bound how long a caller waits
    * here even if that invariant is ever broken by a future change.
    *
@@ -219,21 +235,16 @@ export class IngestService {
    * library, and `usedBytes` is still incremented outside this transaction. Both are
    * pre-existing and out of scope here.
    */
-  private async claimChecksum(
+  private async claimIdentity(
     ownerId: string,
-    checksum: string,
     size: number,
-    values: Omit<typeof assets.$inferInsert, 'ownerId' | 'checksum' | 'sizeBytes'>,
+    values: Omit<typeof assets.$inferInsert, 'ownerId' | 'sizeBytes'>,
   ): Promise<{ id: string; duplicate: boolean }> {
     return this.db.transaction(async (tx) => {
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${checksum}))`)
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`ingest:${ownerId}`}))`)
 
-      const [existing] = await tx
-        .select({ id: assets.id })
-        .from(assets)
-        .where(and(eq(assets.ownerId, ownerId), eq(assets.checksum, checksum)))
-        .limit(1)
-      if (existing) return { id: existing.id, duplicate: true }
+      const existing = await findExistingAsset(tx, ownerId, values)
+      if (existing) return { id: existing, duplicate: true }
 
       const [user] = await tx
         .select({ quotaBytes: users.quotaBytes, usedBytes: users.usedBytes })
@@ -246,7 +257,7 @@ export class IngestService {
 
       const [row] = await tx
         .insert(assets)
-        .values({ ownerId, checksum, sizeBytes: size, ...values })
+        .values({ ownerId, sizeBytes: size, ...values })
         .returning({ id: assets.id })
       return { id: row!.id, duplicate: false }
     })

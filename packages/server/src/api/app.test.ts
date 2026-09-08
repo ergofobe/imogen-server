@@ -89,6 +89,36 @@ async function makePhotoWithExif(name: string, tags: Record<string, string>) {
   return new File([new Uint8Array(buffer)], name, { type: 'image/jpeg' })
 }
 
+/** The same JPEG with a COM segment after SOI: new checksum, same photograph. */
+async function withComment(file: File) {
+  const bytes = new Uint8Array(await file.arrayBuffer())
+  const text = Buffer.from('rewritten by an export pipeline')
+  const segment = Buffer.concat([Buffer.from([0xff, 0xfe, 0, text.length + 2]), text])
+  return new File([Buffer.concat([bytes.subarray(0, 2), segment, bytes.subarray(2)])], file.name, {
+    type: file.type,
+  })
+}
+
+function box(type: string, payload: Uint8Array) {
+  const header = Buffer.alloc(8)
+  header.writeUInt32BE(payload.length + 8, 0)
+  header.write(type, 4, 'ascii')
+  return Buffer.concat([header, payload])
+}
+
+/**
+ * A minimal ISO-BMFF file: what changes between a phone's MP4 and Google's re-export is
+ * the `udta` atom inside `moov`, never `mdat`, so the fixture makes only that vary.
+ */
+function makeVideo(mdat: Uint8Array, userData: string) {
+  const bytes = Buffer.concat([
+    box('ftyp', Buffer.from('isom\0\0\0\0isommp42', 'ascii')),
+    box('moov', box('udta', Buffer.from(userData))),
+    box('mdat', mdat),
+  ])
+  return new File([bytes], 'clip.mp4', { type: 'video/mp4' })
+}
+
 async function upload(cookie: string, file: File, fields: Record<string, string> = {}) {
   const form = new FormData()
   form.set('file', file)
@@ -346,7 +376,7 @@ describe('uploading', () => {
   })
 
   test('two uploads of the same bytes racing each other still produce one asset', async () => {
-    // The advisory lock in claimChecksum is what keeps this from becoming a unique-index
+    // The advisory lock in claimIdentity is what keeps this from becoming a unique-index
     // violation on the loser rather than a tidy `duplicate: true`. See #9.
     const { cookie } = await signUp()
     const photo = await makePhoto()
@@ -368,7 +398,155 @@ describe('uploading', () => {
     expect(rows.length).toBe(1)
   })
 
-  test('a quota rejection rolls back cleanly and releases the checksum lock', async () => {
+  test('a metadata-only rewrite of a photo the owner already has is a duplicate', async () => {
+    // Google Photos, iCloud and WhatsApp all re-serialise the metadata container on export
+    // and leave the scan data alone, so the file checksum changes and the photograph does
+    // not. See #60.
+    const { cookie } = await signUp()
+    const photo = await makePhoto()
+    const first = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
+
+    const response = await upload(cookie, await withComment(photo))
+    const second = (await response.json()) as { asset: { id: string }; duplicate: boolean }
+
+    expect(response.status).toBe(200)
+    expect(second.duplicate).toBe(true)
+    expect(second.asset.id).toBe(first.asset.id)
+    expect((await harness.db.select({ id: assets.id }).from(assets)).length).toBe(1)
+  })
+
+  test('the exact-bytes match wins over content twins, however many the library holds', async () => {
+    // A library that predates the content hash can already hold several copies of one
+    // photograph. A re-upload of one of them must come back as that one, not a sibling.
+    const { cookie, user } = await signUp()
+    const photo = await makePhoto()
+    const first = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
+    const [row] = await harness.db.select().from(assets).where(eq(assets.id, first.asset.id))
+
+    const twin = await withComment(photo)
+    const twinChecksum = createHash('sha256')
+      .update(new Uint8Array(await twin.arrayBuffer()))
+      .digest('hex')
+    const sibling = (checksum: string) => ({
+      ownerId: user.id,
+      type: row!.type,
+      originalFilename: row!.originalFilename,
+      mimeType: row!.mimeType,
+      checksum,
+      contentHash: row!.contentHash,
+      sizeBytes: row!.sizeBytes,
+      originalPath: row!.originalPath,
+      capturedAt: row!.capturedAt,
+    })
+    for (let i = 0; i < 4; i++) await harness.db.insert(assets).values(sibling(`${i}`.repeat(64)))
+    const [exact] = await harness.db
+      .insert(assets)
+      .values(sibling(twinChecksum))
+      .returning({ id: assets.id })
+
+    const response = await upload(cookie, twin)
+    const result = (await response.json()) as { asset: { id: string }; duplicate: boolean }
+
+    expect(result.duplicate).toBe(true)
+    expect(result.asset.id).toBe(exact!.id)
+  })
+
+  test('a video whose metadata atoms were rewritten is a duplicate', async () => {
+    const { cookie } = await signUp()
+    const payload = randomBytes(4096)
+    const first = (await (await upload(cookie, makeVideo(payload, 'phone'))).json()) as {
+      asset: { id: string }
+    }
+
+    const response = await upload(cookie, makeVideo(payload, 'google filled in a location'))
+    const second = (await response.json()) as { asset: { id: string }; duplicate: boolean }
+
+    expect(response.status).toBe(200)
+    expect(second.duplicate).toBe(true)
+    expect(second.asset.id).toBe(first.asset.id)
+  })
+
+  test('two twins that differ only in metadata racing each other still produce one asset', async () => {
+    const { cookie } = await signUp()
+    const photo = await makePhoto()
+
+    const [a, b] = await Promise.all([
+      upload(cookie, photo),
+      upload(cookie, await withComment(photo)),
+    ])
+    type UploadBody = { asset: { id: string }; duplicate: boolean }
+    const [first, second] = (await Promise.all([a.json(), b.json()])) as [UploadBody, UploadBody]
+
+    expect([first.duplicate, second.duplicate].sort()).toEqual([false, true])
+    expect(first.asset.id).toBe(second.asset.id)
+    expect((await harness.db.select({ id: assets.id }).from(assets)).length).toBe(1)
+  })
+
+  test('re-sending a device asset id with different bytes returns the existing asset', async () => {
+    // A reinstalled phone app has lost its ledger and re-sends every MediaStore id. A file
+    // edited in place since then has a new checksum under the old id; the id is the
+    // client's own statement that this is the same asset. See #61.
+    const { cookie } = await signUp()
+    const first = (await (
+      await upload(cookie, await makePhoto('before.jpg'), { deviceAssetId: 'android:1:42' })
+    ).json()) as { asset: { id: string } }
+
+    const response = await upload(cookie, await makePhoto('after.jpg'), {
+      deviceAssetId: 'android:1:42',
+    })
+    const second = (await response.json()) as { asset: { id: string }; duplicate: boolean }
+
+    expect(response.status).toBe(200)
+    expect(second.duplicate).toBe(true)
+    expect(second.asset.id).toBe(first.asset.id)
+    expect((await harness.db.select({ id: assets.id }).from(assets)).length).toBe(1)
+  })
+
+  test('two uploads racing on one device asset id still produce one asset', async () => {
+    const { cookie } = await signUp()
+    const fields = { deviceAssetId: 'android:1:7' }
+
+    const [a, b] = await Promise.all([
+      upload(cookie, await makePhoto('one.jpg'), fields),
+      upload(cookie, await makePhoto('two.jpg'), fields),
+    ])
+    type UploadBody = { asset: { id: string }; duplicate: boolean }
+    const [first, second] = (await Promise.all([a.json(), b.json()])) as [UploadBody, UploadBody]
+
+    expect([first.duplicate, second.duplicate].sort()).toEqual([false, true])
+    expect(first.asset.id).toBe(second.asset.id)
+    expect((await harness.db.select({ id: assets.id }).from(assets)).length).toBe(1)
+  })
+
+  test('beginning a resumable upload with a known device asset id answers without bytes', async () => {
+    const { cookie } = await signUp()
+    const first = (await (
+      await upload(cookie, await makePhoto(), { deviceAssetId: 'android:1:9' })
+    ).json()) as { asset: { id: string } }
+
+    const response = await jsonRequest(
+      '/api/v1/uploads',
+      'POST',
+      {
+        filename: 'edited.jpg',
+        sizeBytes: 1234,
+        mimeType: 'image/jpeg',
+        deviceAssetId: 'android:1:9',
+      },
+      cookie,
+    )
+    const session = (await response.json()) as {
+      offset: number
+      existing: { asset: { id: string }; duplicate: boolean } | null
+    }
+
+    expect(response.status).toBe(201)
+    expect(session.offset).toBe(1234)
+    expect(session.existing?.duplicate).toBe(true)
+    expect(session.existing?.asset.id).toBe(first.asset.id)
+  })
+
+  test('a quota rejection rolls back cleanly and releases the ingest lock', async () => {
     const { cookie, user } = await signUp()
     await harness.db.update(users).set({ quotaBytes: 1 }).where(eq(users.id, user.id))
 
@@ -378,7 +556,7 @@ describe('uploading', () => {
     const rows = await harness.db.select({ id: assets.id }).from(assets)
     expect(rows.length).toBe(0)
 
-    // If claimChecksum's transaction failed to roll back, or left the advisory lock
+    // If claimIdentity's transaction failed to roll back, or left the advisory lock
     // held, a later upload would hang rather than simply succeed once quota allows it.
     await harness.db.update(users).set({ quotaBytes: null }).where(eq(users.id, user.id))
     const accepted = await upload(cookie, await makePhoto('second.jpg'))

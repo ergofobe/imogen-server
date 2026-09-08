@@ -9,8 +9,9 @@ import {
 } from '@imogen/shared'
 import { and, eq } from 'drizzle-orm'
 import { type AppEnv, requireAuth, requireScope } from '../auth/middleware.ts'
-import { assets, uploadSessions } from '../db/schema.ts'
+import { uploadSessions } from '../db/schema.ts'
 import { badRequest, conflict, notFound } from '../lib/errors.ts'
+import { findExistingAsset } from '../media/identity.ts'
 import { created, ERROR_RESPONSES, ok, security } from './openapi.ts'
 
 const SESSION_TTL_HOURS = 24
@@ -45,25 +46,21 @@ export function createUploadRoutes() {
       const principal = c.get('principal')
       const body = c.req.valid('json')
 
-      if (body.checksum) {
-        const [existing] = await services.db
-          .select()
-          .from(assets)
-          .where(and(eq(assets.ownerId, principal.user.id), eq(assets.checksum, body.checksum)))
-          .limit(1)
-        if (existing) {
-          const asset = await services.assets.get(principal.user.id, existing.id)
-          return c.json(
-            {
-              id: crypto.randomUUID(),
-              offset: body.sizeBytes,
-              sizeBytes: body.sizeBytes,
-              expiresAt: new Date().toISOString(),
-              existing: { asset, duplicate: true },
-            },
-            201,
-          )
-        }
+      // The same two keys the client can know before sending bytes; the content hash
+      // needs the bytes, so ingest checks that one after the transfer.
+      const existing = await findExistingAsset(services.db, principal.user.id, body)
+      if (existing) {
+        const asset = await services.assets.get(principal.user.id, existing)
+        return c.json(
+          {
+            id: crypto.randomUUID(),
+            offset: body.sizeBytes,
+            sizeBytes: body.sizeBytes,
+            expiresAt: new Date().toISOString(),
+            existing: { asset, duplicate: true },
+          },
+          201,
+        )
       }
 
       await mkdir(services.config.uploadsDir, { recursive: true })

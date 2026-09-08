@@ -1,8 +1,9 @@
 import { and, eq, gt, isNull, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
-import { assets, faces, settings } from '../db/schema.ts'
+import { assets, faces } from '../db/schema.ts'
 import type { FaceService } from '../faces/faces.ts'
 import type { ModelStore } from '../faces/models.ts'
+import { isDone, markDone } from './done.ts'
 import type { JobQueue } from './queue.ts'
 
 export const FACE_DETECT_JOB = 'faces.detect'
@@ -111,7 +112,7 @@ export function registerFaceJobs(queue: JobQueue, deps: FaceJobDeps): void {
     // starts the pass again rather than calling a library repaired that is not: a second
     // look at a photograph costs one detection run and changes nothing, while a skipped
     // one keeps its stale faces for good.
-    await markRepairDone(deps.db)
+    await markDone(deps.db, REPAIR_DONE_KEY)
   })
 }
 
@@ -139,16 +140,6 @@ export function assetsWithFaces(db: Database, limit: number, after: string | nul
     .limit(limit)
 }
 
-async function markRepairDone(db: Database): Promise<void> {
-  await db
-    .insert(settings)
-    .values({ key: REPAIR_DONE_KEY, value: { done: true } })
-    .onConflictDoUpdate({
-      target: settings.key,
-      set: { value: { done: true }, updatedAt: new Date() },
-    })
-}
-
 /**
  * Queues the stale-face repair, once per server. Called at boot.
  *
@@ -165,8 +156,7 @@ export async function scheduleFaceRepair(
   if (!(await faces.isEnabled())) return false
   if (!(await faces.modelsReady())) return false
 
-  const [done] = await db.select().from(settings).where(eq(settings.key, REPAIR_DONE_KEY)).limit(1)
-  if (done) return false
+  if (await isDone(db, REPAIR_DONE_KEY)) return false
 
   await queue.enqueue(FACE_REPAIR_JOB, {})
   return true
