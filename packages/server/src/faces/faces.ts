@@ -131,7 +131,11 @@ export class FaceService {
     // A confirmed face is a human's decision about who is in the photo; matching it back
     // to a detection by geometry, rather than by re-clustering its embedding, lets the
     // machine refresh where the face is and what it looks like without ever touching who
-    // it says it is.
+    // it says it is. One that matches no detection is in neither list and stays exactly
+    // as it is: the detector missing a face it once found — a tuned threshold, a
+    // different model, a heavier crop — is far more common than a person genuinely
+    // leaving a photograph, and a human can unassign it; the machine cannot know better
+    // than the human who said it was there.
     const { pairs, unmatched } = matchBoxes(confirmed, usable)
 
     // Re-processing a photo replaces its unconfirmed faces rather than duplicating them —
@@ -151,10 +155,6 @@ export class FaceService {
       }
     }
 
-    // A confirmed face that matched nothing stays exactly as it is. The detector missing
-    // a face it once found — a tuned threshold, a different model, a heavier crop — is far
-    // more common than a person genuinely leaving a photograph, and a human can unassign
-    // it; the machine cannot know better than the human who said it was there.
     for (const face of unmatched) {
       const embedding = await embedFace(recognition, path, face)
       touched.add(await this.recordFace(asset.ownerId, assetId, face, embedding))

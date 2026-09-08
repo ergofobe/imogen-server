@@ -5,32 +5,36 @@
  * exercise the matching logic without Postgres or the detector's weights on disk.
  */
 
+/** Corners, `[x1, y1, x2, y2]` — the form the detector emits. */
+export type Corners = [number, number, number, number]
+/** A stored face's box: origin and size, as the `faces` table keeps it. */
 export type Box = { x: number; y: number; width: number; height: number }
-type Detection = { box: [number, number, number, number] }
+type Detection = { box: Corners }
 
 /**
- * The overlap fraction below which two boxes are treated as different faces. 0.5 is the
- * threshold `detect.ts` already uses to collapse duplicate detections of one face, for the
- * same reason: a face that moved a little between scans still shares most of its box with
- * itself, while two different faces rarely do.
+ * The overlap fraction below which a stored face and a detection are treated as different
+ * faces. A face that moved a little between scans — a re-decoded original, a slightly
+ * different detector — still shares most of its box with itself, while two faces in one
+ * photograph almost never do. Higher than the 0.4 non-max suppression uses in `detect.ts`
+ * on purpose: that pass is collapsing duplicates of one detection, whereas a wrong match
+ * here would hand a human's identification to somebody else's face.
  */
 export const MATCH_IOU_THRESHOLD = 0.5
 
-/** Intersection over union of two axis-aligned boxes; 0 when they do not overlap. */
-export function iou(a: Box, b: Box): number {
-  const x1 = Math.max(a.x, b.x)
-  const y1 = Math.max(a.y, b.y)
-  const x2 = Math.min(a.x + a.width, b.x + b.width)
-  const y2 = Math.min(a.y + a.height, b.y + b.height)
-
+/** Intersection over union of two boxes; 0 when they do not overlap. */
+export function iou(a: Corners, b: Corners): number {
+  const x1 = Math.max(a[0], b[0])
+  const y1 = Math.max(a[1], b[1])
+  const x2 = Math.min(a[2], b[2])
+  const y2 = Math.min(a[3], b[3])
   const overlap = Math.max(0, x2 - x1) * Math.max(0, y2 - y1)
-  const areaA = a.width * a.height
-  const areaB = b.width * b.height
+  const areaA = (a[2] - a[0]) * (a[3] - a[1])
+  const areaB = (b[2] - b[0]) * (b[3] - b[1])
   return overlap / (areaA + areaB - overlap)
 }
 
-function toBox(box: [number, number, number, number]): Box {
-  return { x: box[0], y: box[1], width: box[2] - box[0], height: box[3] - box[1] }
+export function corners(box: Box): Corners {
+  return [box.x, box.y, box.x + box.width, box.y + box.height]
 }
 
 /**
@@ -46,7 +50,7 @@ export function matchBoxes<C extends Box, D extends Detection>(
   const candidates: Array<{ ci: number; di: number; score: number }> = []
   for (let ci = 0; ci < confirmed.length; ci++) {
     for (let di = 0; di < detected.length; di++) {
-      const score = iou(confirmed[ci]!, toBox(detected[di]!.box))
+      const score = iou(corners(confirmed[ci]!), detected[di]!.box)
       if (score >= threshold) candidates.push({ ci, di, score })
     }
   }
