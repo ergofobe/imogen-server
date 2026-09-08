@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createApp } from './app.ts'
+import { scheduleFaceRepair } from './jobs/faces.ts'
 import { scheduleMaintenance } from './jobs/maintenance.ts'
 import { loadConfig } from './lib/config.ts'
 import { createServices } from './services.ts'
@@ -21,6 +22,11 @@ await services.queue.reclaimStale()
 
 services.queue.start()
 await scheduleMaintenance(services.queue)
+
+// A library that lost faces before the server learned to clear them still carries them,
+// and nothing re-scans a photograph already marked scanned. Runs once, then records that
+// it has.
+await scheduleFaceRepair(services.queue, services.db, services.faces)
 
 const server = Bun.serve({
   port: config.port,

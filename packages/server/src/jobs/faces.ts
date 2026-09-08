@@ -1,6 +1,6 @@
-import { and, eq, isNull, sql } from 'drizzle-orm'
+import { and, eq, gt, isNull, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
-import { assets } from '../db/schema.ts'
+import { assets, faces, settings } from '../db/schema.ts'
 import type { FaceService } from '../faces/faces.ts'
 import type { ModelStore } from '../faces/models.ts'
 import type { JobQueue } from './queue.ts'
@@ -8,9 +8,20 @@ import type { JobQueue } from './queue.ts'
 export const FACE_DETECT_JOB = 'faces.detect'
 export const FACE_BACKFILL_JOB = 'faces.backfill'
 export const FACE_MODELS_JOB = 'faces.downloadModels'
+export const FACE_REPAIR_JOB = 'faces.repairStale'
+
+/** Set once the repair pass below has walked the whole library. */
+const REPAIR_DONE_KEY = 'faces.staleRepairDone'
 
 /** How many photos one backfill pass queues before scheduling the next. */
 const BACKFILL_BATCH = 200
+
+/**
+ * How many photos one repair pass re-checks before scheduling the next. Smaller than a
+ * backfill batch because this one *runs* detection rather than queueing it: the batch is
+ * the unit of work, not the unit of scheduling.
+ */
+const REPAIR_BATCH = 50
 
 /** How long a photo waits between checks while the models are still downloading. */
 const MODEL_WAIT_SECONDS = 30
@@ -74,6 +85,91 @@ export function registerFaceJobs(queue: JobQueue, deps: FaceJobDeps): void {
       await queue.enqueue(FACE_BACKFILL_JOB, {})
     }
   })
+
+  /**
+   * Walks the photographs that carry faces and asks each whether it still has any,
+   * removing the ones that do not.
+   *
+   * A one-off for libraries that accumulated stale faces before `processAsset` learned to
+   * clear them. Paged on asset id rather than an offset: the pass removes faces as it
+   * goes, so an offset into "assets with faces" would shift underneath it and skip rows.
+   */
+  queue.register(FACE_REPAIR_JOB, async (payload) => {
+    if (!(await deps.faces.isEnabled())) return
+    if (!(await deps.faces.modelsReady())) return
+
+    const after = typeof payload.after === 'string' ? payload.after : null
+    const batch = await assetsWithFaces(deps.db, REPAIR_BATCH, after)
+    for (const asset of batch) await deps.faces.recheckAsset(asset.id)
+
+    if (batch.length === REPAIR_BATCH) {
+      await queue.enqueue(FACE_REPAIR_JOB, { after: batch[batch.length - 1]!.id })
+      return
+    }
+
+    // Marked only now, at the end of the walk. A server that restarts partway through
+    // starts the pass again rather than calling a library repaired that is not: a second
+    // look at a photograph costs one detection run and changes nothing, while a skipped
+    // one keeps its stale faces for good.
+    await markRepairDone(deps.db)
+  })
+}
+
+/**
+ * Photos that have faces on record, in id order from `after`.
+ *
+ * Vaulted and trashed photos are left out for the same reason the backfill leaves them
+ * out: this pass must not be the thing that opens them.
+ */
+export function assetsWithFaces(db: Database, limit: number, after: string | null) {
+  return db
+    .selectDistinct({ id: assets.id })
+    .from(assets)
+    .innerJoin(faces, eq(faces.assetId, assets.id))
+    .where(
+      and(
+        eq(assets.type, 'image'),
+        eq(assets.status, 'ready'),
+        isNull(assets.deletedAt),
+        isNull(assets.vaultedAt),
+        after ? gt(assets.id, after) : undefined,
+      ),
+    )
+    .orderBy(assets.id)
+    .limit(limit)
+}
+
+async function markRepairDone(db: Database): Promise<void> {
+  await db
+    .insert(settings)
+    .values({ key: REPAIR_DONE_KEY, value: { done: true } })
+    .onConflictDoUpdate({
+      target: settings.key,
+      set: { value: { done: true }, updatedAt: new Date() },
+    })
+}
+
+/**
+ * Queues the stale-face repair, once per server. Called at boot.
+ *
+ * Nothing re-scans a photograph whose `facesScannedAt` is stamped, so a library that lost
+ * faces before the fix keeps them until something goes looking. There is no point looking
+ * before face grouping is on and the models have arrived — a server that enables it later
+ * picks the pass up at its next boot.
+ */
+export async function scheduleFaceRepair(
+  queue: JobQueue,
+  db: Database,
+  faces: FaceService,
+): Promise<boolean> {
+  if (!(await faces.isEnabled())) return false
+  if (!(await faces.modelsReady())) return false
+
+  const [done] = await db.select().from(settings).where(eq(settings.key, REPAIR_DONE_KEY)).limit(1)
+  if (done) return false
+
+  await queue.enqueue(FACE_REPAIR_JOB, {})
+  return true
 }
 
 /**

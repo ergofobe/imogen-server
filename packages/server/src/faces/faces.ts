@@ -119,31 +119,11 @@ export class FaceService {
 
     const { detection, recognition } = await this.ready()
     const path = this.originalPath(asset.originalPath)
-
-    const { faces: found } = await detect(detection, path, CLUSTER.minDetectionScore)
-    const usable = found.filter(
-      (f) =>
-        f.box[2] - f.box[0] >= CLUSTER.minFaceSize && f.box[3] - f.box[1] >= CLUSTER.minFaceSize,
-    )
+    const usable = await this.detectUsable(detection, path)
 
     // A landscape with no faces in it has still been looked at, and must not come back
     // round on the next backfill.
     await this.db.update(assets).set({ facesScannedAt: new Date() }).where(eq(assets.id, assetId))
-
-    // Collected before the delete below, and that ordering is the whole point: re-scanning
-    // a photograph that now shows somebody else empties whoever used to be in it, and once
-    // their faces are gone nothing names them again. Recount them and they are cleaned up;
-    // miss them and they linger in the People list with a count they no longer have.
-    const touched = new Set(
-      (
-        await this.db
-          .selectDistinct({ personId: faces.personId })
-          .from(faces)
-          .where(eq(faces.assetId, assetId))
-      )
-        .map((row) => row.personId)
-        .filter((id): id is string => id !== null),
-    )
 
     // Re-processing a photo replaces its faces rather than duplicating them — including
     // when the replacement is nothing at all. This used to sit below an early return on
@@ -151,7 +131,7 @@ export class FaceService {
     // for ever: an edited photo, a tuned threshold or a new detector all land here.
     // Nothing below needs a guard of its own — no faces means no embeddings to file, and
     // an empty set of people to recount is one `refreshCounts` declines to open.
-    await this.db.delete(faces).where(eq(faces.assetId, assetId))
+    const touched = await this.clearFaces(assetId)
 
     for (const face of usable) {
       const embedding = await embedFace(recognition, path, face)
@@ -160,6 +140,66 @@ export class FaceService {
 
     await this.refreshCounts(asset.ownerId, [...touched])
     return usable.length
+  }
+
+  /**
+   * Removes a photo's faces and names the people who were in them.
+   *
+   * One statement rather than a select and then a delete: whoever loses their last face
+   * here has to be recounted afterwards or they linger in the People list with a count
+   * they no longer have, and once the rows are gone nothing names them. `returning` makes
+   * "which people did this affect" a property of the delete itself, so the two cannot
+   * drift apart.
+   */
+  private async clearFaces(assetId: string): Promise<Set<string>> {
+    const removed = await this.db
+      .delete(faces)
+      .where(eq(faces.assetId, assetId))
+      .returning({ personId: faces.personId })
+
+    return new Set(removed.map((row) => row.personId).filter((id): id is string => id !== null))
+  }
+
+  /** The faces in an image that are big enough to be worth embedding. */
+  private async detectUsable(detection: ort.InferenceSession, path: string) {
+    const { faces: found } = await detect(detection, path, CLUSTER.minDetectionScore)
+    return found.filter(
+      (f) =>
+        f.box[2] - f.box[0] >= CLUSTER.minFaceSize && f.box[3] - f.box[1] >= CLUSTER.minFaceSize,
+    )
+  }
+
+  /**
+   * Asks one photograph whether it still contains the faces on record for it, and removes
+   * them if it does not. Reports whether anything was repaired.
+   *
+   * This is the repair for libraries that lost faces before `processAsset` learned to
+   * clear them, and it deliberately stops at detection. Re-scanning would be the obvious
+   * repair and is the wrong one: `processAsset` deletes an asset's faces and re-files them
+   * from scratch, so every row comes back `confirmed: false` and is re-clustered by
+   * centroid — undoing each merge and reassignment a human made on that photograph, which
+   * is the exact thing `confirmed` exists to prevent. A repair that costs somebody their
+   * corrections is worse than the stale faces it removes.
+   *
+   * So a photograph that still has faces is not written to at all, and one that has lost
+   * them keeps no embedding work either: detection alone settles it.
+   */
+  async recheckAsset(assetId: string): Promise<boolean> {
+    if (!(await this.isEnabled())) return false
+
+    const [asset] = await this.db.select().from(assets).where(eq(assets.id, assetId)).limit(1)
+    if (!asset || asset.vaultedAt || asset.deletedAt || asset.type !== 'image') return false
+    if (asset.status !== 'ready') return false
+
+    const { detection } = await this.ready()
+    const usable = await this.detectUsable(detection, this.originalPath(asset.originalPath))
+    if (usable.length > 0) return false
+
+    const touched = await this.clearFaces(assetId)
+    if (touched.size === 0) return false
+
+    await this.refreshCounts(asset.ownerId, [...touched])
+    return true
   }
 
   /**
