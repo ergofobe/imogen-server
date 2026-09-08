@@ -1,5 +1,6 @@
 import ort from 'onnxruntime-node'
 import { openOriginal } from '../media/decode.ts'
+import { iou } from './overlap.ts'
 
 /**
  * SCRFD decoding. The model emits, for each of three strides, a score map, a distance
@@ -125,17 +126,6 @@ function nonMaxSuppression(faces: Face[], iouThreshold: number): Face[] {
     kept.push(candidate)
   }
   return kept
-}
-
-function iou(a: [number, number, number, number], b: [number, number, number, number]): number {
-  const x1 = Math.max(a[0], b[0])
-  const y1 = Math.max(a[1], b[1])
-  const x2 = Math.min(a[2], b[2])
-  const y2 = Math.min(a[3], b[3])
-  const overlap = Math.max(0, x2 - x1) * Math.max(0, y2 - y1)
-  const areaA = (a[2] - a[0]) * (a[3] - a[1])
-  const areaB = (b[2] - b[0]) * (b[3] - b[1])
-  return overlap / (areaA + areaB - overlap)
 }
 
 export function similarity(a: Float32Array, b: Float32Array): number {

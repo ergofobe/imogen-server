@@ -513,7 +513,11 @@ export const faces = pgTable(
     height: integer('height').notNull(),
     score: real('score').notNull(),
     embedding: vector('embedding', { dimensions: 512 }).notNull(),
-    /** Set when a human confirmed or corrected the grouping, so re-clustering leaves it alone. */
+    /**
+     * Set when a human confirmed or corrected the grouping. A re-scan keeps a confirmed
+     * face's person and this flag, refreshing only its geometry and embedding from the
+     * detection that turns out to be it — only a human moves or removes it after that.
+     */
     confirmed: boolean('confirmed').notNull().default(false),
     createdAt,
   },

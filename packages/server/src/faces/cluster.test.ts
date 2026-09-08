@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { bestMatch, CLUSTER, updateCentroid } from './cluster.ts'
+import { bestMatch, CLUSTER, cosine, replaceInCentroid, updateCentroid } from './cluster.ts'
 
 /** A unit vector pointing mostly along one axis, with a little noise on the next. */
 function vec(axis: number, drift = 0): Float32Array {
@@ -110,3 +110,22 @@ function similarity(a: Float32Array, b: Float32Array): number {
   for (let i = 0; i < a.length; i++) dot += a[i]! * b[i]!
   return dot
 }
+
+describe('replacing one face in a person', () => {
+  test('moves the mean by the difference between the old face and the new one', () => {
+    const centroid = updateCentroid(updateCentroid(null, 0, vec(0)), 1, vec(200))
+
+    const swapped = replaceInCentroid(centroid, 2, vec(0), vec(100))
+
+    // The person is now faces 100 and 200: near both, and away from the face that left.
+    // Chosen so that "just take the new face" would sit on 100 and nowhere near 200, and
+    // swapping the arguments would point away from 100 entirely.
+    expect(cosine(swapped, vec(100))).toBeGreaterThan(0.5)
+    expect(cosine(swapped, vec(200))).toBeGreaterThan(0.5)
+    expect(cosine(swapped, vec(0))).toBeLessThan(cosine(centroid, vec(0)) / 2)
+  })
+
+  test('is the new face alone when the person had no centroid yet', () => {
+    expect(Array.from(replaceInCentroid(null, 0, vec(0), vec(3)))).toEqual(Array.from(vec(3)))
+  })
+})
