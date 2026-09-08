@@ -295,8 +295,20 @@ export class MediaPipeline {
     // on, exifr hands back a Date it built in the server's own timezone, which silently
     // reintroduces the guess this code exists to avoid. It turns off revivers for a few
     // other tags too, none of which are read below; GPS is computed before that step.
+    //
+    // `translateValues: false` is a separate flag, and both are wanted. Left on, exifr
+    // renders Orientation as "Rotate 90 CW" rather than 6, so the numeric guard below
+    // never held and every asset ever ingested stored a null orientation. Of the tags
+    // read here it changes that one alone: the dates, the GPS pair and the camera fields
+    // come back identical either way.
     const parsed = await exifr
-      .parse(path, { tiff: true, exif: true, gps: true, reviveValues: false })
+      .parse(path, {
+        tiff: true,
+        exif: true,
+        gps: true,
+        reviveValues: false,
+        translateValues: false,
+      })
       .catch(() => null)
     if (!parsed) return
 
@@ -317,6 +329,12 @@ export class MediaPipeline {
       exposureTime: parsed.ExposureTime ?? null,
       iso: parsed.ISO ?? null,
       focalLength: parsed.FocalLength ?? null,
+      /**
+       * What the file said, not something for a client to apply: `renderDerivatives`
+       * has already baked the rotation in and `width`/`height` are reported after it,
+       * so a client that acts on this turns the photograph twice. It is here so a
+       * client can tell "the camera wrote no orientation" from "the server dropped it".
+       */
       orientation: typeof parsed.Orientation === 'number' ? parsed.Orientation : null,
     }
 
