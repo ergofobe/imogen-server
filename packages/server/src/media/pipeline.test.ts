@@ -278,6 +278,27 @@ describe('image processing', () => {
     const meta = await sharp(result.preview!).metadata()
     expect(meta.height).toBeGreaterThan(meta.width!)
   })
+
+  /**
+   * The test above proves the derivative came out upright, which is exactly why the
+   * stored tag being null went unnoticed: it never looks at what was recorded. The value
+   * is what the file said, not an instruction -- every derivative the server hands out is
+   * already rotated and `width`/`height` are reported post-rotation -- so a client that
+   * applies it would turn the photograph twice.
+   */
+  test('records the orientation the file stored, as a number', async () => {
+    for (const orientation of [1, 3, 6, 8]) {
+      const path = join(workDir, `orientation-${orientation}.jpg`)
+      await sharp(jpegPath).withMetadata({ orientation }).toFile(path)
+
+      const result = await pipeline.process(path, {
+        mimeType: 'image/jpeg',
+        filename: `orientation-${orientation}.jpg`,
+      })
+
+      expect(result.exif?.orientation).toBe(orientation)
+    }
+  })
 })
 
 describe('metadata extraction', () => {
