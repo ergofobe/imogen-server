@@ -22,8 +22,8 @@ export function AdminProcessing() {
     // No retry, against the default of three. When the server cannot reach its database
     // the request takes the full backstop to fail, and three of those in series would
     // keep this panel silent for minutes — which is precisely the failure it exists to
-    // report. Nothing is lost by reporting at once: the interval above keeps asking, so
-    // the panel heals itself as soon as the server does.
+    // report. Nothing is lost by reporting at once, because the failure is not a dead
+    // end: the interval above goes on asking, and the panel offers a button besides.
     retry: false,
   })
 

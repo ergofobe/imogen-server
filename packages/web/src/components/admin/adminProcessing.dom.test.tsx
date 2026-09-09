@@ -17,7 +17,18 @@ afterAll(async () => {
  *
  * A failure has to say so, and has to offer a way to ask again.
  */
-const queue = mock(() => Promise.reject(new Error('Database query timed out after 45000ms')))
+let answer: () => Promise<unknown> = () =>
+  Promise.reject(new Error('Database query timed out after 45000ms'))
+const queue = mock(() => answer())
+
+const HEALTHY = {
+  queued: 0,
+  running: 0,
+  failed: 0,
+  stuck: 0,
+  oldestQueuedAt: null,
+  failures: [],
+}
 
 mock.module('../../lib/client.ts', () => ({
   imogen: {
@@ -68,5 +79,29 @@ describe('the processing panel when the queue cannot be read', () => {
 
     const labels = [...container.querySelectorAll('button')].map((b) => b.textContent)
     expect(labels.join(' ')).toMatch(/try again/i)
+  })
+})
+
+describe('the processing panel once the queue can be read again', () => {
+  test('recovers when asked again, rather than staying broken until a reload', async () => {
+    answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+    const container = await renderPanel()
+    expect(container.textContent ?? '').toMatch(/could not be read/i)
+
+    const { act } = await import('react')
+    answer = () => Promise.resolve(HEALTHY)
+    const button = [...container.querySelectorAll('button')].find((b) =>
+      /try again/i.test(b.textContent ?? ''),
+    )
+    await act(async () => {
+      button?.click()
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    })
+
+    const text = container.textContent ?? ''
+    expect(text).toMatch(/nothing is waiting/i)
+    expect(text).not.toMatch(/could not be read/i)
+
+    answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
   })
 })
