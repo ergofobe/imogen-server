@@ -116,6 +116,14 @@ function guardClient(client: SQL, queryMs: number, transactionMs: number): SQL {
       }
       // Statements inside a transaction run on a connection it already holds, so the
       // whole transaction carries one ceiling rather than each statement carrying its own.
+      //
+      // A ceiling can only report; it cannot cancel. If this ever fires on a transaction
+      // that was genuinely running rather than one that never got a connection, the
+      // caller is told it failed while the transaction goes on to commit. That is the
+      // price of covering `begin` at all, and it is worth paying: leaving it uncovered
+      // puts ingest, faces and vault — every write path — back to hanging for ever, which
+      // is the whole of #71. The window is narrow by construction, since reaching this
+      // needs a transaction slower than four consecutive `statement_timeout`s.
       if (prop === 'begin') {
         return (...args: unknown[]) =>
           withTimeout(bound(...args) as PromiseLike<unknown>, transactionMs, 'transaction')
