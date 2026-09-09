@@ -127,7 +127,11 @@ export class JobQueue {
         }
         await this.run(job)
       } catch (error) {
-        console.error('job worker error', error)
+        // Flattened, for the same reason `fail` flattens: drizzle's own message is the
+        // SQL and nothing else, and when the pool is the thing that is broken the answer
+        // is on `cause`. A worker that cannot reach the database says so here roughly
+        // once per backstop, which is how #71 stops being silent.
+        console.error('job worker error:', describeError(error))
         await Bun.sleep(idle)
       }
     }
