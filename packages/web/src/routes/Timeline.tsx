@@ -128,9 +128,7 @@ export function Timeline({ title, query = NO_FILTER, empty, mode = 'library' }: 
     <>
       {/* `pr-11` clears the rail, which is fixed over the right edge of the viewport. The
           grid is left to slide under it — a translucent scrubber over the last inch is the
-          conventional shape for one, and the rail lets everything but its thumb through,
-          so the photographs under it stay clickable — but a control the reader has to hit
-          is not. */}
+          conventional shape for one — but a control the reader has to hit is not. */}
       <div className="mb-5 flex items-baseline justify-between gap-4 pr-11">
         <h1 className="heading-display text-2xl md:text-[28px]">{title}</h1>
         <TimelineCount

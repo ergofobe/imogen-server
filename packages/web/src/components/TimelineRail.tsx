@@ -254,8 +254,8 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
 
   const dragging = useRef(false)
   const resuming = useRef<ReturnType<typeof setTimeout> | null>(null)
-  // Where on the thumb the pointer took hold, below its centre. Kept for the whole drag so
-  // the thumb moves with the pointer rather than snapping its centre under it on press.
+  // Where on the thumb the pointer took hold, below its top edge. Kept for the whole drag
+  // so the thumb moves with the pointer rather than snapping under it on press.
   const grab = useRef(0)
 
   // A callback ref for the same reason `useGridLayout` uses one: the route renders a
@@ -313,16 +313,14 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
     [suspendFetching],
   )
 
-  /** Puts the thumb's centre at `centreY`, in client coordinates, and the grid with it. */
+  /** Puts the thumb's top edge at `topY`, in client coordinates, and the grid with it. */
   const scrubTo = useCallback(
-    (centreY: number) => {
+    (topY: number) => {
       if (!rail || !grid || table.totalHeight <= 0) return
       const box = rail.getBoundingClientRect()
       const track = box.height - THUMB_HEIGHT
       if (track <= 0) return
-      // Less half a thumb: the position is the thumb's top edge, and what arrives is its
-      // centre — the same correction both mobile clients make.
-      const fraction = Math.min(1, Math.max(0, (centreY - box.top - THUMB_HEIGHT / 2) / track))
+      const fraction = Math.min(1, Math.max(0, (topY - box.top) / track))
       scrollGridTo(grid, fraction * scrollableExtent(table, viewport))
       // Read back rather than trusting the target: `scrollGridTo` clamps at both ends, and
       // a label reporting a date the view never reached is worse than no label.
@@ -335,10 +333,10 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
     (event: React.PointerEvent<HTMLElement>) => {
       if (event.pointerType === 'mouse' && event.button !== 0) return
       event.preventDefault()
-      // Captured, because the thumb moves out from under a pointer that is dragging it.
+      // Captured, because a pointer dragging the thumb leaves its 44px sideways at will,
+      // and can outrun it between commits.
       event.currentTarget.setPointerCapture(event.pointerId)
-      const thumb = event.currentTarget.getBoundingClientRect()
-      grab.current = event.clientY - (thumb.top + thumb.height / 2)
+      grab.current = event.clientY - event.currentTarget.getBoundingClientRect().top
       if (resuming.current) {
         clearTimeout(resuming.current)
         resuming.current = null
@@ -346,11 +344,11 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
       dragging.current = true
       setScrubbing(true)
       // Before the first move, not after: a drag from this year to 2004 crosses fifteen
-      // years of months, and every one of them would be requested and thrown away.
+      // years of months, and every one of them would be requested and thrown away. And
+      // nothing is scrolled yet: the thumb is taken hold of where it is.
       suspendFetching(true)
-      scrubTo(event.clientY - grab.current)
     },
-    [scrubTo, suspendFetching],
+    [suspendFetching],
   )
 
   const onPointerMove = useCallback(
@@ -432,25 +430,12 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
       className="pointer-events-none fixed top-0 right-0 bottom-16 z-20 w-11 md:bottom-0"
     >
       {usable && date && newest && oldest && (
-        <div
-          role="slider"
-          tabIndex={0}
-          aria-label="Scrub the timeline by date"
-          aria-orientation="vertical"
-          // In days, because that is the unit the timeline is bucketed in — and ascending
-          // with newness, so the arrow that moves the view up also raises the value.
-          aria-valuemin={dayNumber(oldest)}
-          aria-valuemax={dayNumber(newest)}
-          aria-valuenow={dayNumber(date)}
-          aria-valuetext={formatDayKeyHeading(date)}
-          onKeyDown={onKeyDown}
-          onFocus={() => setFocused(true)}
-          onBlur={() => setFocused(false)}
-          // The slider is the keyboard's and the screen reader's; the pointer's is the
-          // thumb below. The strip is fixed over the last column of the grid, and a strip
-          // that took the pointer was a column of photographs that could not be clicked.
-          className="pointer-events-none absolute inset-0 select-none focus-visible:outline-none"
-        >
+        // The strip is fixed over the last column of the grid, and a strip that took the
+        // pointer was a column of photographs that could not be clicked. So nothing here
+        // answers to one except the thumb, which is the slider itself: what a keyboard
+        // focuses, what a screen reader names, and what an assistive pointer clicks are
+        // then all the one thing that can be dragged.
+        <div className="pointer-events-none absolute inset-0 select-none">
           {/* The ground the ruler is read against. It fades in with the marks: at rest
               there is nothing here but the thumb, so the photographs keep the edge. */}
           <div
@@ -498,20 +483,32 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
           )}
 
           {/* The thumb: always present, because at rest it is the whole control, and a real
-              object rather than a hairline so there is something to take hold of. It is
-              the one thing in the strip that answers to a pointer, padded out to the
-              rail's width so it is a 44px target; everything around it falls through to
-              the photograph beneath. Eased only when it is following the grid — through a
-              drag it must sit exactly under the pointer, and easing there is just lag. */}
+              object rather than a hairline so there is something to take hold of. Padded
+              out to the rail's width so it is a 44px target. Eased only when it is
+              following the grid — through a drag it must sit exactly under the pointer,
+              and easing there is just lag. */}
           <span
-            aria-hidden="true"
+            role="slider"
+            tabIndex={0}
+            aria-label="Scrub the timeline by date"
+            aria-orientation="vertical"
+            // In days, because that is the unit the timeline is bucketed in — and
+            // ascending with newness, so the arrow that moves the view up also raises the
+            // value.
+            aria-valuemin={dayNumber(oldest)}
+            aria-valuemax={dayNumber(newest)}
+            aria-valuenow={dayNumber(date)}
+            aria-valuetext={formatDayKeyHeading(date)}
+            onKeyDown={onKeyDown}
+            onFocus={() => setFocused(true)}
+            onBlur={() => setFocused(false)}
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
             onPointerUp={endDrag}
             onPointerCancel={endDrag}
             onPointerEnter={() => setPointerOver(true)}
             onPointerLeave={() => setPointerOver(false)}
-            className="pointer-events-auto absolute right-0 flex w-11 cursor-ns-resize touch-none items-center justify-end pr-1.5"
+            className="pointer-events-auto absolute right-0 flex w-11 cursor-ns-resize touch-none items-center justify-end pr-1.5 focus-visible:outline-none"
             style={{
               top: thumbTop,
               height: THUMB_HEIGHT,

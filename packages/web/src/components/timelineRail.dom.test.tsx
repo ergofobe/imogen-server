@@ -8,10 +8,11 @@ afterAll(stopDom)
 
 const OPTIONS = { width: 1200, targetHeight: 208, gap: 4, sectionGap: 44, headerHeight: 40 }
 
+// Newest first, as the server sends them and as the table requires.
 const library = () =>
   buildSegments(
     Array.from({ length: 24 }, (_, i) => ({
-      date: `2012-${String(12 - (i % 12)).padStart(2, '0')}-${String(28 - i).padStart(2, '0')}`,
+      date: `2012-${String(12 - Math.floor(i / 2)).padStart(2, '0')}-${String(28 - (i % 2) * 14).padStart(2, '0')}`,
       count: 400,
       coverAssetId: null,
     })),
@@ -75,8 +76,7 @@ describe('TimelineRail before anything has measured it', () => {
  *
  * happy-dom lays nothing out and hit-tests nothing, so it cannot say where a click on the
  * screen would land. What it can say is where the handlers are: a pointer put down on the
- * strip itself must start nothing, and only the one element inside it that answers to a
- * pointer may take hold.
+ * strip itself must start nothing, and only the slider — the thumb — may take hold.
  */
 describe('TimelineRail once it has a height', () => {
   beforeAll(() => measureAs({ width: 44, height: 800 }))
@@ -87,7 +87,7 @@ describe('TimelineRail once it has a height', () => {
       new PointerEvent('pointerdown', { bubbles: true, pointerId: 1, button: 0, clientY: 400 }),
     )
 
-  test('the strip itself takes no pointer; only the thumb does', async () => {
+  test('the strip itself takes no pointer; only the slider does', async () => {
     const { act } = await import('react')
     const suspended: boolean[] = []
     const container = await render(
@@ -96,21 +96,22 @@ describe('TimelineRail once it has a height', () => {
     const slider = container.querySelector('[role="slider"]')
     expect(slider).not.toBeNull()
     if (!slider) return
+    const strip = slider.parentElement
+    expect(strip).not.toBeNull()
+    if (!strip) return
 
     // The CSS that lets a click fall through to the photograph beneath, asserted by name
     // because nothing here can click.
-    expect(slider.className).toContain('pointer-events-none')
+    expect(strip.className).toContain('pointer-events-none')
+    expect(slider.className).toContain('pointer-events-auto')
 
     await act(async () => {
-      pointerDown(slider)
+      pointerDown(strip)
     })
     expect(suspended).toEqual([])
 
-    const thumb = slider.querySelector('.pointer-events-auto')
-    expect(thumb).not.toBeNull()
-    if (!thumb) return
     await act(async () => {
-      pointerDown(thumb)
+      pointerDown(slider)
     })
     expect(suspended).toEqual([true])
   })
