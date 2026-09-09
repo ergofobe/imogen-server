@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { buildSegments } from '../lib/timelineLayout.ts'
-import { render, startDom, stopDom } from '../test/dom.ts'
+import { measureAs, render, startDom, stopDom } from '../test/dom.ts'
 import { TimelineRail } from './TimelineRail.tsx'
 
 beforeAll(startDom)
@@ -8,10 +8,11 @@ afterAll(stopDom)
 
 const OPTIONS = { width: 1200, targetHeight: 208, gap: 4, sectionGap: 44, headerHeight: 40 }
 
+// Newest first, as the server sends them and as the table requires.
 const library = () =>
   buildSegments(
     Array.from({ length: 24 }, (_, i) => ({
-      date: `2012-${String(12 - (i % 12)).padStart(2, '0')}-${String(28 - i).padStart(2, '0')}`,
+      date: `2012-${String(12 - Math.floor(i / 2)).padStart(2, '0')}-${String(28 - (i % 2) * 14).padStart(2, '0')}`,
       count: 400,
       coverAssetId: null,
     })),
@@ -65,5 +66,59 @@ describe('TimelineRail before anything has measured it', () => {
 
     expect(container.firstElementChild).not.toBeNull()
     expect(container.querySelector('[role="slider"]')).toBeNull()
+  })
+})
+
+/**
+ * The rail is fixed over the right edge of the grid, and the grid slides under it. So
+ * whatever in the strip answers to a pointer is a strip of photographs that cannot be
+ * clicked — a third of the last column on a phone.
+ *
+ * happy-dom lays nothing out and hit-tests nothing, so it cannot say where a click on the
+ * screen would land. What it can say is where the handlers are: a pointer put down on the
+ * strip itself must start nothing, and only the slider — the thumb — may take hold.
+ */
+describe('TimelineRail once it has a height', () => {
+  beforeAll(() => measureAs({ width: 44, height: 800 }))
+  afterAll(() => measureAs(null))
+
+  const pointerDown = (target: Element) =>
+    target.dispatchEvent(
+      new PointerEvent('pointerdown', { bubbles: true, pointerId: 1, button: 0, clientY: 400 }),
+    )
+
+  test('the strip itself takes no pointer; only the slider does', async () => {
+    const { act } = await import('react')
+    const suspended: boolean[] = []
+    const container = await render(
+      <TimelineRail table={library()} grid={null} suspendFetching={(on) => suspended.push(on)} />,
+    )
+    const slider = container.querySelector('[role="slider"]')
+    expect(slider).not.toBeNull()
+    if (!slider) return
+    const strip = slider.parentElement
+    expect(strip).not.toBeNull()
+    if (!strip) return
+
+    // The CSS that lets a click fall through to the photograph beneath, asserted by name
+    // because nothing here can click — and the slider is the thumb, not the strip.
+    expect(strip.className).toContain('pointer-events-none')
+    expect(slider.className).toContain('pointer-events-auto')
+    expect(slider.className).not.toContain('inset-0')
+
+    // On the ruler's ground rather than the strip itself: an event bubbles up, so the one
+    // way to show the strip owns no handler is to start below anything it might have.
+    const ground = strip.firstElementChild
+    expect(ground).not.toBeNull()
+    if (!ground) return
+    await act(async () => {
+      pointerDown(ground)
+    })
+    expect(suspended).toEqual([])
+
+    await act(async () => {
+      pointerDown(slider)
+    })
+    expect(suspended).toEqual([true])
   })
 })
