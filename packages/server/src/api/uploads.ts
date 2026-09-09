@@ -49,8 +49,8 @@ export function createUploadRoutes() {
       const body = c.req.valid('json')
 
       // The same two keys the client can know before sending bytes; the content hash
-      // needs the bytes, so ingest checks that one after the transfer.
-      // Serialised the way the direct path serialises its duplicate, so the two paths
+      // needs the bytes, so ingest checks that one after the transfer. The match is
+      // serialised the way the direct path serialises its duplicate, so the two paths
       // answer alike, vault included: which matches may reach a vaulted photograph is
       // decided in the claim, not here (#65).
       const existing = await claimExistingAsset(services.db, principal.user.id, body)
