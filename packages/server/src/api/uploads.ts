@@ -11,7 +11,8 @@ import { and, eq } from 'drizzle-orm'
 import { type AppEnv, requireAuth, requireScope } from '../auth/middleware.ts'
 import { uploadSessions } from '../db/schema.ts'
 import { badRequest, conflict, notFound } from '../lib/errors.ts'
-import { findExistingAsset } from '../media/identity.ts'
+import { claimExistingAsset } from '../media/identity.ts'
+import { toAsset } from '../media/serialize.ts'
 import { created, ERROR_RESPONSES, ok, security } from './openapi.ts'
 
 const SESSION_TTL_HOURS = 24
@@ -35,7 +36,8 @@ export function createUploadRoutes() {
       summary: 'Begin a resumable upload',
       description:
         'Supply the checksum if you know it and the server will tell you immediately ' +
-        'whether it already has the file, so nothing is transferred twice.',
+        'whether it already has the file, so nothing is transferred twice. A copy that ' +
+        'was in the trash is restored.',
       security: security(),
       middleware: [requireScope('library:write')] as const,
       request: { body: { content: { 'application/json': { schema: UploadSessionCreate } } } },
@@ -47,17 +49,20 @@ export function createUploadRoutes() {
       const body = c.req.valid('json')
 
       // The same two keys the client can know before sending bytes; the content hash
-      // needs the bytes, so ingest checks that one after the transfer.
-      const existing = await findExistingAsset(services.db, principal.user.id, body)
+      // needs the bytes, so ingest checks that one after the transfer. The match is
+      // serialised the way the direct path serialises its duplicate, so the two paths
+      // answer alike, vault included: which matches may reach a vaulted photograph is
+      // decided in the claim, not here (#65).
+      const existing = await claimExistingAsset(services.db, principal.user.id, body)
       if (existing) {
-        const asset = await services.assets.get(principal.user.id, existing)
+        if (existing.restored) await services.faces.refreshFor(principal.user.id)
         return c.json(
           {
             id: crypto.randomUUID(),
             offset: body.sizeBytes,
             sizeBytes: body.sizeBytes,
             expiresAt: new Date().toISOString(),
-            existing: { asset, duplicate: true },
+            existing: { asset: toAsset(existing.row), duplicate: true },
           },
           201,
         )
@@ -187,13 +192,14 @@ export function createUploadRoutes() {
       // rather than refused after its bytes have all arrived.
       const metadata = AssetUploadMetadata.safeParse(row.metadata ?? {})
       try {
-        const result = await services.ingest.ingest({
+        const { restored, ...result } = await services.ingest.ingest({
           ownerId: principal.user.id,
           tempPath: row.tempPath,
           filename: row.filename,
           mimeType: row.mimeType,
           metadata: metadata.success ? metadata.data : {},
         })
+        if (restored) await services.faces.refreshFor(principal.user.id)
         return c.json(result, 201)
       } finally {
         // The session is spent either way; ingest has taken or discarded the file.

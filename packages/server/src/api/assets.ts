@@ -120,7 +120,8 @@ export function createAssetRoutes() {
       summary: 'Upload one photo or video',
       description:
         'Multipart upload. Re-uploading bytes that already exist returns the existing ' +
-        'asset with `duplicate: true` rather than storing a second copy.',
+        'asset with `duplicate: true` rather than storing a second copy. A copy that was ' +
+        'in the trash is restored.',
       security: security(),
       middleware: [requireScope('library:write')] as const,
       request: {
@@ -167,14 +168,17 @@ export function createAssetRoutes() {
         throw badRequest('Invalid upload metadata', fieldErrors(metadata.error))
       }
 
+      const ownerId = c.get('principal').user.id
       const tempPath = await spool(services.config.uploadsDir, file)
-      const result = await services.ingest.ingest({
-        ownerId: c.get('principal').user.id,
+      const { restored, ...result } = await services.ingest.ingest({
+        ownerId,
         tempPath,
         filename: file.name || 'upload',
         mimeType: file.type || 'application/octet-stream',
         metadata: metadata.data,
       })
+      // A photograph back from the trash has its faces still; only the counts move.
+      if (restored) await services.faces.refreshFor(ownerId)
       return c.json(result, result.duplicate ? 200 : 201)
     },
   )
