@@ -329,6 +329,10 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
     [rail, grid, table, viewport],
   )
 
+  const track = Math.max(0, railHeight - THUMB_HEIGHT)
+  const scrollable = scrollableExtent(table, viewport)
+  const thumbTop = Math.min(track, Math.max(0, (gridTop / scrollable) * track))
+
   const onPointerDown = useCallback(
     (event: React.PointerEvent<HTMLElement>) => {
       if (event.pointerType === 'mouse' && event.button !== 0) return
@@ -336,7 +340,9 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
       // Captured, because a pointer dragging the thumb leaves its 44px sideways at will,
       // and can outrun it between commits.
       event.currentTarget.setPointerCapture(event.pointerId)
-      grab.current = event.clientY - event.currentTarget.getBoundingClientRect().top
+      // Against where the thumb is, not where it is drawn: mid-ease the two differ, and
+      // a grab measured from the drawn one would write that lag back into the grid.
+      grab.current = event.clientY - ((rail?.getBoundingClientRect().top ?? 0) + thumbTop)
       if (resuming.current) {
         clearTimeout(resuming.current)
         resuming.current = null
@@ -348,7 +354,7 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
       // nothing is scrolled yet: the thumb is taken hold of where it is.
       suspendFetching(true)
     },
-    [suspendFetching],
+    [rail, thumbTop, suspendFetching],
   )
 
   const onPointerMove = useCallback(
@@ -384,8 +390,6 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
     [grid, table, gridTop],
   )
 
-  const track = Math.max(0, railHeight - THUMB_HEIGHT)
-  const scrollable = scrollableExtent(table, viewport)
   const ticks = railTicks(table, track, scrollable)
   const date = dayAt(table, gridTop)
 
@@ -415,7 +419,6 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
    */
   const usable = ticks.length > 0 && date !== null && table.totalHeight > railHeight
 
-  const thumbTop = Math.min(track, Math.max(0, (gridTop / scrollable) * track))
   // Marks are centred on the thumb's middle, so dragging the thumb onto a year's label is
   // what lands on that year rather than overshooting it by half a thumb.
   const centreOf = (y: number) => y + THUMB_HEIGHT / 2
@@ -508,7 +511,7 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
             onPointerCancel={endDrag}
             onPointerEnter={() => setPointerOver(true)}
             onPointerLeave={() => setPointerOver(false)}
-            className="pointer-events-auto absolute right-0 flex w-11 cursor-ns-resize touch-none items-center justify-end pr-1.5 focus-visible:outline-none"
+            className="pointer-events-auto absolute right-0 flex w-11 cursor-ns-resize touch-none items-center justify-end pr-1.5"
             style={{
               top: thumbTop,
               height: THUMB_HEIGHT,

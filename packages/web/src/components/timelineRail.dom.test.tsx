@@ -101,12 +101,18 @@ describe('TimelineRail once it has a height', () => {
     if (!strip) return
 
     // The CSS that lets a click fall through to the photograph beneath, asserted by name
-    // because nothing here can click.
+    // because nothing here can click — and the slider is the thumb, not the strip.
     expect(strip.className).toContain('pointer-events-none')
     expect(slider.className).toContain('pointer-events-auto')
+    expect(slider.className).not.toContain('inset-0')
 
+    // On the ruler's ground rather than the strip itself: an event bubbles up, so the one
+    // way to show the strip owns no handler is to start below anything it might have.
+    const ground = strip.firstElementChild
+    expect(ground).not.toBeNull()
+    if (!ground) return
     await act(async () => {
-      pointerDown(strip)
+      pointerDown(ground)
     })
     expect(suspended).toEqual([])
 
