@@ -269,3 +269,77 @@ describe('housekeeping', () => {
     expect(await db.select().from(jobs)).toHaveLength(1)
   })
 })
+
+/**
+ * A worker that cannot reach the database has to complain, not disappear.
+ *
+ * In #71 every pooled connection was stranded, so `claim()` waited for one for ever. It
+ * never threw, so the `catch` below it never ran, and four workers went quiet while 570
+ * uploads sat untouched for 25 hours. The database backstop turns that wait into a
+ * rejection; this is the half that has to survive the rejection and keep asking.
+ */
+describe('a worker whose database is unreachable', () => {
+  // Shaped the way drizzle actually reports it: the wrapper's own message is the SQL and
+  // nothing else, and the reason anyone could act on is on `cause`.
+  const unreachable = () =>
+    Promise.reject(
+      new Error('Failed query: update "jobs" set status = $1', {
+        cause: new Error('Database query timed out after 45000ms without reaching Postgres'),
+      }),
+    )
+  const brokenDb = { execute: unreachable, update: unreachable } as unknown as Database
+
+  test('keeps running, and says why, rather than falling silent', async () => {
+    const said: string[] = []
+    const wasError = console.error
+    console.error = (...parts: unknown[]) => said.push(parts.join(' '))
+
+    const queue = new JobQueue(brokenDb, { concurrency: 2, idlePollMs: 5 })
+    queue.start()
+    try {
+      await Bun.sleep(120)
+    } finally {
+      console.error = wasError
+      await queue.stop()
+    }
+
+    // Still asking after many failures, and each one names the reason rather than the SQL.
+    expect(said.length).toBeGreaterThan(2)
+    expect(said.join('\n')).toMatch(/timed out/i)
+  })
+
+  test('recovers on its own once the database answers again', async () => {
+    let reachable = false
+    const flaky = new Proxy(db as object, {
+      get(target, prop, receiver) {
+        if (!reachable && prop === 'execute') return unreachable
+        return Reflect.get(target, prop, receiver)
+      },
+    }) as Database
+
+    const ran: string[] = []
+    const queue = new JobQueue(flaky, { concurrency: 1, idlePollMs: 5 })
+    queue.register('later', async () => {
+      ran.push('later')
+    })
+    await queue.enqueue('later', {})
+
+    const wasError = console.error
+    console.error = () => {}
+    try {
+      queue.start()
+      await Bun.sleep(60)
+      expect(ran).toBeEmpty()
+
+      reachable = true
+      await Bun.sleep(300)
+    } finally {
+      // In a `finally` because a failure above must not leave the whole run without a
+      // console or with a worker still polling.
+      console.error = wasError
+      await queue.stop()
+    }
+
+    expect(ran).toEqual(['later'])
+  })
+})
