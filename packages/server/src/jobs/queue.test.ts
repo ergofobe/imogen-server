@@ -326,14 +326,19 @@ describe('a worker whose database is unreachable', () => {
 
     const wasError = console.error
     console.error = () => {}
-    queue.start()
-    await Bun.sleep(60)
-    expect(ran).toBeEmpty()
+    try {
+      queue.start()
+      await Bun.sleep(60)
+      expect(ran).toBeEmpty()
 
-    reachable = true
-    await Bun.sleep(300)
-    console.error = wasError
-    await queue.stop()
+      reachable = true
+      await Bun.sleep(300)
+    } finally {
+      // In a `finally` because a failure above must not leave the whole run without a
+      // console or with a worker still polling.
+      console.error = wasError
+      await queue.stop()
+    }
 
     expect(ran).toEqual(['later'])
   })
