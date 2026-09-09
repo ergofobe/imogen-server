@@ -254,6 +254,9 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
 
   const dragging = useRef(false)
   const resuming = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Where on the thumb the pointer took hold, below its centre. Kept for the whole drag so
+  // the thumb moves with the pointer rather than snapping its centre under it on press.
+  const grab = useRef(0)
 
   // A callback ref for the same reason `useGridLayout` uses one: the route renders a
   // skeleton first, so an observer attached on the first commit would find nothing and
@@ -310,15 +313,16 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
     [suspendFetching],
   )
 
+  /** Puts the thumb's centre at `centreY`, in client coordinates, and the grid with it. */
   const scrubTo = useCallback(
-    (clientY: number) => {
+    (centreY: number) => {
       if (!rail || !grid || table.totalHeight <= 0) return
       const box = rail.getBoundingClientRect()
       const track = box.height - THUMB_HEIGHT
       if (track <= 0) return
-      // Less half a thumb, so the thumb sits centred under the pointer rather than hanging
-      // below it — the same correction both mobile clients make.
-      const fraction = Math.min(1, Math.max(0, (clientY - box.top - THUMB_HEIGHT / 2) / track))
+      // Less half a thumb: the position is the thumb's top edge, and what arrives is its
+      // centre — the same correction both mobile clients make.
+      const fraction = Math.min(1, Math.max(0, (centreY - box.top - THUMB_HEIGHT / 2) / track))
       scrollGridTo(grid, fraction * scrollableExtent(table, viewport))
       // Read back rather than trusting the target: `scrollGridTo` clamps at both ends, and
       // a label reporting a date the view never reached is worse than no label.
@@ -328,10 +332,13 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
   )
 
   const onPointerDown = useCallback(
-    (event: React.PointerEvent<HTMLDivElement>) => {
+    (event: React.PointerEvent<HTMLElement>) => {
       if (event.pointerType === 'mouse' && event.button !== 0) return
       event.preventDefault()
+      // Captured, because the thumb moves out from under a pointer that is dragging it.
       event.currentTarget.setPointerCapture(event.pointerId)
+      const thumb = event.currentTarget.getBoundingClientRect()
+      grab.current = event.clientY - (thumb.top + thumb.height / 2)
       if (resuming.current) {
         clearTimeout(resuming.current)
         resuming.current = null
@@ -341,15 +348,15 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
       // Before the first move, not after: a drag from this year to 2004 crosses fifteen
       // years of months, and every one of them would be requested and thrown away.
       suspendFetching(true)
-      scrubTo(event.clientY)
+      scrubTo(event.clientY - grab.current)
     },
     [scrubTo, suspendFetching],
   )
 
   const onPointerMove = useCallback(
-    (event: React.PointerEvent<HTMLDivElement>) => {
+    (event: React.PointerEvent<HTMLElement>) => {
       if (!dragging.current) return
-      scrubTo(event.clientY)
+      scrubTo(event.clientY - grab.current)
     },
     [scrubTo],
   )
@@ -436,16 +443,13 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
           aria-valuemax={dayNumber(newest)}
           aria-valuenow={dayNumber(date)}
           aria-valuetext={formatDayKeyHeading(date)}
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={endDrag}
-          onPointerCancel={endDrag}
           onKeyDown={onKeyDown}
-          onPointerEnter={() => setPointerOver(true)}
-          onPointerLeave={() => setPointerOver(false)}
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
-          className="pointer-events-auto absolute inset-0 cursor-ns-resize touch-none select-none focus-visible:outline-none"
+          // The slider is the keyboard's and the screen reader's; the pointer's is the
+          // thumb below. The strip is fixed over the last column of the grid, and a strip
+          // that took the pointer was a column of photographs that could not be clicked.
+          className="pointer-events-none absolute inset-0 select-none focus-visible:outline-none"
         >
           {/* The ground the ruler is read against. It fades in with the marks: at rest
               there is nothing here but the thumb, so the photographs keep the edge. */}
@@ -494,31 +498,43 @@ export function TimelineRail({ table, grid, suspendFetching }: Props) {
           )}
 
           {/* The thumb: always present, because at rest it is the whole control, and a real
-              object rather than a hairline so there is something to take hold of. Eased
-              only when it is following the grid — through a drag it must sit exactly under
-              the pointer, and easing there is just lag. */}
+              object rather than a hairline so there is something to take hold of. It is
+              the one thing in the strip that answers to a pointer, padded out to the
+              rail's width so it is a 44px target; everything around it falls through to
+              the photograph beneath. Eased only when it is following the grid — through a
+              drag it must sit exactly under the pointer, and easing there is just lag. */}
           <span
             aria-hidden="true"
-            className={`absolute right-1.5 flex w-7 items-center justify-center rounded-full border border-line/70 shadow-sm ${
-              scrubbing ? 'bg-safelight text-paper' : 'bg-paper text-muted'
-            }`}
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={endDrag}
+            onPointerCancel={endDrag}
+            onPointerEnter={() => setPointerOver(true)}
+            onPointerLeave={() => setPointerOver(false)}
+            className="pointer-events-auto absolute right-0 flex w-11 cursor-ns-resize touch-none items-center justify-end pr-1.5"
             style={{
               top: thumbTop,
               height: THUMB_HEIGHT,
               transition: scrubbing ? 'none' : 'top 140ms ease-out',
             }}
           >
-            <svg
-              viewBox="0 0 16 16"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              aria-hidden="true"
-              className="h-4 w-4"
+            <span
+              className={`flex h-full w-7 items-center justify-center rounded-full border border-line/70 shadow-sm ${
+                scrubbing ? 'bg-safelight text-paper' : 'bg-paper text-muted'
+              }`}
             >
-              <path d="M4 6h8M4 10h8" />
-            </svg>
+              <svg
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                aria-hidden="true"
+                className="h-4 w-4"
+              >
+                <path d="M4 6h8M4 10h8" />
+              </svg>
+            </span>
           </span>
         </div>
       )}
