@@ -17,6 +17,7 @@ const MAX_FTYP_BYTES = 1024
 const MAX_META_BYTES = 16 * 1024 * 1024
 const MAX_ITEMS = 4096
 const MAX_REFERENCES = 65536
+const MAX_EXTENTS = 65536
 
 const SOI = 0xd8
 const EOI = 0xd9
@@ -189,8 +190,8 @@ function childBoxes(buf: Buffer, start: number, end: number): Child[] | null {
     if (children.length > MAX_BOXES) return null
     offset += size
   }
-  // Trailing bytes that are not a box mean the parse has lost its place.
-  return offset === end ? children : null
+  // A remainder under eight bytes cannot be a box: it is padding, not a lost place.
+  return children
 }
 
 function findChild(children: Child[], type: string): Child | null {
@@ -206,6 +207,7 @@ function readField(buf: Buffer, at: number, size: number): number | null {
 }
 
 function readPrimaryItemId(buf: Buffer, pitm: Child): number | null {
+  if (pitm.start + 4 > pitm.end) return null
   const width = buf.readUInt8(pitm.start) === 0 ? 2 : 4
   if (pitm.start + 4 + width > pitm.end) return null
   return buf.readUIntBE(pitm.start + 4, width)
@@ -215,6 +217,7 @@ type ItemReferences = Map<string, Map<number, number[]>>
 
 /** `iref` as reference kind -> from-item -> to-items. */
 function readItemReferences(buf: Buffer, iref: Child): ItemReferences | null {
+  if (iref.start + 4 > iref.end) return null
   const idWidth = buf.readUInt8(iref.start) === 0 ? 2 : 4
   const boxes = childBoxes(buf, iref.start + 4, iref.end)
   if (boxes === null) return null
@@ -246,10 +249,12 @@ function readItemReferences(buf: Buffer, iref: Child): ItemReferences | null {
 }
 
 type Extent = { start: number; length: number }
-type ItemLocation = { construction: number; extents: Extent[] }
+/** `external` items live in another file, so their bytes are neither ours to hash nor to claim. */
+type ItemLocation = { construction: number; extents: Extent[]; external: boolean }
 
 /** `iloc`, whose every field width is declared in the box itself and varies by version. */
 function readItemLocations(buf: Buffer, iloc: Child): Map<number, ItemLocation> | null {
+  if (iloc.start + 4 > iloc.end) return null
   const version = buf.readUInt8(iloc.start)
   // Every later version would be walked with a layout it does not have.
   if (version > 2) return null
@@ -271,6 +276,7 @@ function readItemLocations(buf: Buffer, iloc: Child): Map<number, ItemLocation> 
   at += idWidth
 
   const locations = new Map<number, ItemLocation>()
+  let totalExtents = 0
   for (let i = 0; i < count; i++) {
     if (at + idWidth + 2 > iloc.end) return null
     const id = buf.readUIntBE(at, idWidth)
@@ -283,8 +289,9 @@ function readItemLocations(buf: Buffer, iloc: Child): Map<number, ItemLocation> 
       if (at + 2 > iloc.end) return null
     }
 
-    // A non-zero data reference points into another file, whose bytes are not ours to hash.
-    if (buf.readUInt16BE(at) !== 0) return null
+    // A non-zero data reference points into another file. Only the picture's own items need
+    // to be readable, so this is recorded rather than failing the whole walk here.
+    const external = buf.readUInt16BE(at) !== 0
     at += 2
 
     if (at + baseOffsetSize + 2 > iloc.end) return null
@@ -293,6 +300,8 @@ function readItemLocations(buf: Buffer, iloc: Child): Map<number, ItemLocation> 
     at += baseOffsetSize
     const extentCount = buf.readUInt16BE(at)
     at += 2
+    totalExtents += extentCount
+    if (totalExtents > MAX_EXTENTS) return null
 
     const extents: Extent[] = []
     for (let e = 0; e < extentCount; e++) {
@@ -306,7 +315,7 @@ function readItemLocations(buf: Buffer, iloc: Child): Map<number, ItemLocation> 
       if (offset === null || length === null || length === 0) return null
       extents.push({ start: base + offset, length })
     }
-    locations.set(id, { construction, extents })
+    locations.set(id, { construction, extents, external })
   }
   return locations
 }
@@ -424,7 +433,8 @@ async function hashHeifItems(
 
   for (const id of ids) {
     const location = locations.get(id)
-    if (location === undefined) return null
+    // The picture's own bytes must be in this file for the hash to mean anything.
+    if (location === undefined || location.external) return null
     for (const extent of location.extents) {
       hashed += extent.length
       // Extents partition the file's item data, so a total past the file size is a crafted
@@ -447,7 +457,7 @@ async function hashHeifItems(
   }
 
   const claimed = [...locations.values()]
-    .filter((location) => location.construction === 0)
+    .filter((location) => location.construction === 0 && !location.external)
     .flatMap((location) => location.extents)
   for (const gap of unclaimedRanges(mdats, claimed)) {
     await streamRangeInto(handle, hash, gap.start, gap.end)

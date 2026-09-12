@@ -243,7 +243,13 @@ function irefBox(refs: ItemRef[]): Buffer {
 }
 
 type Extent = { offset: number; length: number }
-type ItemLocation = { id: number; construction: number; extents: Extent[] }
+type ItemLocation = {
+  id: number
+  construction: number
+  extents: Extent[]
+  /** Non-zero means the item's bytes live in another file. */
+  dataReferenceIndex?: number
+}
 
 /** An `iloc` version 1 with 4-byte offsets and lengths and no base offset or extent index. */
 function ilocBox(items: ItemLocation[]): Buffer {
@@ -256,7 +262,7 @@ function ilocBox(items: ItemLocation[]): Buffer {
     const buf = Buffer.alloc(8 + item.extents.length * 8)
     buf.writeUInt16BE(item.id, 0)
     buf.writeUInt16BE(item.construction, 2)
-    buf.writeUInt16BE(0, 4) // data_reference_index: 0 means "this file"
+    buf.writeUInt16BE(item.dataReferenceIndex ?? 0, 4) // 0 means "this file"
     buf.writeUInt16BE(item.extents.length, 6)
     item.extents.forEach((extent, i) => {
       buf.writeUInt32BE(extent.offset, 8 + i * 8)
@@ -279,6 +285,10 @@ type HeifSpec = {
   omitItemIndex?: boolean
   /** A second top-level `mdat` no item claims, the shape a motion photo's video takes. */
   trailer?: Buffer
+  /** Give the XMP item, or the primary, a data reference into another file. */
+  externalItem?: 'xmp' | 'primary'
+  /** Extra items, each with `EXTENT_FLOOD_PER_ITEM` extents, for the extent bound. */
+  floodExtentItems?: number
   /** A `moov`, which makes the file an image sequence rather than a still. */
   withTracks?: boolean
   /**
@@ -290,6 +300,7 @@ type HeifSpec = {
 }
 
 const FLOOD_TARGETS = 30000
+const EXTENT_FLOOD_PER_ITEM = 30000
 const PRIMARY_ID = 1
 const XMP_ID = 90
 const AUX_ID = 91
@@ -312,10 +323,34 @@ function heif(spec: HeifSpec): Buffer {
       return extent
     })
 
+    const extentFlood: ItemLocation[] = Array.from(
+      { length: spec.floodExtentItems ?? 0 },
+      (_, n) => ({
+        id: 2000 + n,
+        construction: 0,
+        extents: Array.from({ length: EXTENT_FLOOD_PER_ITEM }, (_, i) => ({
+          // Spaced out, so each extent leaves a gap behind it.
+          offset: mdatPayloadStart + i * 2,
+          length: 1,
+        })),
+      }),
+    )
+
     const locations: ItemLocation[] = [
-      { id: PRIMARY_ID, construction: 1, extents: [{ offset: 0, length: GRID_DESCRIPTOR.length }] },
+      ...extentFlood,
+      {
+        id: PRIMARY_ID,
+        construction: 1,
+        extents: [{ offset: 0, length: GRID_DESCRIPTOR.length }],
+        dataReferenceIndex: spec.externalItem === 'primary' ? 1 : 0,
+      },
       ...tileIds.map((id, i) => ({ id, construction: 0, extents: [extents[i]!] })),
-      { id: XMP_ID, construction: 0, extents: [extents[spec.tiles.length]!] },
+      {
+        id: XMP_ID,
+        construction: 0,
+        extents: [extents[spec.tiles.length]!],
+        dataReferenceIndex: spec.externalItem === 'xmp' ? 1 : 0,
+      },
       ...(spec.aux
         ? [{ id: AUX_ID, construction: 0, extents: [extents[spec.tiles.length + 1]!] }]
         : []),
@@ -419,6 +454,26 @@ describe('contentHash HEIF', () => {
     // guard against merging those references quadratically: it does not finish if they are.
     expect(await hashOf(heif({ tiles, xmp, floodDimgBoxes: 2 }))).not.toBeNull()
     expect(await hashOf(heif({ tiles, xmp, floodDimgBoxes: 3 }))).toBeNull()
+  })
+
+  test('bounds the item extents: an iloc past the cap returns null', async () => {
+    const xmp = Buffer.from('<x:xmpmeta/>')
+    // Two flooded items stay under the 65536 cap, three cross it.
+    expect(await hashOf(heif({ tiles, xmp, floodExtentItems: 2 }))).not.toBeNull()
+    expect(await hashOf(heif({ tiles, xmp, floodExtentItems: 3 }))).toBeNull()
+  }, 30000)
+
+  test('an item in another file is skipped, not fatal, unless it is the picture', async () => {
+    const shortXmp = Buffer.from('<x/>')
+    const longXmp = Buffer.from('<x>rewritten, and rather longer</x>')
+
+    // The XMP living elsewhere says nothing about whether the picture can be hashed. Its
+    // bytes are no longer claimed, so they now count as payload and the rewrite shows up.
+    const hash = await hashOf(heif({ tiles, xmp: shortXmp, externalItem: 'xmp' }))
+    expect(hash).not.toBeNull()
+    expect(await hashOf(heif({ tiles, xmp: longXmp, externalItem: 'xmp' }))).not.toBe(hash)
+
+    expect(await hashOf(heif({ tiles, xmp: shortXmp, externalItem: 'primary' }))).toBeNull()
   })
 
   test('an image sequence keeps the mdat rule despite its cover item', async () => {
