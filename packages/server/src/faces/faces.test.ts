@@ -499,18 +499,8 @@ describe('recounting under concurrency', () => {
  * goes in regardless, and the same person's face waits.
  */
 describe.skipIf(!canRun)('filing faces under concurrency', () => {
-  test('a face waits for its own person, not for everyone the owner has', async () => {
-    const portraitA = await addPhoto('person-a.png')
-    const portraitB = await addPhoto('person-b.png')
-    await service.processAsset(portraitA.id)
-    await service.processAsset(portraitB.id)
-
-    const [faceA] = await service.facesForAsset(ownerId, portraitA.id)
-    const personA = faceA!.personId!
-
-    const againA = await addPhoto('person-a.png', (i) => i.modulate({ brightness: 1.2 }))
-    const againB = await addPhoto('person-b.png', (i) => i.modulate({ brightness: 1.2 }))
-
+  /** Holds what a filing in progress holds, until the returned `release` is called. */
+  async function holdingFor(personId: string) {
     let release!: () => void
     const held = new Promise<void>((resolve) => {
       release = resolve
@@ -522,34 +512,65 @@ describe.skipIf(!canRun)('filing faces under concurrency', () => {
 
     const holder = db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock_shared(hashtext(${`faces:${ownerId}`}))`)
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`faces:person:${personA}`}))`)
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`faces:person:${personId}`}))`)
       locked()
       await held
     })
     await isLocked
+    return async () => {
+      release()
+      await holder
+    }
+  }
 
-    let filedA = false
-    const scanA = service.processAsset(againA.id).then(() => {
-      filedA = true
+  test('a face joins its person while another person is being filed', async () => {
+    const portraitA = await addPhoto('person-a.png')
+    const portraitB = await addPhoto('person-b.png')
+    await service.processAsset(portraitA.id)
+    await service.processAsset(portraitB.id)
+
+    const [faceA] = await service.facesForAsset(ownerId, portraitA.id)
+    const againB = await addPhoto('person-b.png', (i) => i.modulate({ brightness: 1.2 }))
+
+    const release = await holdingFor(faceA!.personId!)
+    try {
+      // Unfixed, this waits on the owner's key behind a person it has nothing to do with,
+      // and `lock_timeout` cancels it rather than queueing it.
+      expect(await withDeadline(service.processAsset(againB.id), 15_000)).toBe(1)
+    } finally {
+      await release()
+    }
+
+    const found = await service.listPeople(ownerId)
+    expect(found).toHaveLength(2)
+    expect(found.map((p) => p.faceCount).sort()).toEqual([1, 2])
+  }, 60_000)
+
+  test('but work on that same person does wait for it', async () => {
+    const portraitA = await addPhoto('person-a.png')
+    await service.processAsset(portraitA.id)
+    const [faceA] = await service.facesForAsset(ownerId, portraitA.id)
+    const personA = faceA!.personId!
+
+    const release = await holdingFor(personA)
+
+    // Recounting rather than a second scan: it reaches the lock immediately, so nothing
+    // sits waiting on it for the length of a detection — `lock_timeout` would cancel a
+    // waiter that did, and turn a slow machine into a failing test.
+    let finished = false
+    const recount = service.refreshCounts(ownerId, [personA]).then(() => {
+      finished = true
     })
 
     try {
-      // Started second and still first: unfixed, this waits on the owner's lock behind
-      // a person it has nothing to do with.
-      const scanB = await withDeadline(service.processAsset(againB.id), 20_000)
-      expect(scanB).toBe(1)
-      // And the lock that remains is a real one: A's face is still waiting for A.
-      expect(filedA).toBe(false)
+      await Bun.sleep(250)
+      expect(finished).toBe(false)
     } finally {
-      release()
-      await holder
-      await scanA
+      await release()
+      await recount
     }
 
-    expect(filedA).toBe(true)
-    const found = await service.listPeople(ownerId)
-    expect(found).toHaveLength(2)
-    expect(found.map((p) => p.faceCount)).toEqual([2, 2])
+    expect(finished).toBe(true)
   }, 60_000)
 })
 

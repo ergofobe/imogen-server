@@ -366,11 +366,14 @@ export class FaceService {
    * the authoritative decision is always made again under it. A face that joins somebody
    * already known therefore contends with that person alone.
    *
-   * Creating someone stays owner-wide, and cannot be narrowed: the whole question is
-   * whether a person exists, so there is nothing to name. What that costs is bounded by
+   * Creating someone stays owner-wide, and there is nothing narrower to take: the whole
+   * question is whether the person exists, so no key names them, and sharding the key on
+   * the embedding would let two shards create the same person — the failure the lock is
+   * here to prevent. So this path is not fixed, only made rarer. Its cost is bounded by
    * how many people a library has rather than how many faces, since every face after the
-   * first of each person joins instead. It is the same hold as before — one candidate
-   * query and the writes — and the unlocked probe that precedes it is outside it.
+   * first of each person joins instead, and the hold is what it always was: one candidate
+   * query and the writes, with the unlocked probe outside it. A library being scanned for
+   * the very first time, where most faces really are somebody new, still serialises.
    *
    * Detection and embedding, where the time actually goes, are outside all of this.
    */
@@ -432,11 +435,14 @@ export class FaceService {
    * Adds a face to a person already known, returning them — or null if they are not
    * there to be joined, which sends the caller round to the create path.
    *
-   * The centroid is re-read here rather than carried from the candidate search, because
-   * that search ran unlocked: another worker may have moved the mean since. Whether the
-   * face still *matches* is not re-asked. The two centroids differ by one face out of
-   * however many the person has, and preferring a second person for a face that was over
-   * the threshold moments ago is the worse of the two mistakes.
+   * The centroid is re-read and the threshold re-applied, because the candidate search
+   * ran unlocked and the mean can have moved since — and not only by the one face a
+   * concurrent filing adds. `mergePeople` and `reassignFaces` both recompute it over a
+   * different set of faces entirely, so a small cluster matched at 0.52 can become a
+   * three-hundred-face person by the time the lock is granted. Filing into that on the
+   * strength of the old reading is exactly the merge of two people that
+   * `CLUSTER.matchThreshold` is set high to avoid. Below the threshold this returns null
+   * and the caller starts again, which is the cheap mistake of the two.
    */
   private async joinPerson(tx: Tx, personId: string, filing: Filing): Promise<string | null> {
     const [person] = await tx
@@ -444,7 +450,10 @@ export class FaceService {
       .from(people)
       .where(eq(people.id, personId))
       .limit(1)
-    if (!person) return null
+    if (!person?.centroid) return null
+
+    const centroid = new Float32Array(person.centroid as number[])
+    if (!bestMatch(filing.embedding, [{ id: personId, centroid }])) return null
 
     // Clustering agrees with the human: this is their face, found somewhere new. Each
     // orphaned row is taken once, so a second detection of the same person moves the
@@ -455,15 +464,11 @@ export class FaceService {
       return personId
     }
 
-    const centroid = updateCentroid(
-      person.centroid ? new Float32Array(person.centroid as number[]) : null,
-      person.faceCount,
-      filing.embedding,
-    )
+    const moved = updateCentroid(centroid, person.faceCount, filing.embedding)
     await tx
       .update(people)
       .set({
-        centroid: Array.from(centroid),
+        centroid: Array.from(moved),
         faceCount: person.faceCount + 1,
         updatedAt: new Date(),
       })
@@ -644,17 +649,31 @@ export class FaceService {
     return moved
   }
 
-  /** Moves specific faces to a different person — the fix when clustering guessed wrong. */
+  /**
+   * Moves specific faces to a different person — the fix when clustering guessed wrong.
+   *
+   * Naming a person puts the move under their lock alongside the new centroid, for the
+   * reason `mergePeople` gives: between the check that they exist and the write that
+   * points a face at them, a recount is free to find them empty and delete them.
+   * Unassigning names nobody, and writing a null cannot point at a person who has gone.
+   */
   async reassignFaces(ownerId: string, faceIds: string[], personId: string | null) {
-    if (personId) await this.getPerson(ownerId, personId)
-    await this.db
-      .update(faces)
-      .set({ personId, confirmed: true })
-      .where(and(eq(faces.ownerId, ownerId), inArray(faces.id, faceIds)))
+    const move = (tx: Tx | Database) =>
+      tx
+        .update(faces)
+        .set({ personId, confirmed: true })
+        .where(and(eq(faces.ownerId, ownerId), inArray(faces.id, faceIds)))
 
     if (personId) {
-      await this.lockedForPeople(ownerId, [personId], (tx) => this.recomputeCentroid(personId, tx))
+      await this.getPerson(ownerId, personId)
+      await this.lockedForPeople(ownerId, [personId], async (tx) => {
+        await move(tx)
+        await this.recomputeCentroid(personId, tx)
+      })
+    } else {
+      await move(this.db)
     }
+
     await this.refreshCounts(ownerId)
   }
 
