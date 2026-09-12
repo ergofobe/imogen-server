@@ -140,6 +140,19 @@ async function addFace(assetId: string, personId: string, faceOwnerId = ownerId,
   return row!.id
 }
 
+/** Races work against a deadline so a regression fails the test rather than wedging it. */
+function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | 'timed out'> {
+  // Racing leaves the loser unobserved, and the loser here rejects for the very reason
+  // the test exists: a regression hits `lock_timeout`. Unhandled, that fails the whole
+  // file rather than this one assertion.
+  work.catch(() => {})
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<'timed out'>((resolve) => {
+    timer = setTimeout(() => resolve('timed out'), ms)
+  })
+  return Promise.race([work, deadline]).finally(() => clearTimeout(timer))
+}
+
 async function seedOwner(): Promise<string> {
   const [row] = await db
     .insert(users)
@@ -467,6 +480,98 @@ describe('recounting under concurrency', () => {
 
     expect(finished).toBe(true)
   })
+})
+
+/**
+ * Every face for one owner used to be filed under a single `faces:<owner>` advisory
+ * lock, so a library with one owner — the ordinary case — filed strictly one face at a
+ * time across every job worker. With `lock_timeout` set the waiters are not queued but
+ * cancelled, and a live import logged several thousand `canceling statement due to lock
+ * timeout` from this one lock.
+ *
+ * What the lock has to keep is that two scans cannot split one person in two, and that
+ * housekeeping cannot delete a person out from under a face being filed onto them.
+ * Neither needs the owner: a face whose person is already known needs only that person.
+ *
+ * So the holder below is exactly what a filing in progress now holds — the owner's key
+ * in *shared* mode, and its own person's key exclusively — and the test asks the two
+ * questions that separate a per-person lock from a per-owner one: another person's face
+ * goes in regardless, and the same person's face waits.
+ */
+describe.skipIf(!canRun)('filing faces under concurrency', () => {
+  /** Holds what a filing in progress holds, until the returned `release` is called. */
+  async function holdingFor(personId: string) {
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let locked!: () => void
+    const isLocked = new Promise<void>((resolve) => {
+      locked = resolve
+    })
+
+    const holder = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock_shared(hashtext(${`faces:${ownerId}`}))`)
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`faces:person:${personId}`}))`)
+      locked()
+      await held
+    })
+    await isLocked
+    return async () => {
+      release()
+      await holder
+    }
+  }
+
+  test('a face joins its person while another person is being filed', async () => {
+    const portraitA = await addPhoto('person-a.png')
+    const portraitB = await addPhoto('person-b.png')
+    await service.processAsset(portraitA.id)
+    await service.processAsset(portraitB.id)
+
+    const [faceA] = await service.facesForAsset(ownerId, portraitA.id)
+    const againB = await addPhoto('person-b.png', (i) => i.modulate({ brightness: 1.2 }))
+
+    const release = await holdingFor(faceA!.personId!)
+    try {
+      // Unfixed, this waits on the owner's key behind a person it has nothing to do with,
+      // and `lock_timeout` cancels it rather than queueing it.
+      expect(await withDeadline(service.processAsset(againB.id), 15_000)).toBe(1)
+    } finally {
+      await release()
+    }
+
+    const found = await service.listPeople(ownerId)
+    expect(found).toHaveLength(2)
+    expect(found.map((p) => p.faceCount).sort()).toEqual([1, 2])
+  }, 60_000)
+
+  test('but work on that same person does wait for it', async () => {
+    const portraitA = await addPhoto('person-a.png')
+    await service.processAsset(portraitA.id)
+    const [faceA] = await service.facesForAsset(ownerId, portraitA.id)
+    const personA = faceA!.personId!
+
+    const release = await holdingFor(personA)
+
+    // Recounting rather than a second scan: it reaches the lock immediately, so nothing
+    // sits waiting on it for the length of a detection — `lock_timeout` would cancel a
+    // waiter that did, and turn a slow machine into a failing test.
+    let finished = false
+    const recount = service.refreshCounts(ownerId, [personA]).then(() => {
+      finished = true
+    })
+
+    try {
+      await Bun.sleep(250)
+      expect(finished).toBe(false)
+    } finally {
+      await release()
+      await recount
+    }
+
+    expect(finished).toBe(true)
+  }, 60_000)
 })
 
 /**

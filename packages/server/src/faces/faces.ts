@@ -27,6 +27,16 @@ type ConfirmedFace = {
 /** How many people the index is asked for before choosing among them. */
 const MATCH_CANDIDATES = 12
 
+/** One face on its way into the library, ready to be filed under whichever person wins. */
+type Filing = {
+  ownerId: string
+  assetId: string
+  face: Face
+  embedding: Float32Array
+  vector: number[]
+  adoptable: Map<string, ConfirmedFace[]>
+}
+
 export type DetectedFace = {
   id: string
   assetId: string
@@ -158,7 +168,9 @@ export class FaceService {
     // been replaced would describe someone the library no longer holds.
     for (const { confirmed: row, detection: face } of pairs) {
       const embedding = await embedFace(recognition, path, face)
-      await this.locked(asset.ownerId, (tx) => this.refreshFace(tx, row, face, embedding))
+      await this.lockedForPeople(asset.ownerId, row.personId ? [row.personId] : [], (tx) =>
+        this.refreshFace(tx, row, face, embedding),
+      )
       if (row.personId) touched.add(row.personId)
     }
 
@@ -237,10 +249,44 @@ export class FaceService {
       .where(eq(people.id, row.personId))
   }
 
-  /** Every write that touches an owner's people happens under this lock; see `recordFace`. */
-  private locked<T>(ownerId: string, fn: (tx: Tx) => Promise<T>): Promise<T> {
+  /**
+   * Housekeeping that can reach any of the owner's people, serialised against every
+   * filing. Exclusive, and it has to be: a full recount deletes whichever people are
+   * left empty, so it cannot name them in advance and has to exclude the lot.
+   *
+   * This used to be the only lock here, taken once per face, which made one owner's
+   * whole library contend on a single key — with `lock_timeout` set, waiters are
+   * cancelled rather than queued, so an import spent itself on
+   * `canceling statement due to lock timeout`.
+   */
+  private lockedForOwner<T>(ownerId: string, fn: (tx: Tx) => Promise<T>): Promise<T> {
     return this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`faces:${ownerId}`}))`)
+      return fn(tx)
+    })
+  }
+
+  /**
+   * Work whose people are already known: exclusive on each of them, shared on the owner.
+   *
+   * The shared half is what keeps `lockedForOwner` meaningful — a full recount still
+   * excludes every filing in flight — while costing nothing between filings, since
+   * shared holders do not conflict with each other. Two faces of two different people
+   * therefore never wait on one another.
+   *
+   * Keys are taken in a fixed order so two overlapping sets cannot form a cycle.
+   */
+  private lockedForPeople<T>(
+    ownerId: string,
+    personIds: string[],
+    fn: (tx: Tx) => Promise<T>,
+  ): Promise<T> {
+    const keys = [...new Set(personIds)].sort()
+    return this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock_shared(hashtext(${`faces:${ownerId}`}))`)
+      for (const id of keys) {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`faces:person:${id}`}))`)
+      }
       return fn(tx)
     })
   }
@@ -308,16 +354,28 @@ export class FaceService {
   /**
    * Files one face: finds or creates its person and stores the face, together.
    *
-   * Both halves happen in one transaction under a per-owner advisory lock, and that
-   * matters twice over. Without the lock, workers scanning several photos of one person
-   * at once each find nobody yet and each create a separate person — three photographs
-   * of one face became three different people the first time this met the job queue.
-   * And unless the two halves are atomic, the housekeeping pass can delete a person who
-   * has no faces yet, in the instant between creating them and storing the face, leaving
-   * the face attached to nobody.
+   * Choosing the person and writing the face have to be atomic, or the housekeeping pass
+   * can delete a person in the instant between the two and leave the face attached to
+   * nobody. And two workers must not both decide a face belongs to nobody yet and each
+   * create a person for it — three photographs of one face became three different people
+   * the first time this met the job queue.
    *
-   * Only this step is serialised. Detection and embedding, where the time actually goes,
-   * stay parallel.
+   * Only the second of those needs a lock over the owner, and only when it actually
+   * creates someone: a person that does not exist yet cannot be named in a lock key.
+   * So the candidate search runs first, unlocked, purely to learn which lock to take —
+   * the authoritative decision is always made again under it. A face that joins somebody
+   * already known therefore contends with that person alone.
+   *
+   * Creating someone stays owner-wide, and there is nothing narrower to take: the whole
+   * question is whether the person exists, so no key names them, and sharding the key on
+   * the embedding would let two shards create the same person — the failure the lock is
+   * here to prevent. So this path is not fixed, only made rarer. Its cost is bounded by
+   * how many people a library has rather than how many faces, since every face after the
+   * first of each person joins instead, and the hold is what it always was: one candidate
+   * query and the writes, with the unlocked probe outside it. A library being scanned for
+   * the very first time, where most faces really are somebody new, still serialises.
+   *
+   * Detection and embedding, where the time actually goes, are outside all of this.
    */
   private async recordFace(
     ownerId: string,
@@ -326,61 +384,107 @@ export class FaceService {
     embedding: Float32Array,
     adoptable: Map<string, ConfirmedFace[]> = new Map(),
   ): Promise<string> {
-    const vector = Array.from(embedding)
+    const filing = { ownerId, assetId, face, embedding, vector: Array.from(embedding), adoptable }
 
-    return this.locked(ownerId, async (tx) => {
-      // The index narrows the field; the threshold decision is made in one place.
-      const nearby = await tx
-        .select({ id: people.id, centroid: people.centroid, faceCount: people.faceCount })
-        .from(people)
-        .where(and(eq(people.ownerId, ownerId), isNotNull(people.centroid)))
-        .orderBy(cosineDistance(people.centroid, vector))
-        .limit(MATCH_CANDIDATES)
-
-      const match = bestMatch(
-        embedding,
-        nearby.map((p) => ({ id: p.id, centroid: new Float32Array(p.centroid as number[]) })),
+    const candidate = await this.bestPerson(this.db, ownerId, embedding, filing.vector)
+    if (candidate) {
+      const joined = await this.lockedForPeople(ownerId, [candidate], (tx) =>
+        this.joinPerson(tx, candidate, filing),
       )
+      if (joined) return joined
+    }
 
-      let personId: string
-      if (match) {
-        // Clustering agrees with the human: this is their face, found somewhere new. Each
-        // orphaned row is taken once, so a second detection of the same person moves the
-        // next one rather than the same one twice.
-        const orphan = adoptable.get(match.id)?.shift()
-        if (orphan) {
-          await this.refreshFace(tx, orphan, face, embedding)
-          return match.id
-        }
+    return this.lockedForOwner(ownerId, async (tx) => {
+      // Re-asked under the exclusive lock, so a person another worker created while the
+      // probe above was running is found rather than duplicated.
+      const under = await this.bestPerson(tx, ownerId, embedding, filing.vector)
+      const joined = under && (await this.joinPerson(tx, under, filing))
+      if (joined) return joined
 
-        const existing = nearby.find((p) => p.id === match.id)!
-        const centroid = updateCentroid(match.centroid, existing.faceCount, embedding)
-        await tx
-          .update(people)
-          .set({
-            centroid: Array.from(centroid),
-            faceCount: existing.faceCount + 1,
-            updatedAt: new Date(),
-          })
-          .where(eq(people.id, match.id))
-        personId = match.id
-      } else {
-        const [created] = await tx
-          .insert(people)
-          .values({ ownerId, centroid: vector, faceCount: 1 })
-          .returning({ id: people.id })
-        personId = created!.id
-      }
+      const [created] = await tx
+        .insert(people)
+        .values({ ownerId, centroid: filing.vector, faceCount: 1 })
+        .returning({ id: people.id })
+      await this.insertFace(tx, filing, created!.id)
+      return created!.id
+    })
+  }
 
-      await tx.insert(faces).values({
-        assetId,
-        ownerId,
-        personId,
-        ...storedBox(face.box),
-        score: face.score,
-        embedding: vector,
-      })
+  /** The person this face belongs to, if any. The index narrows; the threshold decides. */
+  private async bestPerson(
+    exec: Database | Tx,
+    ownerId: string,
+    embedding: Float32Array,
+    vector: number[],
+  ): Promise<string | null> {
+    const nearby = await exec
+      .select({ id: people.id, centroid: people.centroid })
+      .from(people)
+      .where(and(eq(people.ownerId, ownerId), isNotNull(people.centroid)))
+      .orderBy(cosineDistance(people.centroid, vector))
+      .limit(MATCH_CANDIDATES)
+
+    const match = bestMatch(
+      embedding,
+      nearby.map((p) => ({ id: p.id, centroid: new Float32Array(p.centroid as number[]) })),
+    )
+    return match?.id ?? null
+  }
+
+  /**
+   * Adds a face to a person already known, returning them — or null if they are not
+   * there to be joined, which sends the caller round to the create path.
+   *
+   * The centroid is re-read and the threshold re-applied, because the candidate search
+   * ran unlocked and the mean can have moved since — and not only by the one face a
+   * concurrent filing adds. `mergePeople` and `reassignFaces` both recompute it over a
+   * different set of faces entirely, so a small cluster matched at 0.52 can become a
+   * three-hundred-face person by the time the lock is granted. Filing into that on the
+   * strength of the old reading is exactly the merge of two people that
+   * `CLUSTER.matchThreshold` is set high to avoid. Below the threshold this returns null
+   * and the caller starts again, which is the cheap mistake of the two.
+   */
+  private async joinPerson(tx: Tx, personId: string, filing: Filing): Promise<string | null> {
+    const [person] = await tx
+      .select({ centroid: people.centroid, faceCount: people.faceCount })
+      .from(people)
+      .where(eq(people.id, personId))
+      .limit(1)
+    if (!person?.centroid) return null
+
+    const centroid = new Float32Array(person.centroid as number[])
+    if (!bestMatch(filing.embedding, [{ id: personId, centroid }])) return null
+
+    // Clustering agrees with the human: this is their face, found somewhere new. Each
+    // orphaned row is taken once, so a second detection of the same person moves the
+    // next one rather than the same one twice.
+    const orphan = filing.adoptable.get(personId)?.shift()
+    if (orphan) {
+      await this.refreshFace(tx, orphan, filing.face, filing.embedding)
       return personId
+    }
+
+    const moved = updateCentroid(centroid, person.faceCount, filing.embedding)
+    await tx
+      .update(people)
+      .set({
+        centroid: Array.from(moved),
+        faceCount: person.faceCount + 1,
+        updatedAt: new Date(),
+      })
+      .where(eq(people.id, personId))
+    await this.insertFace(tx, filing, personId)
+    return personId
+  }
+
+  private insertFace(tx: Tx, filing: Filing, personId: string): Promise<unknown> {
+    return tx.insert(faces).values({
+      assetId: filing.assetId,
+      ownerId: filing.ownerId,
+      personId,
+      ...storedBox(filing.face.box),
+      score: filing.face.score,
+      embedding: filing.vector,
     })
   }
 
@@ -388,23 +492,23 @@ export class FaceService {
    * Recomputes how many faces each person has, counting only photos that are actually
    * visible — a person's count must never include a vaulted or trashed photo.
    *
-   * Under the same per-owner lock `recordFace` files beneath, and for the same reason it
-   * gives. This rewrites every one of the owner's `people` rows and then deletes the
-   * empty ones, so it is housekeeping of exactly the kind that lock exists to keep away
-   * from a filing in progress. Unlocked, four job workers recounting one owner's 5,758
-   * people put three backends in a lock cycle on this UPDATE — `deadlock detected` on
-   * repeat, `faces_person_id_people_id_fk` violations where the DELETE landed between a
-   * person being chosen and their face being written, and finally the 10s `lock_timeout`
-   * taking the server down with it.
+   * Under the same locks a filing takes, and for the same reason. This rewrites `people`
+   * rows and then deletes the empty ones, so it is housekeeping of exactly the kind those
+   * locks exist to keep away from a filing in progress. Unlocked, four job workers
+   * recounting one owner's 5,758 people put three backends in a lock cycle on this UPDATE
+   * — `deadlock detected` on repeat, `faces_person_id_people_id_fk` violations where the
+   * DELETE landed between a person being chosen and their face being written, and finally
+   * the 10s `lock_timeout` taking the server down with it.
    *
-   * Serialising recounts per owner costs throughput on a backfill, which is why naming
-   * the people to recount matters. `personIds` narrows both statements to those people;
-   * omitted, every one of the owner's is recounted, which is what trash, restore, merge
-   * and reassign all want. Scanning one photograph does not: it can only change the
-   * people in that photograph, so recounting the rest rewrites thousands of rows to the
-   * values they already held. Against the production owner above that was 5,758 rows per
-   * photograph across 28,320 photographs, every rewrite leaving a dead tuple on a table
-   * carrying an HNSW index, and every one of them queued behind this lock.
+   * Which lock follows from the scope. `personIds` narrows both statements to those
+   * people, so it needs only their keys and two scans of different photographs recount in
+   * parallel; omitted, every one of the owner's is recounted and any of them may be
+   * deleted, so nothing can be named in advance and the owner's key is taken exclusively.
+   * That unscoped form is what trash, restore, merge and reassign want. Scanning one
+   * photograph does not: it can only change the people in that photograph, so recounting
+   * the rest rewrites thousands of rows to the values they already held. Against the
+   * production owner above that was 5,758 rows per photograph across 28,320 photographs,
+   * every rewrite leaving a dead tuple on a table carrying an HNSW index.
    *
    * Narrowing is safe because both quantities are local: `face_count` and `cover_face_id`
    * are functions of one person's own faces, and only a person with a face on the changed
@@ -418,7 +522,7 @@ export class FaceService {
     const facesInScope = personIds ? sql`and ${inArray(sql`f.person_id`, personIds)}` : sql``
     const peopleInScope = personIds ? sql`and ${inArray(people.id, personIds)}` : sql``
 
-    await this.locked(ownerId, async (tx) => {
+    const recount = async (tx: Tx) => {
       await tx.execute(sql`
         update ${people} set face_count = counted.total, cover_face_id = counted.cover
         from (
@@ -449,7 +553,10 @@ export class FaceService {
               and a.deleted_at is null
           )
       `)
-    })
+    }
+
+    if (personIds) await this.lockedForPeople(ownerId, personIds, recount)
+    else await this.lockedForOwner(ownerId, recount)
   }
 
   /** Recounts after photos come or go without their faces changing — trash, restore. */
@@ -510,6 +617,19 @@ export class FaceService {
    * Folds one person into another. The surviving person keeps its name if it has one,
    * and every moved face is marked confirmed so re-clustering never undoes a human's
    * decision.
+   *
+   * The move, the delete and the new centroid are one locked transaction over everybody
+   * involved. The delete used to stand on its own, outside any lock, which left a scan
+   * free to file a face onto one of the people being merged away — between the move and
+   * the delete, so the face is not moved and the person it points at is gone. That is the
+   * `faces_person_id_people_id_fk` violation the housekeeping comments describe, arrived
+   * at from the other direction.
+   *
+   * The survivor is confirmed again inside that transaction. `getPerson` answers for the
+   * caller — whose person this is, and a 404 rather than a constraint — but it answers
+   * before the lock is granted, and an unscoped recount deleting a `keep` whose photos
+   * have all just been trashed is exactly what that window lets through. A merged-away
+   * person needs no such check: the move simply matches nothing.
    */
   async mergePeople(ownerId: string, keepId: string, mergeIds: string[]): Promise<number> {
     const keep = await this.getPerson(ownerId, keepId)
@@ -518,29 +638,64 @@ export class FaceService {
 
     for (const id of others) await this.getPerson(ownerId, id)
 
-    const moved = await this.db
-      .update(faces)
-      .set({ personId: keepId, confirmed: true })
-      .where(and(eq(faces.ownerId, ownerId), inArray(faces.personId, others)))
-      .returning({ id: faces.id })
+    const moved = await this.lockedForPeople(ownerId, [keepId, ...others], async (tx) => {
+      if (!(await this.stillThere(tx, keepId))) throw notFound('No such person')
 
-    await this.db.delete(people).where(inArray(people.id, others))
-    await this.locked(ownerId, (tx) => this.recomputeCentroid(keepId, tx))
+      const rows = await tx
+        .update(faces)
+        .set({ personId: keepId, confirmed: true })
+        .where(and(eq(faces.ownerId, ownerId), inArray(faces.personId, others)))
+        .returning({ id: faces.id })
+
+      await tx.delete(people).where(inArray(people.id, others))
+      await this.recomputeCentroid(keepId, tx)
+      return rows.length
+    })
+
     await this.refreshCounts(ownerId)
     void keep
-    return moved.length
+    return moved
   }
 
-  /** Moves specific faces to a different person — the fix when clustering guessed wrong. */
+  /**
+   * Moves specific faces to a different person — the fix when clustering guessed wrong.
+   *
+   * Naming a person puts the move under their lock alongside the new centroid, for the
+   * reason `mergePeople` gives: between the check that they exist and the write that
+   * points a face at them, a recount is free to find them empty and delete them.
+   * Unassigning names nobody, and writing a null cannot point at a person who has gone.
+   * `getPerson` above answers for the caller and cannot bind, since it runs before the
+   * lock is granted; the re-read inside does the binding.
+   */
   async reassignFaces(ownerId: string, faceIds: string[], personId: string | null) {
-    if (personId) await this.getPerson(ownerId, personId)
-    await this.db
-      .update(faces)
-      .set({ personId, confirmed: true })
-      .where(and(eq(faces.ownerId, ownerId), inArray(faces.id, faceIds)))
+    const move = (tx: Tx | Database) =>
+      tx
+        .update(faces)
+        .set({ personId, confirmed: true })
+        .where(and(eq(faces.ownerId, ownerId), inArray(faces.id, faceIds)))
 
-    if (personId) await this.locked(ownerId, (tx) => this.recomputeCentroid(personId, tx))
+    if (personId) {
+      await this.getPerson(ownerId, personId)
+      await this.lockedForPeople(ownerId, [personId], async (tx) => {
+        if (!(await this.stillThere(tx, personId))) throw notFound('No such person')
+        await move(tx)
+        await this.recomputeCentroid(personId, tx)
+      })
+    } else {
+      await move(this.db)
+    }
+
     await this.refreshCounts(ownerId)
+  }
+
+  /** Whether the person is still there, asked under the lock, where the answer holds. */
+  private async stillThere(tx: Tx, personId: string): Promise<boolean> {
+    const [row] = await tx
+      .select({ id: people.id })
+      .from(people)
+      .where(eq(people.id, personId))
+      .limit(1)
+    return row !== undefined
   }
 
   private async recomputeCentroid(personId: string, tx: Tx): Promise<void> {
