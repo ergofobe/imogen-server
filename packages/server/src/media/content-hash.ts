@@ -18,6 +18,7 @@ const MAX_META_BYTES = 16 * 1024 * 1024
 const MAX_ITEMS = 4096
 const MAX_REFERENCES = 65536
 const MAX_EXTENTS = 65536
+const MAX_LOCATIONS = 65536
 
 const SOI = 0xd8
 const EOI = 0xd9
@@ -274,6 +275,10 @@ function readItemLocations(buf: Buffer, iloc: Child): Map<number, ItemLocation> 
   if (at + idWidth > iloc.end) return null
   const count = buf.readUIntBE(at, idWidth)
   at += idWidth
+  // Separate from MAX_ITEMS, which bounds the walk rather than the table: a version 2 entry
+  // declaring no extents costs ten bytes, so a `meta` at the size cap could otherwise declare
+  // over a million of them and the map alone would be hundreds of megabytes.
+  if (count > MAX_LOCATIONS) return null
 
   const locations = new Map<number, ItemLocation>()
   let totalExtents = 0
@@ -384,9 +389,15 @@ function unclaimedRanges(mdats: BoxHeader[], claimed: Extent[]): Range[] {
   }
 
   const gaps: Range[] = []
+  // Both lists are in file order, so a span the walk has passed is never wanted again. Without
+  // carrying this index, a file whose claimed spans all sit before a long run of `mdat` boxes
+  // rescans every span for every box, which is quadratic in two separately bounded numbers.
+  let first = 0
   for (const mdat of mdats) {
     let cursor = mdat.payloadStart
-    for (const span of merged) {
+    while (first < merged.length && merged[first]!.end <= cursor) first++
+    for (let i = first; i < merged.length; i++) {
+      const span = merged[i]!
       if (span.start >= mdat.payloadEnd) break
       if (span.end <= cursor) continue
       if (span.start > cursor) gaps.push({ start: cursor, end: span.start })

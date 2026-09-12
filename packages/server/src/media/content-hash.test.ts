@@ -343,6 +343,10 @@ type HeifSpec = {
   /** Extra items, each with `EXTENT_FLOOD_PER_ITEM` extents, for the extent bound. */
   floodExtentItems?: number
   ilocLayout?: IlocLayout
+  /** Empty top-level `mdat` boxes after the real one, to stress the unclaimed-gap walk. */
+  trailingEmptyMdats?: number
+  /** Extra `iloc` entries declaring no extents at all, for the location bound. */
+  floodLocations?: number
   /** A `moov`, which makes the file an image sequence rather than a still. */
   withTracks?: boolean
   /**
@@ -400,8 +404,14 @@ function heif(spec: HeifSpec): Buffer {
       }),
     )
 
+    const locationFlood: ItemLocation[] = Array.from(
+      { length: spec.floodLocations ?? 0 },
+      (_, n) => ({ id: 30000 + n, construction: 0, extents: [] }),
+    )
+
     const first = gridInMdat ? 1 : 0
     const locations: ItemLocation[] = [
+      ...locationFlood,
       ...extentFlood,
       {
         id: PRIMARY_ID,
@@ -456,7 +466,12 @@ function heif(spec: HeifSpec): Buffer {
   const measured = build(0)
   const final = build(ftyp.length + measured.meta.length + 8)
   const trailer = spec.trailer ? box('mdat', spec.trailer) : Buffer.alloc(0)
-  return Buffer.concat([ftyp, final.meta, final.mdat, trailer])
+  const emptyMdats = Buffer.alloc(8 * (spec.trailingEmptyMdats ?? 0))
+  for (let at = 0; at < emptyMdats.length; at += 8) {
+    emptyMdats.writeUInt32BE(8, at)
+    emptyMdats.write('mdat', at + 4, 'ascii')
+  }
+  return Buffer.concat([ftyp, final.meta, final.mdat, trailer, emptyMdats])
 }
 
 describe('contentHash HEIF', () => {
@@ -574,6 +589,23 @@ describe('contentHash HEIF', () => {
 
     expect(await hashOf(heif({ tiles, xmp: shortXmp, externalItem: 'primary' }))).toBeNull()
   })
+
+  test('bounds the iloc table: more locations than the cap returns null', async () => {
+    const xmp = Buffer.from('<x:xmpmeta/>')
+    // Only version 2 can declare this many: its item_count is 32-bit where version 1's is 16.
+    const ilocLayout = { version: 2, offsetSize: 4, lengthSize: 4, baseOffsetSize: 0, indexSize: 0 }
+    expect(await hashOf(heif({ tiles, xmp, ilocLayout, floodLocations: 1000 }))).not.toBeNull()
+    expect(await hashOf(heif({ tiles, xmp, ilocLayout, floodLocations: 65537 }))).toBeNull()
+  }, 30000)
+
+  test('a long run of mdat boxes does not rescan the claimed spans', async () => {
+    const xmp = Buffer.from('<x:xmpmeta/>')
+    // Claimed spans all sit before the run, which is the shape that made the gap walk
+    // quadratic. The timeout is the assertion: this takes about 0.7s walking each list once
+    // and about 9s rescanning, so the limit sits well clear of both even on a slow runner.
+    const file = heif({ tiles, xmp, floodExtentItems: 1, trailingEmptyMdats: 60000 })
+    expect(await hashOf(file)).not.toBeNull()
+  }, 5000)
 
   test('an image sequence keeps the mdat rule despite its cover item', async () => {
     const xmp = Buffer.from('<x:xmpmeta/>')
