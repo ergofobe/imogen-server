@@ -3,6 +3,7 @@ import type { AssetType, ExifData, GeoPoint } from '@imogen/shared'
 import exifr from 'exifr'
 import type { Sharp } from 'sharp'
 import sharp from 'sharp'
+import { isPlaceableLatitude, isPlaceableLongitude, isUsableAltitude } from './coordinates.ts'
 import { decodeImage, decodeWithFfmpeg } from './decode.ts'
 
 const THUMBNAIL_EDGE = 320
@@ -338,15 +339,13 @@ export class MediaPipeline {
       orientation: typeof parsed.Orientation === 'number' ? parsed.Orientation : null,
     }
 
-    // `typeof NaN` is 'number', and a GPS rational with a zero denominator decodes to
-    // exactly that, so a coordinate has to be tested for a usable value rather than for a
-    // type. Storing the NaN would put a location on the row that reaches a client as a
-    // null coordinate, which its model has no room for.
-    if (Number.isFinite(parsed.latitude) && Number.isFinite(parsed.longitude)) {
+    // What a GPS block decodes to has to be tested for a value that locates something,
+    // not for a type: see `coordinates.ts` for the two ways it fails to.
+    if (isPlaceableLatitude(parsed.latitude) && isPlaceableLongitude(parsed.longitude)) {
       result.location = {
         latitude: parsed.latitude,
         longitude: parsed.longitude,
-        altitude: Number.isFinite(parsed.GPSAltitude) ? parsed.GPSAltitude : null,
+        altitude: isUsableAltitude(parsed.GPSAltitude) ? parsed.GPSAltitude : null,
         place: null,
       }
     }

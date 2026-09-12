@@ -293,6 +293,24 @@ describe('browsing', () => {
     expect(blob.type).toBe('image/webp')
   })
 
+  /**
+   * The client model drops a coordinate outside its range on decode, so a server that
+   * still emits one leaves the row holding a location no client will ever show. The row
+   * is written straight into Postgres because `GeoPoint` refuses such a coordinate on the
+   * request path: no client can put one there, only a GPS block can.
+   */
+  test('answers with no location for a coordinate outside its range', async () => {
+    await signUp()
+    await client.assets.upload(await photo('placeless.jpg', 200))
+    await services.queue.drain()
+    const [stored] = (await client.assets.list({ limit: 1 })).items
+    await harness.db.execute(
+      sql`update assets set latitude = 200, longitude = 12.5 where id = ${stored!.id}`,
+    )
+
+    expect((await client.assets.get(stored!.id)).location).toBeNull()
+  })
+
   test('summarises the library', async () => {
     await library()
 

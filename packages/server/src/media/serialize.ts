@@ -1,5 +1,6 @@
 import type { Asset } from '@imogen/shared'
 import type { AssetRow } from '../db/schema.ts'
+import { isPlaceableLatitude, isPlaceableLongitude, isUsableAltitude } from './coordinates.ts'
 
 /** Turns a database row into the shape the API contract promises. */
 export function toAsset(row: AssetRow): Asset {
@@ -34,24 +35,16 @@ export function toAsset(row: AssetRow): Asset {
 }
 
 /**
- * A coordinate has to be a finite number to locate anything. NaN -- which is what a GPS
- * rational with a zero denominator decodes to -- passes a null check, and
- * `JSON.stringify` then writes it out as `null` because JSON has no NaN literal. That
- * hands the client a location object with a null coordinate, which no port's model
- * allows, so the response fails to deserialise instead of simply arriving without a
- * location.
+ * Half a pair fixes nothing on a map, so both coordinates go or neither does. The bound
+ * is applied here as well as on ingest because a row written before the pipeline checked
+ * it has to stop being served as a location too.
  */
-function isUsableCoordinate(value: number | null): value is number {
-  return value !== null && Number.isFinite(value)
-}
-
-/** Half a pair fixes nothing on a map, so both coordinates go or neither does. */
 function toLocation(row: AssetRow): Asset['location'] {
-  if (!isUsableCoordinate(row.latitude) || !isUsableCoordinate(row.longitude)) return null
+  if (!isPlaceableLatitude(row.latitude) || !isPlaceableLongitude(row.longitude)) return null
   return {
     latitude: row.latitude,
     longitude: row.longitude,
-    altitude: isUsableCoordinate(row.altitude) ? row.altitude : null,
+    altitude: isUsableAltitude(row.altitude) ? row.altitude : null,
     place: row.place,
   }
 }
