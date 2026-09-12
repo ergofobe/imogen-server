@@ -286,11 +286,86 @@ describe('repairing library rows written before ingest read the file correctly',
 
     test('counts the rows the pass will examine', async () => {
       await insertAsset({ capturedAtIsExact: true })
+      // Opened too: the old reader wrote this flag, so `false` does not mean the file has
+      // nothing to say. See the widened predicate.
       await insertAsset({ capturedAtIsExact: false })
       await insertAsset({ capturedAtIsExact: true, capturedAtOriginal: new Date() })
       await insertAsset({ capturedAtIsExact: true, type: 'video', mimeType: 'video/mp4' })
 
-      expect(await countRepairCandidates(db, 'captureTime')).toBe(1)
+      expect(await countRepairCandidates(db, 'captureTime')).toBe(2)
+    })
+  })
+
+  /**
+   * `captured_at_is_exact` was written by the old reader, so `false` means "that reader
+   * could not parse the date tag", not "the file has nothing to say". Those rows fell
+   * through to a client timestamp or a file mtime and are the worst-dated in the library,
+   * so the walk opens them — and the same leave-alone standard applies to them as to any
+   * other row it opens.
+   */
+  describe('rows the old reader gave up on', () => {
+    test('repairs one whose file names an instant with an offset, flag and all', async () => {
+      const queue = setup()
+      const path = await writeJpeg('inexact', {
+        capturedAt: '2026:08:04 16:52:52',
+        offset: '+09:00',
+      })
+      // Dated by the file mtime, because the old reader made nothing of the date tag.
+      const asset = await insertAsset({
+        originalPath: path,
+        capturedAt: new Date('2026-09-01T12:00:00.000Z'),
+        capturedAtIsExact: false,
+      })
+
+      await queue.enqueue(CAPTURE_TIME_REPAIR_JOB, {})
+      await queue.drain()
+
+      const row = await read(asset.id)
+      expect(row.capturedAt.toISOString()).toBe('2026-08-04T07:52:52.000Z')
+      expect(row.capturedAtIsExact).toBe(true)
+    })
+
+    test('leaves one whose file still names no offset entirely alone', async () => {
+      const queue = setup()
+      const path = await writeJpeg('inexact-no-offset', { capturedAt: '2026:08:04 16:52:52' })
+      const asset = await insertAsset({
+        originalPath: path,
+        capturedAt: new Date('2026-09-01T12:00:00.000Z'),
+        capturedAtIsExact: false,
+      })
+
+      await queue.enqueue(CAPTURE_TIME_REPAIR_JOB, {})
+      await queue.drain()
+
+      const row = await read(asset.id)
+      expect(row.capturedAt.toISOString()).toBe('2026-09-01T12:00:00.000Z')
+      expect(row.capturedAtIsExact).toBe(false)
+      expect(row.updatedAt.toISOString()).toBe(asset.updatedAt.toISOString())
+    })
+
+    /**
+     * A client timestamp can already be the right instant while the label says otherwise.
+     * Testing the instant alone would leave the row holding an exact value flagged inexact.
+     */
+    test('puts the label right when the instant already matches', async () => {
+      const queue = setup()
+      const path = await writeJpeg('inexact-right-instant', {
+        capturedAt: '2026:08:04 16:52:52',
+        offset: '+09:00',
+      })
+      const asset = await insertAsset({
+        originalPath: path,
+        capturedAt: new Date('2026-08-04T07:52:52.000Z'),
+        capturedAtIsExact: false,
+        capturedAtFromClient: true,
+      })
+
+      await queue.enqueue(CAPTURE_TIME_REPAIR_JOB, {})
+      await queue.drain()
+
+      const row = await read(asset.id)
+      expect(row.capturedAt.toISOString()).toBe('2026-08-04T07:52:52.000Z')
+      expect(row.capturedAtIsExact).toBe(true)
     })
   })
 

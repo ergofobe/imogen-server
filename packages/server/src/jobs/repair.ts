@@ -53,13 +53,13 @@ type Update = Partial<typeof assets.$inferInsert> | null
  * against a deploy date would need a date this code cannot know, so the pass re-checks
  * everything instead and is a no-op on a row that is already right.
  *
- * `captured_at_is_exact` is the candidate set #54 names, and it is narrower than the
- * defect: it was written by the old reader, so a file whose date tag that reader could not
- * make sense of is `false` here even when today's `exifInstant` reads it — including with
- * an offset. Those rows are dated by a client timestamp or a file mtime and this pass will
- * not open them. Widening the set is a decision for #54, not for this pass to take on its
- * own; nothing here would be unsafe if it were widened, because the repair below acts only
- * on a file that names an instant with an offset.
+ * Deliberately wider than the `captured_at_is_exact = true` set #54 first named, because
+ * that column is narrower than the defect. It was written by the *old* reader, so a file
+ * whose date tag that reader could not make sense of reads `false` here even when today's
+ * `exifInstant` handles it — offset and all. Those rows fell through to a client timestamp
+ * or a file mtime and are exactly the defect, so the pass opens them too. Widening costs
+ * nothing in safety: `repairCaptureTime` acts only on a file that names an instant *with*
+ * an offset, and leaves every other row untouched however it got into the set.
  *
  * Videos are out: their pre-fix value came from ffprobe's `creation_time`, and nothing in
  * the container can settle it. A row an owner has corrected by hand is out for good.
@@ -71,11 +71,7 @@ type Update = Partial<typeof assets.$inferInsert> | null
  * with no other way to fix it, and a photograph waiting in the trash is one restore away
  * from the timeline it would be wrong in.
  */
-const captureTimeWhere = and(
-  eq(assets.type, 'image'),
-  eq(assets.capturedAtIsExact, true),
-  sql`${assets.capturedAtOriginal} is null`,
-)
+const captureTimeWhere = and(eq(assets.type, 'image'), sql`${assets.capturedAtOriginal} is null`)
 
 /**
  * Images whose stored `exif.orientation` is null.
@@ -249,10 +245,14 @@ export async function repairAsset(
 function repairCaptureTime(row: AssetRow, tags: Record<string, unknown>): Update {
   const captured = exifCapturedAt(tags)
   if (!captured?.hasOffset) return null
-  if (captured.at.getTime() === row.capturedAt.getTime()) return null
+  // Both halves, not just the instant: a row the walk now opens because its
+  // `captured_at_is_exact` is false can already hold the right instant by way of a client
+  // timestamp, and it still needs the label put right. Testing the instant alone is what
+  // makes a second run a no-op, so the flag is tested with it rather than instead of it.
+  if (captured.at.getTime() === row.capturedAt.getTime() && row.capturedAtIsExact) return null
 
-  // Re-derived alongside so the row stays self-consistent, though a file that named an
-  // instant is exact by definition and every candidate was already flagged as one.
+  // Re-derived alongside so the row stays self-consistent: a file that names an instant is
+  // exact by definition, whatever the old reader made of it.
   return { capturedAt: captured.at, capturedAtIsExact: true }
 }
 
