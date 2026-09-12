@@ -36,7 +36,14 @@ type Repair = {
   /** The rows the pass will examine. Not all of them can be repaired; see the notes below. */
   candidates: (db: Database, limit: number, after: string | null) => Promise<{ id: string }[]>
   where: ReturnType<typeof and>
+  /** What one row becomes, given its file's tags, or `null` when it needs no change. */
+  repair: (row: AssetRow, tags: Record<string, unknown>) => Update
 }
+
+type AssetRow = typeof assets.$inferSelect
+
+/** The columns a repair writes, or `null` when the row is already right. */
+type Update = Partial<typeof assets.$inferInsert> | null
 
 /**
  * Assets whose stored capture time may be the zone-less EXIF wall clock #50 replaced.
@@ -81,6 +88,7 @@ export const REPAIRS: Record<RepairName, Repair> = {
       'any date an owner has corrected by hand. Videos are not examined.',
     candidates: (db, limit, after) => page(db, captureTimeWhere, limit, after),
     where: captureTimeWhere,
+    repair: repairCaptureTime,
   },
   exifOrientation: {
     job: ORIENTATION_REPAIR_JOB,
@@ -93,11 +101,14 @@ export const REPAIRS: Record<RepairName, Repair> = {
       'orientation is rewritten; every other EXIF field is left as it was.',
     candidates: (db, limit, after) => page(db, orientationWhere, limit, after),
     where: orientationWhere,
+    repair: repairOrientation,
   },
 }
 
 export function isRepairName(value: string): value is RepairName {
-  return value in REPAIRS
+  // `in` walks the prototype chain, so `toString` and `constructor` would pass it and the
+  // route would answer 500 where an unknown name has to answer 404.
+  return Object.hasOwn(REPAIRS, value)
 }
 
 /** How many rows a pass would examine, for the panel to show before anything is written. */
@@ -120,19 +131,10 @@ export async function repairIsDone(db: Database, name: RepairName): Promise<bool
  * shows the candidate count first.
  */
 export function registerRepairJobs(queue: JobQueue, deps: RepairJobDeps): void {
-  register(queue, deps, 'captureTime', repairCaptureTime)
-  register(queue, deps, 'exifOrientation', repairOrientation)
+  for (const name of Object.keys(REPAIRS) as RepairName[]) register(queue, deps, name)
 }
 
-/** An asset the pass has looked at, or `null` when its row needs no change. */
-type Update = Partial<typeof assets.$inferInsert> | null
-
-function register(
-  queue: JobQueue,
-  deps: RepairJobDeps,
-  name: RepairName,
-  repair: (row: AssetRow, tags: Record<string, unknown>) => Update,
-): void {
+function register(queue: JobQueue, deps: RepairJobDeps, name: RepairName): void {
   const { job, doneKey, candidates } = REPAIRS[name]
 
   /**
@@ -143,7 +145,7 @@ function register(
     const after = typeof payload.after === 'string' ? payload.after : null
     const batch = await candidates(deps.db, REPAIR_BATCH, after)
 
-    for (const { id } of batch) await applyRepair(deps, id, repair)
+    for (const { id } of batch) await repairAsset(deps, id, name)
 
     if (batch.length === REPAIR_BATCH) {
       await queue.enqueue(job, { after: batch[batch.length - 1]!.id })
@@ -158,14 +160,29 @@ function register(
   })
 }
 
-type AssetRow = typeof assets.$inferSelect
-
-async function applyRepair(
+/**
+ * Re-reads one asset and writes what the file says, if anything.
+ *
+ * The pass's own predicate is re-asserted on both the read and the write, not left behind
+ * in the batch query. The batch names twenty-five ids up front and each one is then opened
+ * from disk in turn, so seconds pass between a row being chosen and being written. An owner
+ * correcting a capture date through the API inside that window fills
+ * `captured_at_original` — and an update keyed on the id alone would overwrite the
+ * correction from the file moments later, which is the one irreversible thing this pass
+ * promises never to do.
+ */
+export async function repairAsset(
   deps: RepairJobDeps,
   id: string,
-  repair: (row: AssetRow, tags: Record<string, unknown>) => Update,
+  name: RepairName,
 ): Promise<void> {
-  const [row] = await deps.db.select().from(assets).where(eq(assets.id, id)).limit(1)
+  const { where, repair } = REPAIRS[name]
+
+  const [row] = await deps.db
+    .select()
+    .from(assets)
+    .where(and(eq(assets.id, id), where))
+    .limit(1)
   // An upload that never finished has no file to learn from.
   if (!row || row.originalPath === '') return
 
@@ -180,7 +197,7 @@ async function applyRepair(
   await deps.db
     .update(assets)
     .set({ ...update, updatedAt: new Date() })
-    .where(eq(assets.id, id))
+    .where(and(eq(assets.id, id), where))
 }
 
 /**

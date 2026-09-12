@@ -319,9 +319,12 @@ export class AdminService {
   /**
    * Starts one pass.
    *
-   * Refuses while the same pass is already in the queue. Two walks of the same rows would
-   * not corrupt anything — every repair is a no-op on a row that is already right — but
-   * they would double the reading and make the panel's own progress unreadable.
+   * Refuses while the same pass is already in the queue. Deliberately a guard rather than
+   * a lock: it is check-then-enqueue, so two administrators pressing Start in the same
+   * instant can still both get a walk. That costs reading and nothing else — every repair
+   * is a no-op on a row that is already right, and the write is guarded by the pass's own
+   * predicate — so the check is here to stop the obvious double-press making the panel's
+   * progress unreadable, not to promise there is only ever one.
    */
   async startRepair(name: RepairName): Promise<void> {
     const repair = REPAIRS[name]

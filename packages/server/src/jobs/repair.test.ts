@@ -12,6 +12,7 @@ import {
   ORIENTATION_REPAIR_JOB,
   REPAIR_BATCH,
   registerRepairJobs,
+  repairAsset,
 } from './repair.ts'
 
 const harness = await createTestDatabase()
@@ -290,6 +291,51 @@ describe('repairing library rows written before ingest read the file correctly',
       await insertAsset({ capturedAtIsExact: true, type: 'video', mimeType: 'video/mp4' })
 
       expect(await countRepairCandidates(db, 'captureTime')).toBe(1)
+    })
+  })
+
+  /**
+   * A batch names twenty-five ids up front and then opens each file in turn, so seconds
+   * pass between a row being chosen and being written. Everything the passes promise never
+   * to touch has to survive being corrected inside that window, which means the guard has
+   * to be on the write and not only on the query that picked the row.
+   *
+   * Expressed by repairing one asset directly, which is the same thing without having to
+   * race the queue: the row was a candidate when the batch was built and is not one by the
+   * time its turn comes.
+   */
+  describe('a row that leaves the candidate set while the batch is in flight', () => {
+    test('is not overwritten when an owner corrects the date first', async () => {
+      const path = await writeJpeg('raced', { capturedAt: '2026:08:04 16:52:52', offset: '+09:00' })
+      const asset = await insertAsset({
+        originalPath: path,
+        capturedAt: new Date('2026-08-04T16:52:52.000Z'),
+        capturedAtIsExact: true,
+      })
+
+      const corrected = new Date('1999-01-01T00:00:00.000Z')
+      await db
+        .update(assets)
+        .set({ capturedAt: corrected, capturedAtOriginal: new Date('2026-08-04T16:52:52.000Z') })
+        .where(eq(assets.id, asset.id))
+
+      await repairAsset({ db, storage, queue: setup() }, asset.id, 'captureTime')
+
+      expect((await read(asset.id)).capturedAt.toISOString()).toBe(corrected.toISOString())
+    })
+
+    test('is not rewritten when its orientation has since been filled in', async () => {
+      const path = await writeJpeg('raced-orientation', { orientation: 6 })
+      const asset = await insertAsset({ originalPath: path, exif: { orientation: null } })
+
+      await db
+        .update(assets)
+        .set({ exif: { orientation: 1 } })
+        .where(eq(assets.id, asset.id))
+
+      await repairAsset({ db, storage, queue: setup() }, asset.id, 'exifOrientation')
+
+      expect((await read(asset.id)).exif).toMatchObject({ orientation: 1 })
     })
   })
 

@@ -488,6 +488,17 @@ describe('one-off repairs', () => {
     expect(await harness.db.select().from(jobs)).toEqual([])
   })
 
+  /** A name off `Object.prototype` must be as absent as any other, not a 500. */
+  test('a name the prototype chain happens to answer to is not found either', async () => {
+    const admin = await signUp('first@example.com')
+
+    for (const name of ['toString', 'constructor', 'hasOwnProperty']) {
+      const response = await asAdmin(`/api/v1/admin/repairs/${name}`, 'POST', {}, admin.cookie)
+      expect(response.status).toBe(404)
+    }
+    expect(await harness.db.select().from(jobs)).toEqual([])
+  })
+
   test('an ordinary account cannot see them, let alone run one', async () => {
     await signUp('first@example.com')
     const { cookie } = await signUp('second@example.com')

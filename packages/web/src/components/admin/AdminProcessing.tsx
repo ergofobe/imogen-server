@@ -152,6 +152,12 @@ function Repairs({ onStarted }: { onStarted: () => void }) {
   const { data, isPending, isError } = useQuery({
     queryKey: ['admin', 'repairs'],
     queryFn: () => imogen.http.request<{ items: Repair[] }>('GET', '/api/v1/admin/repairs'),
+    // Polled only while a pass is walking, so the count falls as it goes and the button
+    // comes back by itself when it finishes. A still panel asks nothing: each answer costs
+    // a count over every asset, and the orientation one reads a JSON field no index can
+    // serve, so a steady three-second poll would be two table scans a tick for nothing.
+    refetchInterval: (query) =>
+      query.state.data?.items.some((repair) => repair.state === 'running') ? 3000 : false,
     retry: false,
   })
 
