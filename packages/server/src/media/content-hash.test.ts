@@ -251,27 +251,80 @@ type ItemLocation = {
   dataReferenceIndex?: number
 }
 
-/** An `iloc` version 1 with 4-byte offsets and lengths and no base offset or extent index. */
-function ilocBox(items: ItemLocation[]): Buffer {
-  const head = Buffer.alloc(4)
-  head.writeUInt8(0x44, 0) // offset_size = 4, length_size = 4
-  head.writeUInt8(0x00, 1) // base_offset_size = 0, index_size = 0
-  head.writeUInt16BE(items.length, 2)
+/** The field widths an `iloc` declares for itself; every one of them varies by version. */
+type IlocLayout = {
+  version: number
+  offsetSize: number
+  lengthSize: number
+  baseOffsetSize: number
+  indexSize: number
+}
+
+const DEFAULT_ILOC: IlocLayout = {
+  version: 1,
+  offsetSize: 4,
+  lengthSize: 4,
+  baseOffsetSize: 0,
+  indexSize: 0,
+}
+
+function writeField(buf: Buffer, at: number, size: number, value: number): void {
+  if (size === 8) buf.writeBigUInt64BE(BigInt(value), at)
+  else if (size === 4) buf.writeUInt32BE(value, at)
+}
+
+function ilocBox(items: ItemLocation[], layout: IlocLayout): Buffer {
+  const { version, offsetSize, lengthSize, baseOffsetSize } = layout
+  const hasConstruction = version === 1 || version === 2
+  const indexSize = hasConstruction ? layout.indexSize : 0
+  const idWidth = version < 2 ? 2 : 4
+
+  const head = Buffer.alloc(2 + idWidth)
+  head.writeUInt8((offsetSize << 4) | lengthSize, 0)
+  head.writeUInt8((baseOffsetSize << 4) | indexSize, 1)
+  head.writeUIntBE(items.length, 2, idWidth)
 
   const entries = items.map((item) => {
-    const buf = Buffer.alloc(8 + item.extents.length * 8)
-    buf.writeUInt16BE(item.id, 0)
-    buf.writeUInt16BE(item.construction, 2)
-    buf.writeUInt16BE(item.dataReferenceIndex ?? 0, 4) // 0 means "this file"
-    buf.writeUInt16BE(item.extents.length, 6)
-    item.extents.forEach((extent, i) => {
-      buf.writeUInt32BE(extent.offset, 8 + i * 8)
-      buf.writeUInt32BE(extent.length, 12 + i * 8)
-    })
+    // A base offset is only meaningful for extents that are file offsets, and exercising it
+    // means actually subtracting it, not writing a zero into a wider field.
+    const base =
+      baseOffsetSize > 0 && item.construction === 0
+        ? Math.min(...item.extents.map((extent) => extent.offset))
+        : 0
+
+    const extentWidth = indexSize + offsetSize + lengthSize
+    const buf = Buffer.alloc(
+      idWidth +
+        (hasConstruction ? 2 : 0) +
+        2 +
+        baseOffsetSize +
+        2 +
+        item.extents.length * extentWidth,
+    )
+    let at = 0
+    buf.writeUIntBE(item.id, at, idWidth)
+    at += idWidth
+    if (hasConstruction) {
+      buf.writeUInt16BE(item.construction, at)
+      at += 2
+    }
+    buf.writeUInt16BE(item.dataReferenceIndex ?? 0, at) // 0 means "this file"
+    at += 2
+    writeField(buf, at, baseOffsetSize, base)
+    at += baseOffsetSize
+    buf.writeUInt16BE(item.extents.length, at)
+    at += 2
+    for (const extent of item.extents) {
+      at += indexSize // extent_index, left zero: the parser only has to skip it
+      writeField(buf, at, offsetSize, extent.offset - base)
+      at += offsetSize
+      writeField(buf, at, lengthSize, extent.length)
+      at += lengthSize
+    }
     return buf
   })
 
-  return fullBox('iloc', 1, Buffer.concat([head, ...entries]))
+  return fullBox('iloc', version, Buffer.concat([head, ...entries]))
 }
 
 const GRID_DESCRIPTOR = Buffer.from([0x00, 0x00, 0x01, 0x01, 0x02, 0x00, 0x02, 0x00])
@@ -289,6 +342,7 @@ type HeifSpec = {
   externalItem?: 'xmp' | 'primary'
   /** Extra items, each with `EXTENT_FLOOD_PER_ITEM` extents, for the extent bound. */
   floodExtentItems?: number
+  ilocLayout?: IlocLayout
   /** A `moov`, which makes the file an image sequence rather than a still. */
   withTracks?: boolean
   /**
@@ -311,8 +365,18 @@ const AUX_ID = 91
  */
 function heif(spec: HeifSpec): Buffer {
   const ftyp = heifFtypBox(spec.brands ?? ['heic', 'mif1', 'heic'])
+  const iloc = spec.ilocLayout ?? DEFAULT_ILOC
   const tileIds = spec.tiles.map((_, i) => 10 + i)
-  const payloads = [...spec.tiles, spec.xmp, ...(spec.aux ? [spec.aux] : [])]
+  // Version 0 has no construction-method field, so every item is a file offset and the grid
+  // descriptor has to ride in `mdat` rather than `idat`. The same bytes end up hashed either
+  // way, which is what lets one expectation cover every layout.
+  const gridInMdat = iloc.version === 0
+  const payloads = [
+    ...(gridInMdat ? [GRID_DESCRIPTOR] : []),
+    ...spec.tiles,
+    spec.xmp,
+    ...(spec.aux ? [spec.aux] : []),
+  ]
 
   // Offsets are fixed-width, so a first pass with zeros measures a `meta` of the final size.
   const build = (mdatPayloadStart: number): { meta: Buffer; mdat: Buffer } => {
@@ -336,23 +400,24 @@ function heif(spec: HeifSpec): Buffer {
       }),
     )
 
+    const first = gridInMdat ? 1 : 0
     const locations: ItemLocation[] = [
       ...extentFlood,
       {
         id: PRIMARY_ID,
-        construction: 1,
-        extents: [{ offset: 0, length: GRID_DESCRIPTOR.length }],
+        construction: gridInMdat ? 0 : 1,
+        extents: [gridInMdat ? extents[0]! : { offset: 0, length: GRID_DESCRIPTOR.length }],
         dataReferenceIndex: spec.externalItem === 'primary' ? 1 : 0,
       },
-      ...tileIds.map((id, i) => ({ id, construction: 0, extents: [extents[i]!] })),
+      ...tileIds.map((id, i) => ({ id, construction: 0, extents: [extents[first + i]!] })),
       {
         id: XMP_ID,
         construction: 0,
-        extents: [extents[spec.tiles.length]!],
+        extents: [extents[first + spec.tiles.length]!],
         dataReferenceIndex: spec.externalItem === 'xmp' ? 1 : 0,
       },
       ...(spec.aux
-        ? [{ id: AUX_ID, construction: 0, extents: [extents[spec.tiles.length + 1]!] }]
+        ? [{ id: AUX_ID, construction: 0, extents: [extents[first + spec.tiles.length + 1]!] }]
         : []),
     ]
 
@@ -372,12 +437,16 @@ function heif(spec: HeifSpec): Buffer {
 
     const index = spec.omitItemIndex
       ? Buffer.alloc(0)
-      : Buffer.concat([pitmBox(PRIMARY_ID), irefBox(refs), ilocBox(locations)])
+      : Buffer.concat([pitmBox(PRIMARY_ID), irefBox(refs), ilocBox(locations, iloc)])
 
     const tracks = spec.withTracks ? moovBox(Buffer.from('tracks')) : Buffer.alloc(0)
     return {
       meta: Buffer.concat([
-        fullBox('meta', 0, Buffer.concat([index, box('idat', GRID_DESCRIPTOR)])),
+        fullBox(
+          'meta',
+          0,
+          Buffer.concat([index, gridInMdat ? Buffer.alloc(0) : box('idat', GRID_DESCRIPTOR)]),
+        ),
         tracks,
       ]),
       mdat: box('mdat', Buffer.concat(payloads)),
@@ -454,6 +523,36 @@ describe('contentHash HEIF', () => {
     // guard against merging those references quadratically: it does not finish if they are.
     expect(await hashOf(heif({ tiles, xmp, floodDimgBoxes: 2 }))).not.toBeNull()
     expect(await hashOf(heif({ tiles, xmp, floodDimgBoxes: 3 }))).toBeNull()
+  })
+
+  test('reads every iloc field-width layout to the same bytes', async () => {
+    const shortXmp = Buffer.from('<x/>')
+    const longXmp = Buffer.from('<x>rewritten, and rather longer than before</x>')
+    const layouts: IlocLayout[] = [
+      { version: 0, offsetSize: 4, lengthSize: 4, baseOffsetSize: 0, indexSize: 0 },
+      { version: 0, offsetSize: 8, lengthSize: 8, baseOffsetSize: 4, indexSize: 0 },
+      { version: 1, offsetSize: 4, lengthSize: 4, baseOffsetSize: 0, indexSize: 0 },
+      { version: 1, offsetSize: 8, lengthSize: 8, baseOffsetSize: 4, indexSize: 4 },
+      { version: 1, offsetSize: 4, lengthSize: 8, baseOffsetSize: 8, indexSize: 8 },
+      { version: 2, offsetSize: 8, lengthSize: 4, baseOffsetSize: 0, indexSize: 0 },
+      { version: 2, offsetSize: 4, lengthSize: 4, baseOffsetSize: 8, indexSize: 4 },
+    ]
+
+    const expected = await hashOf(heif({ tiles, xmp: shortXmp }))
+    expect(expected).not.toBeNull()
+    for (const ilocLayout of layouts) {
+      // Every layout describes the same picture, so a parser that reads each field at the
+      // right width and adds the base offset lands on one hash for all of them.
+      expect(await hashOf(heif({ tiles, xmp: shortXmp, ilocLayout }))).toBe(expected)
+      // And the rewrite is still invisible, whichever layout carried the offsets.
+      expect(await hashOf(heif({ tiles, xmp: longXmp, ilocLayout }))).toBe(expected)
+    }
+  })
+
+  test('an iloc version above 2 is refused rather than guessed at', async () => {
+    const xmp = Buffer.from('<x:xmpmeta/>')
+    const ilocLayout = { version: 3, offsetSize: 4, lengthSize: 4, baseOffsetSize: 0, indexSize: 0 }
+    expect(await hashOf(heif({ tiles, xmp, ilocLayout }))).toBeNull()
   })
 
   test('bounds the item extents: an iloc past the cap returns null', async () => {
