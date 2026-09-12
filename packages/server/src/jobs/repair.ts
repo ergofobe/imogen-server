@@ -53,6 +53,14 @@ type Update = Partial<typeof assets.$inferInsert> | null
  * against a deploy date would need a date this code cannot know, so the pass re-checks
  * everything instead and is a no-op on a row that is already right.
  *
+ * `captured_at_is_exact` is the candidate set #54 names, and it is narrower than the
+ * defect: it was written by the old reader, so a file whose date tag that reader could not
+ * make sense of is `false` here even when today's `exifInstant` reads it — including with
+ * an offset. Those rows are dated by a client timestamp or a file mtime and this pass will
+ * not open them. Widening the set is a decision for #54, not for this pass to take on its
+ * own; nothing here would be unsafe if it were widened, because the repair below acts only
+ * on a file that names an instant with an offset.
+ *
  * Videos are out: their pre-fix value came from ffprobe's `creation_time`, and nothing in
  * the container can settle it. A row an owner has corrected by hand is out for good.
  *
@@ -222,9 +230,21 @@ export async function repairAsset(
  * What this cannot do is restore what the uploading client sent: `ingest` wrote over
  * `captured_at` in place, `captured_at_original` is the owner-edit undo slot rather than a
  * record of it, there is no audit table, and `pruneUploads` clears `upload_sessions` on
- * expiry whether or not they completed. So the only recoverable rows are those whose file
- * still carries an `OffsetTime*` tag; without one there is no way to place the wall clock,
- * and reading it as UTC — which is what is already stored — is the answer #50 settled on.
+ * expiry whether or not they completed. So the only rows this can put right are those whose
+ * file still carries an `OffsetTime*` tag: that pair names an instant and needs nothing
+ * guessed.
+ *
+ * A file that names no offset is left where it is, and that is a limit rather than a
+ * verdict that the row is correct. Do not read the stored value as the UTC reading #50
+ * settled on — it predates #50. The old pipeline let exifr revive the date tags, which
+ * builds a Date in *the ingesting server's* timezone, so the row holds the wall clock
+ * interpreted in whatever zone that machine ran in. On a server in UTC that happens to
+ * equal today's reading; anywhere else it is out by that machine's offset, and nothing
+ * recorded which machine or which offset. Rewriting these to the UTC reading would make
+ * them reproducible and match what a fresh ingest stores today — but it would also move
+ * every one of them on a claim about a zone this code cannot check, and #54 says to leave
+ * them alone. That decision was taken on the understanding that they already held the UTC
+ * reading, which is not so; it is worth revisiting there rather than here.
  */
 function repairCaptureTime(row: AssetRow, tags: Record<string, unknown>): Update {
   const captured = exifCapturedAt(tags)
