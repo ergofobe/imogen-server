@@ -26,6 +26,7 @@ import {
   shareLinks,
   users,
 } from '../db/schema.ts'
+import { countRepairCandidates, REPAIRS, type RepairName, repairIsDone } from '../jobs/repair.ts'
 import { conflict, notFound } from '../lib/errors.ts'
 import { generateToken, hashToken } from '../lib/tokens.ts'
 import type { SettingsService } from './settings.ts'
@@ -41,6 +42,8 @@ export class AdminService {
   constructor(
     private readonly db: Database,
     private readonly settings: SettingsService,
+    /** Repairs run through the queue: a library of any size cannot be walked in a request. */
+    private readonly enqueue: (name: string, payload: Record<string, unknown>) => Promise<string>,
   ) {}
 
   /**
@@ -276,6 +279,63 @@ export class AdminService {
   async discardJob(id: string): Promise<void> {
     const rows = await this.db.delete(jobs).where(eq(jobs.id, id)).returning({ id: jobs.id })
     if (rows.length === 0) throw notFound('No such job')
+  }
+
+  /**
+   * The one-off repair passes, with the count of rows each would examine.
+   *
+   * A preview, deliberately shown before anything is written. These rewrite values that
+   * are already stored, across every account, with no undo — so unlike the backfills
+   * beside them they are not scheduled at boot and nothing starts until someone asks.
+   *
+   * The count is what the database can answer for nothing: the rows the walk will open.
+   * How many of those actually move depends on what is in each file, which cannot be
+   * known without reading all of them — so it is not promised here, and each repair's
+   * description says what makes a row unrepairable.
+   */
+  async repairs(): Promise<AdminRepair[]> {
+    const active = await this.db
+      .select({ name: jobs.name })
+      .from(jobs)
+      .where(inArray(jobs.status, ['queued', 'running']))
+    const running = new Set(active.map((row) => row.name))
+
+    const names = Object.keys(REPAIRS) as RepairName[]
+    return Promise.all(
+      names.map(async (name) => {
+        const repair = REPAIRS[name]
+        const done = await repairIsDone(this.db, name)
+        return {
+          name,
+          title: repair.title,
+          description: repair.description,
+          candidates: await countRepairCandidates(this.db, name),
+          state: running.has(repair.job) ? 'running' : done ? 'done' : 'idle',
+        } satisfies AdminRepair
+      }),
+    )
+  }
+
+  /**
+   * Starts one pass.
+   *
+   * Refuses while the same pass is already in the queue. Deliberately a guard rather than
+   * a lock: it is check-then-enqueue, so two administrators pressing Start in the same
+   * instant can still both get a walk. That costs reading and nothing else — every repair
+   * is a no-op on a row that is already right, and the write is guarded by the pass's own
+   * predicate — so the check is here to stop the obvious double-press making the panel's
+   * progress unreadable, not to promise there is only ever one.
+   */
+  async startRepair(name: RepairName): Promise<void> {
+    const repair = REPAIRS[name]
+    const [existing] = await this.db
+      .select({ id: jobs.id })
+      .from(jobs)
+      .where(and(eq(jobs.name, repair.job), inArray(jobs.status, ['queued', 'running'])))
+      .limit(1)
+    if (existing) throw conflict('That repair is already running')
+
+    await this.enqueue(repair.job, {})
   }
 
   /**
@@ -554,4 +614,13 @@ function toInvite(row: typeof invites.$inferSelect): Invite {
     acceptedAt: row.acceptedAt?.toISOString() ?? null,
     state: row.acceptedAt ? 'accepted' : expired ? 'expired' : 'pending',
   }
+}
+
+/** One repair pass as the administration panel sees it. */
+export type AdminRepair = {
+  name: RepairName
+  title: string
+  description: string
+  candidates: number
+  state: 'idle' | 'running' | 'done'
 }

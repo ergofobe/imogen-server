@@ -440,6 +440,79 @@ describe('deleting an account', () => {
   })
 })
 
+describe('one-off repairs', () => {
+  /**
+   * The panel exists so a repair is a decision rather than a side effect of upgrading.
+   * Nothing here may start on its own, and the count has to be readable before it does.
+   */
+  test('lists every repair with the count of rows it would open, and starts none of them', async () => {
+    const admin = await signUp('first@example.com')
+
+    const response = await request('/api/v1/admin/repairs', { headers: { Cookie: admin.cookie } })
+    const body = (await response.json()) as {
+      items: Array<{ name: string; candidates: number; state: string }>
+    }
+
+    expect(response.status).toBe(200)
+    expect(body.items.map((r) => r.name).sort()).toEqual(['captureTime', 'exifOrientation'])
+    for (const repair of body.items) expect(repair.state).toBe('idle')
+    expect(await harness.db.select().from(jobs)).toEqual([])
+  })
+
+  test('starting one queues its walk', async () => {
+    const admin = await signUp('first@example.com')
+
+    const response = await asAdmin('/api/v1/admin/repairs/captureTime', 'POST', {}, admin.cookie)
+    expect(response.status).toBe(204)
+
+    const queued = await harness.db.select().from(jobs)
+    expect(queued.map((job) => job.name)).toEqual(['repair.captureTime'])
+  })
+
+  test('refuses to start the same pass twice over', async () => {
+    const admin = await signUp('first@example.com')
+    await asAdmin('/api/v1/admin/repairs/captureTime', 'POST', {}, admin.cookie)
+
+    const again = await asAdmin('/api/v1/admin/repairs/captureTime', 'POST', {}, admin.cookie)
+
+    expect(again.status).toBe(409)
+    expect(await harness.db.select().from(jobs)).toHaveLength(1)
+  })
+
+  test('a repair nobody has written about is not found', async () => {
+    const admin = await signUp('first@example.com')
+
+    const response = await asAdmin('/api/v1/admin/repairs/whatever', 'POST', {}, admin.cookie)
+
+    expect(response.status).toBe(404)
+    expect(await harness.db.select().from(jobs)).toEqual([])
+  })
+
+  /** A name off `Object.prototype` must be as absent as any other, not a 500. */
+  test('a name the prototype chain happens to answer to is not found either', async () => {
+    const admin = await signUp('first@example.com')
+
+    for (const name of ['toString', 'constructor', 'hasOwnProperty']) {
+      const response = await asAdmin(`/api/v1/admin/repairs/${name}`, 'POST', {}, admin.cookie)
+      expect(response.status).toBe(404)
+    }
+    expect(await harness.db.select().from(jobs)).toEqual([])
+  })
+
+  test('an ordinary account cannot see them, let alone run one', async () => {
+    await signUp('first@example.com')
+    const { cookie } = await signUp('second@example.com')
+
+    expect((await request('/api/v1/admin/repairs', { headers: { Cookie: cookie } })).status).toBe(
+      404,
+    )
+    expect((await asAdmin('/api/v1/admin/repairs/captureTime', 'POST', {}, cookie)).status).toBe(
+      404,
+    )
+    expect(await harness.db.select().from(jobs)).toEqual([])
+  })
+})
+
 describe('the work queue', () => {
   const addJob = (status: string, error: string | null = null, attempts = 0) =>
     harness.db.execute(

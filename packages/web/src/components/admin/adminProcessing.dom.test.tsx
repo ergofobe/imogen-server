@@ -30,6 +30,25 @@ const HEALTHY = {
   failures: [],
 }
 
+/** The repair list and the POST that starts one, both through the SDK's own HTTP client. */
+const REPAIRS = {
+  items: [
+    {
+      name: 'captureTime',
+      title: 'Capture times stored without their EXIF offset',
+      description: 'Re-reads each photograph.',
+      candidates: 21802,
+      state: 'idle' as const,
+    },
+  ],
+}
+const started: string[] = []
+const httpRequest = mock((method: string, path: string) => {
+  if (method === 'GET') return Promise.resolve(REPAIRS)
+  started.push(path)
+  return Promise.resolve(undefined)
+})
+
 mock.module('../../lib/client.ts', () => ({
   imogen: {
     admin: {
@@ -38,6 +57,7 @@ mock.module('../../lib/client.ts', () => ({
       retryJob: () => Promise.resolve(null),
       discardJob: () => Promise.resolve(null),
     },
+    http: { request: httpRequest },
   },
 }))
 
@@ -102,6 +122,60 @@ describe('the processing panel once the queue can be read again', () => {
     expect(text).toMatch(/nothing is waiting/i)
     expect(text).not.toMatch(/could not be read/i)
 
+    answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+  })
+})
+
+/**
+ * A repair rewrites stored values across every account with no undo. The panel's whole
+ * reason for existing is that nobody's photographs move because a server was upgraded, so
+ * "rendering the list starts nothing" is the assertion that matters here.
+ */
+
+/**
+ * Renders, then waits for the text to turn up.
+ *
+ * The repairs list settles a query later than the queue above it, and how much later
+ * depends on what else the run is doing — a fixed sleep passed on its own and failed in a
+ * full suite. Polling asks the question the test actually means.
+ */
+async function panelShowing(pattern: RegExp): Promise<HTMLElement> {
+  const { act } = await import('react')
+  const container = await renderPanel()
+
+  const deadline = Date.now() + 2000
+  while (!pattern.test(container.textContent ?? '') && Date.now() < deadline) {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    })
+  }
+  return container
+}
+
+describe('the repairs offered in the processing panel', () => {
+  test('shows what a pass would open, and starts nothing by rendering', async () => {
+    answer = () => Promise.resolve(HEALTHY)
+    const container = await panelShowing(/to examine/)
+
+    expect(container.textContent ?? '').toMatch(/21,802 to examine/)
+    expect(started).toEqual([])
+  })
+
+  test('starts one only when the button is pressed', async () => {
+    answer = () => Promise.resolve(HEALTHY)
+    const { act } = await import('react')
+    const container = await panelShowing(/to examine/)
+
+    const button = [...container.querySelectorAll('button')].find(
+      (b) => (b.textContent ?? '').trim() === 'Start',
+    )
+    expect(button).toBeDefined()
+    await act(async () => {
+      button?.click()
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    })
+
+    expect(started).toEqual(['/api/v1/admin/repairs/captureTime'])
     answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
   })
 })

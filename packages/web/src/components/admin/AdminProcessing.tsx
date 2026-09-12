@@ -117,7 +117,111 @@ export function AdminProcessing() {
           ))}
         </ul>
       </section>
+
+      <Repairs onStarted={refresh} />
     </div>
+  )
+}
+
+/** One repair pass, as `GET /api/v1/admin/repairs` describes it. */
+type Repair = {
+  name: string
+  title: string
+  description: string
+  candidates: number
+  state: 'idle' | 'running' | 'done'
+}
+
+/**
+ * Repairs of values stored before a defect was fixed.
+ *
+ * Deliberately a button rather than something an upgrade does on its own: each of these
+ * rewrites stored values across every account with no undo, and a version bump should not
+ * silently move every capture time in somebody's library. The count is shown first so the
+ * decision is made against a number.
+ *
+ * Asked for through `imogen.http` rather than a typed `imogen.admin` method: a method
+ * belongs in the SDK, and adding one there would make this a cross-repo change with a
+ * submodule pin to move, which #54's triage ruled out for now. This is still the SDK's own
+ * client — the session cookie, the base URL and `ImogenError` all come with it — not a
+ * hand-rolled fetch. When repairs grow an MCP surface they grow a typed method with it.
+ */
+function Repairs({ onStarted }: { onStarted: () => void }) {
+  const queryClient = useQueryClient()
+
+  const { data, isPending, isError } = useQuery({
+    queryKey: ['admin', 'repairs'],
+    queryFn: () => imogen.http.request<{ items: Repair[] }>('GET', '/api/v1/admin/repairs'),
+    // Polled only while a pass is walking, and slowly. What it is waiting for is the pass
+    // finishing — the state going back to `done` and the button returning — not the count,
+    // which for the capture-time pass never falls: a repaired row still matches its own
+    // predicate, which is exactly what makes the pass safe to run twice. Progress belongs
+    // to the queue panel above. Each answer costs a count over every asset, and the
+    // orientation one reads a JSON field no index can serve, so asking every three seconds
+    // for the hours a large library takes would only contend with the walk's own reads.
+    refetchInterval: (query) =>
+      query.state.data?.items.some((repair) => repair.state === 'running') ? 15_000 : false,
+    retry: false,
+  })
+
+  const start = useMutation({
+    mutationFn: (name: string) =>
+      imogen.http.request<void>('POST', `/api/v1/admin/repairs/${name}`),
+    // `onSettled`, not `onSuccess`: this POST is not idempotent and the SDK retries a
+    // transient failure, so a start whose response was lost comes back as the guard's own
+    // 409. Asking again is what tells the admin the truth — the pass is running — however
+    // the request appeared to end.
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ['admin', 'repairs'] })
+      onStarted()
+    },
+  })
+
+  // Silent when it cannot be read, unlike the queue above: nothing is wrong with a server
+  // that has no repairs to offer, and an older one has no such route at all.
+  if (isPending || isError || !data || data.items.length === 0) return null
+
+  return (
+    <section>
+      <header className="mb-4">
+        <h3 className="heading-display text-lg">Repairs</h3>
+        <p className="mt-1 text-sm text-muted">
+          One-off passes over photographs stored before a defect was fixed. None of them run on
+          their own.
+        </p>
+      </header>
+
+      <ul className="space-y-2">
+        {data.items.map((repair) => (
+          <li key={repair.name} className="rounded-xl border border-line p-4">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+              <p className="text-sm">{repair.title}</p>
+              <p className="label-micro text-[10px] text-muted">
+                {repair.candidates.toLocaleString()} to examine
+                {repair.state === 'done' ? ' · already run' : ''}
+              </p>
+            </div>
+
+            <p className="mt-2 text-sm text-muted">{repair.description}</p>
+
+            <button
+              type="button"
+              onClick={() => start.mutate(repair.name)}
+              disabled={
+                (start.isPending && start.variables === repair.name) ||
+                repair.state === 'running' ||
+                repair.candidates === 0
+              }
+              className="mt-3 rounded-lg border border-line px-3 py-1.5 text-sm transition hover:bg-sunken disabled:opacity-50"
+            >
+              {repair.state === 'running' ? 'Walking the library' : 'Start'}
+            </button>
+          </li>
+        ))}
+      </ul>
+
+      {start.isError && <p className="mt-3 text-sm text-red-500">{errorText(start.error)}</p>}
+    </section>
   )
 }
 
