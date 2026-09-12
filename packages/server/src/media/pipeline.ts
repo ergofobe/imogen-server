@@ -183,6 +183,66 @@ function subSecondMilliseconds(value: unknown): number {
   return match ? Number(match[1]!.padEnd(3, '0')) : 0
 }
 
+/**
+ * The EXIF tags this server reads, as EXIF actually stores them.
+ *
+ * Pulled out of the pipeline so the repair passes in `jobs/repair.ts` read a file exactly
+ * the way ingest did. Both flags below are load bearing and neither is the default, so a
+ * second `exifr.parse` call configured by hand somewhere else would quietly disagree with
+ * this one — which is the bug #53 was, spelled twice.
+ *
+ * `reviveValues: false` keeps the date tags as strings. Left on, exifr hands back a Date
+ * it built in the server's own timezone, which silently reintroduces the guess this code
+ * exists to avoid. It turns off revivers for a few other tags too, none of which are read
+ * here; GPS is computed before that step.
+ *
+ * `translateValues: false` is a separate flag, and both are wanted. Left on, exifr renders
+ * Orientation as "Rotate 90 CW" rather than 6, so the numeric guard below never held and
+ * every asset ever ingested stored a null orientation. Of the tags read here it changes
+ * that one alone: the dates, the GPS pair and the camera fields come back identical
+ * either way.
+ */
+export async function readExifTags(path: string): Promise<Record<string, unknown> | null> {
+  return exifr
+    .parse(path, { tiff: true, exif: true, gps: true, reviveValues: false, translateValues: false })
+    .catch(() => null)
+}
+
+/**
+ * The capture instant a file names, from whichever date tag carries one.
+ *
+ * Each date tag has its own offset companion, and they do not describe the same moment,
+ * so the pairs must not be crossed.
+ */
+export function exifCapturedAt(tags: Record<string, unknown>) {
+  return (
+    exifInstant(tags.DateTimeOriginal, tags.OffsetTimeOriginal, tags.SubSecTimeOriginal) ??
+    exifInstant(tags.CreateDate, tags.OffsetTimeDigitized, tags.SubSecTimeDigitized) ??
+    exifInstant(tags.ModifyDate, tags.OffsetTime, tags.SubSecTime)
+  )
+}
+
+/** What the file said, or null when the camera wrote no orientation. */
+export function exifOrientation(tags: Record<string, unknown>): number | null {
+  return asNumber(tags.Orientation)
+}
+
+/**
+ * EXIF is whatever the file happened to hold, so every tag is narrowed before it is
+ * stored. `ExifData` types these as strings and numbers, and a camera that wrote a byte
+ * array into `Make` should leave the field empty rather than put its own shape on the
+ * wire. NaN is deliberately kept: `coordinates.ts` is the one that knows a 0/0 rational
+ * is not a place, and narrowing it away here would move that decision somewhere it does
+ * not belong.
+ */
+function asText(value: unknown): string | null {
+  return typeof value === 'string' ? value : null
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === 'number' ? value : null
+}
+
 export class MediaPipeline {
   constructor(private readonly options: PipelineOptions) {}
 
@@ -299,60 +359,40 @@ export class MediaPipeline {
   }
 
   private async readExif(path: string, result: ProcessResult): Promise<void> {
-    // `reviveValues: false` keeps the date tags as the strings EXIF actually stores. Left
-    // on, exifr hands back a Date it built in the server's own timezone, which silently
-    // reintroduces the guess this code exists to avoid. It turns off revivers for a few
-    // other tags too, none of which are read below; GPS is computed before that step.
-    //
-    // `translateValues: false` is a separate flag, and both are wanted. Left on, exifr
-    // renders Orientation as "Rotate 90 CW" rather than 6, so the numeric guard below
-    // never held and every asset ever ingested stored a null orientation. Of the tags
-    // read here it changes that one alone: the dates, the GPS pair and the camera fields
-    // come back identical either way.
-    const parsed = await exifr
-      .parse(path, {
-        tiff: true,
-        exif: true,
-        gps: true,
-        reviveValues: false,
-        translateValues: false,
-      })
-      .catch(() => null)
+    const parsed = await readExifTags(path)
     if (!parsed) return
 
-    // Each date tag has its own offset companion, and they do not describe the same
-    // moment, so the pairs must not be crossed.
-    const captured =
-      exifInstant(parsed.DateTimeOriginal, parsed.OffsetTimeOriginal, parsed.SubSecTimeOriginal) ??
-      exifInstant(parsed.CreateDate, parsed.OffsetTimeDigitized, parsed.SubSecTimeDigitized) ??
-      exifInstant(parsed.ModifyDate, parsed.OffsetTime, parsed.SubSecTime)
+    const captured = exifCapturedAt(parsed)
     result.capturedAt = captured?.at ?? null
     result.capturedAtHasOffset = captured?.hasOffset ?? false
 
     result.exif = {
-      make: parsed.Make ?? null,
-      model: parsed.Model ?? null,
-      lens: parsed.LensModel ?? null,
-      fNumber: parsed.FNumber ?? null,
-      exposureTime: parsed.ExposureTime ?? null,
-      iso: parsed.ISO ?? null,
-      focalLength: parsed.FocalLength ?? null,
+      make: asText(parsed.Make),
+      model: asText(parsed.Model),
+      lens: asText(parsed.LensModel),
+      fNumber: asNumber(parsed.FNumber),
+      exposureTime: asNumber(parsed.ExposureTime),
+      iso: asNumber(parsed.ISO),
+      focalLength: asNumber(parsed.FocalLength),
       /**
        * What the file said, not something for a client to apply: `renderDerivatives`
        * has already baked the rotation in and `width`/`height` are reported after it,
        * so a client that acts on this turns the photograph twice. It is here so a
        * client can tell "the camera wrote no orientation" from "the server dropped it".
        */
-      orientation: typeof parsed.Orientation === 'number' ? parsed.Orientation : null,
+      orientation: exifOrientation(parsed),
     }
 
     // What a GPS block decodes to has to be tested for a value that locates something,
     // not for a type: see `coordinates.ts` for the two ways it fails to.
-    if (isPlaceableLatitude(parsed.latitude) && isPlaceableLongitude(parsed.longitude)) {
+    const latitude = asNumber(parsed.latitude)
+    const longitude = asNumber(parsed.longitude)
+    const altitude = asNumber(parsed.GPSAltitude)
+    if (isPlaceableLatitude(latitude) && isPlaceableLongitude(longitude)) {
       result.location = {
-        latitude: parsed.latitude,
-        longitude: parsed.longitude,
-        altitude: isUsableAltitude(parsed.GPSAltitude) ? parsed.GPSAltitude : null,
+        latitude,
+        longitude,
+        altitude: isUsableAltitude(altitude) ? altitude : null,
         place: null,
       }
     }

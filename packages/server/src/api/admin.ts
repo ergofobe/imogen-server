@@ -16,9 +16,26 @@ import {
   StorageReport,
 } from '@imogen/shared'
 import { type AppEnv, requireHiddenAdmin } from '../auth/middleware.ts'
+import { isRepairName, REPAIRS } from '../jobs/repair.ts'
+import { notFound } from '../lib/errors.ts'
 import { created, ERROR_RESPONSES, NO_CONTENT, ok, security } from './openapi.ts'
 
 const IdParam = z.object({ id: z.uuid() })
+
+/**
+ * Described here rather than in `@imogen/shared` because no client outside this web app
+ * asks for it yet. Exposing repairs over MCP needs an `admin` OAuth scope, which lives in
+ * the SDK and would make this a cross-repo change; that is deliberately a separate piece
+ * of work, once the panel has proved the shape.
+ */
+const AdminRepair = z.object({
+  name: z.enum(Object.keys(REPAIRS) as [string, ...string[]]),
+  title: z.string(),
+  description: z.string(),
+  /** Rows the pass will open. Not a promise of how many will move; see the description. */
+  candidates: z.number().int(),
+  state: z.enum(['idle', 'running', 'done']),
+})
 
 /**
  * The administration API.
@@ -216,6 +233,43 @@ export function createAdminRoutes() {
     }),
     async (c) => {
       await c.get('services').admin.discardJob(c.req.valid('param').id)
+      return c.body(null, 204)
+    },
+  )
+
+  app.openapi(
+    createRoute({
+      method: 'get',
+      path: '/repairs',
+      tags: ['Admin'],
+      summary: 'One-off repairs of values stored before a defect was fixed',
+      description:
+        'A preview. Nothing here runs on its own: each pass rewrites stored values across every account with no undo, so it waits to be started.',
+      security: security(),
+      responses: {
+        ...ok(z.object({ items: z.array(AdminRepair) }), 'The repairs'),
+        ...ERROR_RESPONSES,
+      },
+    }),
+    async (c) => c.json({ items: await c.get('services').admin.repairs() }, 200),
+  )
+
+  app.openapi(
+    createRoute({
+      method: 'post',
+      path: '/repairs/{name}',
+      tags: ['Admin'],
+      summary: 'Start a repair pass',
+      description:
+        'Queues the walk. It pages through the library re-enqueueing itself, so progress shows in the queue above and a restart resumes rather than starting over.',
+      security: security(),
+      request: { params: z.object({ name: z.string() }) },
+      responses: { ...NO_CONTENT, ...ERROR_RESPONSES },
+    }),
+    async (c) => {
+      const { name } = c.req.valid('param')
+      if (!isRepairName(name)) throw notFound('No such repair')
+      await c.get('services').admin.startRepair(name)
       return c.body(null, 204)
     },
   )

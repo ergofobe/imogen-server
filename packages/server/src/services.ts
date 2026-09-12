@@ -12,6 +12,7 @@ import { registerContentHashJobs } from './jobs/content-hash.ts'
 import { FACE_DETECT_JOB, registerFaceJobs } from './jobs/faces.ts'
 import { registerMaintenanceJobs } from './jobs/maintenance.ts'
 import { JobQueue } from './jobs/queue.ts'
+import { registerRepairJobs } from './jobs/repair.ts'
 import type { Config } from './lib/config.ts'
 import { AlbumService } from './media/albums.ts'
 import { AssetService } from './media/assets.ts'
@@ -67,7 +68,7 @@ export function createServices(config: Config, database?: Database): Services {
   const pairing = new PairingService(db, oauth, { publicUrl: config.publicUrl })
 
   const assets = new AssetService(db)
-  const admin = new AdminService(db, settings)
+  const admin = new AdminService(db, settings, (name, payload) => queue.enqueue(name, payload))
   const albums = new AlbumService(db)
   const vault = new VaultService(db, { secret: config.secret })
   const models = new ModelStore(config.modelsDir)
@@ -92,6 +93,8 @@ export function createServices(config: Config, database?: Database): Services {
   registerMaintenanceJobs(queue, { db, config, library, thumbnails, sessions, settings })
   registerFaceJobs(queue, { db, faces, models, queue })
   registerContentHashJobs(queue, { db, storage: library })
+  // Registered but never scheduled: see `jobs/repair.ts` for why these wait to be asked.
+  registerRepairJobs(queue, { db, storage: library, queue })
 
   return {
     config,
