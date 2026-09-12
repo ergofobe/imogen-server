@@ -279,8 +279,15 @@ type HeifSpec = {
   omitItemIndex?: boolean
   /** A `moov`, which makes the file an image sequence rather than a still. */
   withTracks?: boolean
+  /**
+   * Extra `dimg` sub-boxes naming the primary, each listing `FLOOD_TARGETS` items. A single
+   * sub-box cannot cross the reference bound — its count is a uint16 — so only a pile of them
+   * reaches it, which is the shape a crafted file would take.
+   */
+  floodDimgBoxes?: number
 }
 
+const FLOOD_TARGETS = 30000
 const PRIMARY_ID = 1
 const XMP_ID = 90
 const AUX_ID = 91
@@ -312,7 +319,15 @@ function heif(spec: HeifSpec): Buffer {
         : []),
     ]
 
+    const flood = Array.from({ length: spec.floodDimgBoxes ?? 0 }, () => ({
+      kind: 'dimg',
+      from: PRIMARY_ID,
+      // All naming one real tile, so the flood tests the reference bound rather than the
+      // item bound, and the walk still has somewhere to go.
+      to: Array.from({ length: FLOOD_TARGETS }, () => tileIds[0]!),
+    }))
     const refs: ItemRef[] = [
+      ...flood,
       { kind: 'dimg', from: PRIMARY_ID, to: tileIds },
       { kind: 'cdsc', from: XMP_ID, to: [PRIMARY_ID] },
       ...(spec.aux ? [{ kind: 'auxl', from: AUX_ID, to: [PRIMARY_ID] }] : []),
@@ -380,6 +395,14 @@ describe('contentHash HEIF', () => {
     expect(await hashOf(heif({ tiles, xmp, omitItemIndex: true }))).toBeNull()
   })
 
+  test('bounds the item references: an iref past the cap returns null', async () => {
+    const xmp = Buffer.from('<x:xmpmeta/>')
+    // Two floods stay under the 65536 cap, three cross it. The first assertion is also the
+    // guard against merging those references quadratically: it does not finish if they are.
+    expect(await hashOf(heif({ tiles, xmp, floodDimgBoxes: 2 }))).not.toBeNull()
+    expect(await hashOf(heif({ tiles, xmp, floodDimgBoxes: 3 }))).toBeNull()
+  })
+
   test('an image sequence keeps the mdat rule despite its cover item', async () => {
     const xmp = Buffer.from('<x:xmpmeta/>')
     const brands = ['msf1', 'msf1', 'avis']
@@ -430,6 +453,12 @@ test.skipIf(!realHeicAvailable)(
     const rewritten = join(workDir, 'real-rewritten.heic')
     await Bun.write(rewritten, Bun.file(original))
     await Bun.$`exiftool -overwrite_original -XMP:Rating=1 ${rewritten}`.quiet().nothrow()
+
+    // Without this the test is vacuous: an exiftool that refuses to write HEIC leaves a
+    // byte-for-byte copy behind, and two identical files hash alike however broken the rule.
+    const before = new Uint8Array(await Bun.file(original).arrayBuffer())
+    const after = new Uint8Array(await Bun.file(rewritten).arrayBuffer())
+    expect(sha256(after)).not.toBe(sha256(before))
 
     const hash = await contentHash(original)
     expect(hash).not.toBeNull()

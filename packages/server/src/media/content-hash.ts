@@ -16,6 +16,7 @@ const HEIF_BRANDS = new Set(['heic', 'heix', 'mif1', 'msf1', 'avif'])
 const MAX_FTYP_BYTES = 1024
 const MAX_META_BYTES = 16 * 1024 * 1024
 const MAX_ITEMS = 4096
+const MAX_REFERENCES = 65536
 
 const SOI = 0xd8
 const EOI = 0xd9
@@ -185,6 +186,7 @@ function childBoxes(buf: Buffer, start: number, end: number): Child[] | null {
     }
 
     children.push({ type, start: payloadStart, end: offset + size })
+    if (children.length > MAX_BOXES) return null
     offset += size
   }
   // Trailing bytes that are not a box mean the parse has lost its place.
@@ -218,6 +220,7 @@ function readItemReferences(buf: Buffer, iref: Child): ItemReferences | null {
   if (boxes === null) return null
 
   const refs: ItemReferences = new Map()
+  let total = 0
   for (const ref of boxes) {
     if (ref.start + idWidth + 2 > ref.end) return null
     const from = buf.readUIntBE(ref.start, idWidth)
@@ -225,12 +228,19 @@ function readItemReferences(buf: Buffer, iref: Child): ItemReferences | null {
     const listStart = ref.start + idWidth + 2
     if (listStart + count * idWidth > ref.end) return null
 
-    const to: number[] = []
-    for (let i = 0; i < count; i++) to.push(buf.readUIntBE(listStart + i * idWidth, idWidth))
+    total += count
+    if (total > MAX_REFERENCES) return null
 
     const byKind = refs.get(ref.type) ?? new Map<number, number[]>()
-    byKind.set(from, [...(byKind.get(from) ?? []), ...to])
     refs.set(ref.type, byKind)
+    // Appended in place: a crafted `meta` may hold thousands of sub-boxes naming the same
+    // item, and rebuilding the accumulated list for each of them is quadratic.
+    let to = byKind.get(from)
+    if (to === undefined) {
+      to = []
+      byKind.set(from, to)
+    }
+    for (let i = 0; i < count; i++) to.push(buf.readUIntBE(listStart + i * idWidth, idWidth))
   }
   return refs
 }
@@ -241,6 +251,8 @@ type ItemLocation = { construction: number; extents: Extent[] }
 /** `iloc`, whose every field width is declared in the box itself and varies by version. */
 function readItemLocations(buf: Buffer, iloc: Child): Map<number, ItemLocation> | null {
   const version = buf.readUInt8(iloc.start)
+  // Every later version would be walked with a layout it does not have.
+  if (version > 2) return null
   let at = iloc.start + 4
   if (at + 2 > iloc.end) return null
 
