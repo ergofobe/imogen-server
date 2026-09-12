@@ -152,19 +152,26 @@ function Repairs({ onStarted }: { onStarted: () => void }) {
   const { data, isPending, isError } = useQuery({
     queryKey: ['admin', 'repairs'],
     queryFn: () => imogen.http.request<{ items: Repair[] }>('GET', '/api/v1/admin/repairs'),
-    // Polled only while a pass is walking, so the count falls as it goes and the button
-    // comes back by itself when it finishes. A still panel asks nothing: each answer costs
-    // a count over every asset, and the orientation one reads a JSON field no index can
-    // serve, so a steady three-second poll would be two table scans a tick for nothing.
+    // Polled only while a pass is walking, and slowly. What it is waiting for is the pass
+    // finishing — the state going back to `done` and the button returning — not the count,
+    // which for the capture-time pass never falls: a repaired row still matches its own
+    // predicate, which is exactly what makes the pass safe to run twice. Progress belongs
+    // to the queue panel above. Each answer costs a count over every asset, and the
+    // orientation one reads a JSON field no index can serve, so asking every three seconds
+    // for the hours a large library takes would only contend with the walk's own reads.
     refetchInterval: (query) =>
-      query.state.data?.items.some((repair) => repair.state === 'running') ? 3000 : false,
+      query.state.data?.items.some((repair) => repair.state === 'running') ? 15_000 : false,
     retry: false,
   })
 
   const start = useMutation({
     mutationFn: (name: string) =>
       imogen.http.request<void>('POST', `/api/v1/admin/repairs/${name}`),
-    onSuccess: () => {
+    // `onSettled`, not `onSuccess`: this POST is not idempotent and the SDK retries a
+    // transient failure, so a start whose response was lost comes back as the guard's own
+    // 409. Asking again is what tells the admin the truth — the pass is running — however
+    // the request appeared to end.
+    onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ['admin', 'repairs'] })
       onStarted()
     },
@@ -200,10 +207,14 @@ function Repairs({ onStarted }: { onStarted: () => void }) {
             <button
               type="button"
               onClick={() => start.mutate(repair.name)}
-              disabled={start.isPending || repair.state === 'running' || repair.candidates === 0}
+              disabled={
+                (start.isPending && start.variables === repair.name) ||
+                repair.state === 'running' ||
+                repair.candidates === 0
+              }
               className="mt-3 rounded-lg border border-line px-3 py-1.5 text-sm transition hover:bg-sunken disabled:opacity-50"
             >
-              {repair.state === 'running' ? 'Running' : 'Start'}
+              {repair.state === 'running' ? 'Walking the library' : 'Start'}
             </button>
           </li>
         ))}

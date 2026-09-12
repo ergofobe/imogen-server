@@ -55,6 +55,13 @@ type Update = Partial<typeof assets.$inferInsert> | null
  *
  * Videos are out: their pre-fix value came from ffprobe's `creation_time`, and nothing in
  * the container can settle it. A row an owner has corrected by hand is out for good.
+ *
+ * Trashed and vaulted photographs are deliberately left in, unlike the face passes. Theirs
+ * is a scan that creates faces and people, so it must not be the thing that surfaces a
+ * hidden photograph; this one reads a file and writes one column, and shows nobody
+ * anything. Leaving them out would strand a wrong date in the owner's own vault timeline
+ * with no other way to fix it, and a photograph waiting in the trash is one restore away
+ * from the timeline it would be wrong in.
  */
 const captureTimeWhere = and(
   eq(assets.type, 'image'),
@@ -68,6 +75,8 @@ const captureTimeWhere = and(
  * A file whose camera wrote no Orientation tag stays a candidate for ever, because null
  * is also the right answer for it. That costs one EXIF read per pass and the pass is
  * started by hand, so there is nothing to bound it against.
+ *
+ * Trashed and vaulted rows are in, for the reason given above.
  */
 const orientationWhere = and(
   eq(assets.type, 'image'),
@@ -111,7 +120,14 @@ export function isRepairName(value: string): value is RepairName {
   return Object.hasOwn(REPAIRS, value)
 }
 
-/** How many rows a pass would examine, for the panel to show before anything is written. */
+/**
+ * How many rows a pass would examine, for the panel to show before anything is written.
+ *
+ * Only the orientation count falls as its walk proceeds. A repaired capture time still
+ * satisfies its own predicate — that is what makes the pass idempotent and what lets it
+ * re-check a library it has already walked — so that number is a size, not a progress bar.
+ * Progress shows in the queue above it.
+ */
 export async function countRepairCandidates(db: Database, name: RepairName): Promise<number> {
   const [row] = await db.select({ n: count() }).from(assets).where(REPAIRS[name].where)
   return Number(row?.n ?? 0)
