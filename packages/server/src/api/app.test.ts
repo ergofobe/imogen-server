@@ -785,6 +785,32 @@ describe('uploading', () => {
     expect(await services.queue.drain()).toBe(0)
   })
 
+  test('a device asset id the client re-sends does not run the pipeline again', async () => {
+    // Only the bytes are the owner holding the photograph and asking for it again. A
+    // device asset id is a name the client chose, and a phone that re-offers its library
+    // on every scan sends those by the thousand -- each one would put a broken original
+    // through ffmpeg once more, to fail the same way, for as long as it stayed broken.
+    const { cookie } = await signUp()
+    const fields = { deviceAssetId: 'android:1:68' }
+    const first = (await (await upload(cookie, await makePhoto(), fields)).json()) as {
+      asset: { id: string }
+    }
+    await services.queue.drain()
+    await markFailed(first.asset.id)
+
+    const response = await upload(cookie, await makePhoto('edited.jpg'), fields)
+    const second = (await response.json()) as {
+      asset: { id: string; status: string }
+      duplicate: boolean
+    }
+
+    expect(second.duplicate).toBe(true)
+    expect(second.asset.id).toBe(first.asset.id)
+    expect(second.asset.status).toBe('failed')
+    expect(await services.queue.drain()).toBe(0)
+    expect(await processingOf(first.asset.id)).toMatchObject({ status: 'failed' })
+  })
+
   test('a twin of a vaulted photograph answers the same on both upload paths', async () => {
     // One rule, and it is the direct path's: `duplicate: true` with the asset, whether or
     // not the caller can see the vault. A checksum or content match is the caller holding

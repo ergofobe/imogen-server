@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
 import { eq, sql } from 'drizzle-orm'
 import { assets, users } from '../db/schema.ts'
 import { createTestDatabase } from '../test/harness.ts'
+import type { ExistingAsset } from './identity.ts'
 import { INGEST_JOB, IngestService } from './ingest.ts'
 import type { MediaPipeline } from './pipeline.ts'
 import type { StorageDriver } from './storage.ts'
@@ -50,6 +51,11 @@ async function addAsset(overrides: Partial<typeof assets.$inferInsert> = {}) {
   return row!
 }
 
+/** What the claim hands back when the upload carried the photograph's own bytes. */
+function claimOf(row: typeof assets.$inferSelect): ExistingAsset {
+  return { row, restored: false, matchedBytes: true }
+}
+
 async function rowOf(assetId: string) {
   const [row] = await harness.db.select().from(assets).where(eq(assets.id, assetId))
   return row!
@@ -63,7 +69,7 @@ describe('retrying a failed photograph', () => {
     const result = await ingestWith(async (name, payload) => {
       queued.push({ name, payload })
       return 'job'
-    }).retryIfFailed(row)
+    }).retryIfFailed(claimOf(row))
 
     expect(queued).toEqual([{ name: INGEST_JOB, payload: { assetId: row.id } }])
     expect(result.status).toBe('pending')
@@ -76,9 +82,19 @@ describe('retrying a failed photograph', () => {
 
     const result = await ingestWith(async () => {
       throw new Error('nothing should be queued')
-    }).retryIfFailed(row)
+    }).retryIfFailed(claimOf(row))
 
     expect(result.status).toBe('ready')
+  })
+
+  test('leaves a photograph the caller matched only by the name the client chose', async () => {
+    const row = await addAsset()
+
+    const result = await ingestWith(async () => {
+      throw new Error('nothing should be queued')
+    }).retryIfFailed({ row, restored: false, matchedBytes: false })
+
+    expect(result.status).toBe('failed')
   })
 
   test('two uploads racing to retry one photograph queue one job between them', async () => {
@@ -89,9 +105,9 @@ describe('retrying a failed photograph', () => {
       return 'job'
     })
 
-    await service.retryIfFailed(row)
+    await service.retryIfFailed(claimOf(row))
     // The same row the first caller read: what the loser of the race is holding.
-    const second = await service.retryIfFailed(row)
+    const second = await service.retryIfFailed(claimOf(row))
 
     expect(queued).toEqual([row.id])
     expect(second.status).toBe('pending')
@@ -105,7 +121,7 @@ describe('retrying a failed photograph', () => {
       throw new Error('the queue is unreachable')
     })
 
-    await expect(service.retryIfFailed(row)).rejects.toThrow('the queue is unreachable')
+    await expect(service.retryIfFailed(claimOf(row))).rejects.toThrow('the queue is unreachable')
 
     expect(await rowOf(row.id)).toMatchObject({
       status: 'failed',

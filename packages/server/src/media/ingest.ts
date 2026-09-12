@@ -5,7 +5,12 @@ import type { Database } from '../db/index.ts'
 import { assetFiles, assets, users } from '../db/schema.ts'
 import { conflict, quotaExceeded, unsupportedMediaType } from '../lib/errors.ts'
 import { contentHash } from './content-hash.ts'
-import { type AssetRow, claimExistingAsset, deviceAssetIdIsVaulted } from './identity.ts'
+import {
+  type AssetRow,
+  claimExistingAsset,
+  deviceAssetIdIsVaulted,
+  type ExistingAsset,
+} from './identity.ts'
 import type { MediaPipeline } from './pipeline.ts'
 import { toAsset } from './serialize.ts'
 import { derivativePath, hashFile, libraryPath, type StorageDriver } from './storage.ts'
@@ -93,7 +98,7 @@ export class IngestService {
     if (claim.duplicate) {
       // Already have this photograph. Drop the copy rather than storing it twice.
       await rm(input.tempPath, { force: true })
-      const row = await this.retryIfFailed(claim.row)
+      const row = await this.retryIfFailed(claim)
       return { asset: toAsset(row), duplicate: true, restored: claim.restored }
     }
 
@@ -142,11 +147,18 @@ export class IngestService {
    * status and its checksum, every later upload matched it, and the only way out was to
    * wait for the retention sweep to destroy it (#68).
    *
+   * Only a match on the bytes counts. A device asset id is a name the client chose and
+   * may have moved to a different file since (#61), so it is not the owner holding this
+   * photograph -- and a phone that re-offers its library on every scan sends those by
+   * the thousand, each of which would put a broken original through ffmpeg again, to
+   * fail the same way, for as long as it stayed broken.
+   *
    * The update is guarded on the status that was read, so two uploads racing to retry
    * the same photograph queue one job between them.
    */
-  async retryIfFailed(row: AssetRow): Promise<AssetRow> {
-    if (row.status !== 'failed') return row
+  async retryIfFailed(match: ExistingAsset): Promise<AssetRow> {
+    const row = match.row
+    if (!match.matchedBytes || row.status !== 'failed') return row
 
     const [pending] = await this.db
       .update(assets)
@@ -290,9 +302,7 @@ export class IngestService {
     ownerId: string,
     size: number,
     values: Omit<typeof assets.$inferInsert, 'ownerId' | 'sizeBytes'>,
-  ): Promise<
-    { duplicate: true; row: AssetRow; restored: boolean } | { duplicate: false; id: string }
-  > {
+  ): Promise<({ duplicate: true } & ExistingAsset) | { duplicate: false; id: string }> {
     return this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`ingest:${ownerId}`}))`)
 

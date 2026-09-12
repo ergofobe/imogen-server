@@ -58,8 +58,9 @@ export function createUploadRoutes() {
         if (existing.restored) await services.faces.refreshFor(principal.user.id)
         // This path tells the client not to send the bytes, so a photograph the pipeline
         // rejected has to be queued again from here too; otherwise the uploads too big to
-        // repeat -- the videos -- are the ones with no way to ask again (#68).
-        const row = await services.ingest.retryIfFailed(existing.row)
+        // repeat -- the videos -- are the ones with no way to ask again (#68). Which
+        // matches are the caller holding those bytes is decided there.
+        const row = await services.ingest.retryIfFailed(existing)
         return c.json(
           {
             id: crypto.randomUUID(),
