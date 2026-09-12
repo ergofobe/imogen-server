@@ -1,11 +1,16 @@
 import { rm, stat } from 'node:fs/promises'
 import type { AssetUploadMetadata, AssetUploadResult } from '@imogen/shared'
-import { eq, sql } from 'drizzle-orm'
+import { and, eq, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { assetFiles, assets, users } from '../db/schema.ts'
 import { conflict, quotaExceeded, unsupportedMediaType } from '../lib/errors.ts'
 import { contentHash } from './content-hash.ts'
-import { type AssetRow, claimExistingAsset, deviceAssetIdIsVaulted } from './identity.ts'
+import {
+  type AssetRow,
+  claimExistingAsset,
+  deviceAssetIdIsVaulted,
+  type ExistingAsset,
+} from './identity.ts'
 import type { MediaPipeline } from './pipeline.ts'
 import { toAsset } from './serialize.ts'
 import { derivativePath, hashFile, libraryPath, type StorageDriver } from './storage.ts'
@@ -93,7 +98,8 @@ export class IngestService {
     if (claim.duplicate) {
       // Already have this photograph. Drop the copy rather than storing it twice.
       await rm(input.tempPath, { force: true })
-      return { asset: toAsset(claim.row), duplicate: true, restored: claim.restored }
+      const row = await this.retryIfFailed(claim)
+      return { asset: toAsset(row), duplicate: true, restored: claim.restored }
     }
 
     const assetId = claim.id
@@ -131,9 +137,67 @@ export class IngestService {
     return { asset: await this.hydrate(assetId), duplicate: false, restored: false }
   }
 
+  /**
+   * Queues another attempt at a photograph the pipeline rejected, and answers with the
+   * row as it now stands.
+   *
+   * Sending the file again is the owner asking for the derivatives it never got. The
+   * library already holds those bytes, so the copy is dropped as any duplicate is, and
+   * before this the answer stopped there: the row kept its `failed` status and its
+   * checksum, every later upload matched it, and the only way out was to wait for the
+   * retention sweep to destroy it (#68).
+   *
+   * Only a match on the bytes counts -- the checksum the server hashed for itself, or
+   * the content hash of the same payload under rewritten metadata (#60). A device asset
+   * id is a name the client chose and may have moved to a different file since (#61),
+   * so it is not the owner holding this photograph; a phone that re-offers its library
+   * on every scan sends those by the thousand, and each would put a broken original
+   * through ffmpeg again, to fail the same way, for as long as it stayed broken. For
+   * the same reason the resumable fast path does not call this: there the checksum is
+   * one the client asserts before sending anything. Another attempt is paid for by the
+   * bytes.
+   *
+   * What runs is the stored original, so a file that cannot be decoded at all fails
+   * again; this recovers the photographs whose processing failed for a reason that has
+   * since been fixed, which is what a failed row cannot tell you apart from the rest.
+   *
+   * The update is guarded on the status that was read, so two uploads racing to retry
+   * the same photograph queue one job between them.
+   */
+  async retryIfFailed(match: ExistingAsset): Promise<AssetRow> {
+    const row = match.row
+    if (!match.matchedBytes || row.status !== 'failed') return row
+
+    const [pending] = await this.db
+      .update(assets)
+      .set({ status: 'pending', processingError: null, updatedAt: new Date() })
+      .where(and(eq(assets.id, row.id), eq(assets.status, 'failed')))
+      .returning()
+    if (!pending) return (await this.rowOf(row.id)) ?? row
+
+    try {
+      await this.enqueue(INGEST_JOB, { assetId: row.id })
+    } catch (error) {
+      // Put the failure back if the job never reached the queue. `pending` with nothing
+      // queued is a photograph no retry can reach again -- this one refuses it, and the
+      // error the owner was shown is gone with it -- which is worse than the `failed` it
+      // replaced.
+      await this.db
+        .update(assets)
+        .set({
+          status: 'failed',
+          processingError: row.processingError,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(assets.id, row.id), eq(assets.status, 'pending')))
+      throw error
+    }
+    return pending
+  }
+
   /** Generates derivatives and fills in metadata. Runs in a worker, never on a request. */
   async process(assetId: string): Promise<void> {
-    const [asset] = await this.db.select().from(assets).where(eq(assets.id, assetId)).limit(1)
+    const asset = await this.rowOf(assetId)
     if (!asset) return
 
     await this.db.update(assets).set({ status: 'processing' }).where(eq(assets.id, assetId))
@@ -246,9 +310,7 @@ export class IngestService {
     ownerId: string,
     size: number,
     values: Omit<typeof assets.$inferInsert, 'ownerId' | 'sizeBytes'>,
-  ): Promise<
-    { duplicate: true; row: AssetRow; restored: boolean } | { duplicate: false; id: string }
-  > {
+  ): Promise<({ duplicate: true } & ExistingAsset) | { duplicate: false; id: string }> {
     return this.db.transaction(async (tx) => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`ingest:${ownerId}`}))`)
 
@@ -280,9 +342,14 @@ export class IngestService {
   }
 
   private async hydrate(assetId: string) {
-    const [row] = await this.db.select().from(assets).where(eq(assets.id, assetId)).limit(1)
+    const row = await this.rowOf(assetId)
     if (!row) throw conflict('Asset disappeared during upload')
     return toAsset(row)
+  }
+
+  private async rowOf(assetId: string): Promise<AssetRow | undefined> {
+    const [row] = await this.db.select().from(assets).where(eq(assets.id, assetId)).limit(1)
+    return row
   }
 }
 

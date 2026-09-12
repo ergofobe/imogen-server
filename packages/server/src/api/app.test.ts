@@ -146,6 +146,27 @@ async function deletedAtOf(assetId: string) {
   return row!.deletedAt
 }
 
+/** What the pipeline made of the asset, as the row records it. */
+async function processingOf(assetId: string) {
+  const [row] = await harness.db
+    .select({ status: assets.status, processingError: assets.processingError })
+    .from(assets)
+    .where(eq(assets.id, assetId))
+  return row!
+}
+
+/**
+ * The state `process` leaves behind when the pipeline rejects the file. Set directly so
+ * the stored bytes stay good and a retry can be seen to succeed; driving a real failure
+ * would leave nothing the second attempt could produce.
+ */
+async function markFailed(assetId: string) {
+  await harness.db
+    .update(assets)
+    .set({ status: 'failed', processingError: 'ffprobe could not read this file' })
+    .where(eq(assets.id, assetId))
+}
+
 /**
  * A second row for the same photograph, the way a library that predates the content
  * hash holds one. The checksum is unique per owner, so every caller supplies it.
@@ -656,6 +677,141 @@ describe('uploading', () => {
     expect(result.asset.id).toBe(first.asset.id)
     expect(await deletedAtOf(first.asset.id)).toBeNull()
     expect(await deletedAtOf(other)).toBeNull()
+  })
+
+  test('re-uploading a photograph whose processing failed runs the pipeline again', async () => {
+    // The checksum index sends the re-upload to the failed row, and before this the
+    // duplicate answer dropped the bytes and left the tile broken with nothing to try
+    // next. The bytes in the library are the bytes just sent, so the copy still adds
+    // nothing -- but the derivatives it never got are what the owner is asking for (#68).
+    const { cookie } = await signUp()
+    const photo = await makePhoto()
+    const first = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
+    await services.queue.drain()
+    await markFailed(first.asset.id)
+
+    const response = await upload(cookie, photo)
+    const second = (await response.json()) as {
+      asset: { id: string; status: string }
+      duplicate: boolean
+    }
+
+    expect(response.status).toBe(200)
+    expect(second.duplicate).toBe(true)
+    expect(second.asset.id).toBe(first.asset.id)
+    expect(second.asset.status).toBe('pending')
+    expect(await processingOf(first.asset.id)).toMatchObject({
+      status: 'pending',
+      processingError: null,
+    })
+
+    await services.queue.drain()
+    expect(await processingOf(first.asset.id)).toMatchObject({ status: 'ready' })
+    const thumbnail = await request(`/api/v1/assets/${first.asset.id}/thumbnail`, {
+      headers: { Cookie: cookie },
+    })
+    expect(thumbnail.status).toBe(200)
+  })
+
+  test('a failed photograph in the trash is restored and retried by one upload', async () => {
+    // Trashing the broken tile was the only lever the owner had, and since #64 the
+    // re-upload brings the row back -- still failed, still broken. One request has to do
+    // both.
+    const { cookie } = await signUp()
+    const photo = await makePhoto()
+    const first = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
+    await services.queue.drain()
+    await markFailed(first.asset.id)
+    await jsonRequest('/api/v1/assets/trash', 'POST', { assetIds: [first.asset.id] }, cookie)
+
+    const second = (await (await upload(cookie, photo)).json()) as {
+      asset: { id: string; status: string; deletedAt: string | null }
+      duplicate: boolean
+    }
+
+    expect(second.duplicate).toBe(true)
+    expect(second.asset.id).toBe(first.asset.id)
+    expect(second.asset.deletedAt).toBeNull()
+    expect(second.asset.status).toBe('pending')
+    await services.queue.drain()
+    expect(await processingOf(first.asset.id)).toMatchObject({ status: 'ready' })
+  })
+
+  test('beginning a resumable upload of a failed photograph does not retry it', async () => {
+    // The checksum here is one the client asserts; it has sent nothing, and the server
+    // has hashed nothing. A backup that opens a session per photograph on every scan
+    // would re-run the pipeline over every broken original it holds, every time. Another
+    // attempt is paid for by the bytes, and this path is where a client is told it need
+    // not send them.
+    const { cookie } = await signUp()
+    const photo = await makePhoto()
+    const first = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
+    await services.queue.drain()
+    await markFailed(first.asset.id)
+
+    const response = await jsonRequest(
+      '/api/v1/uploads',
+      'POST',
+      {
+        filename: 'photo.jpg',
+        sizeBytes: photo.size,
+        mimeType: 'image/jpeg',
+        checksum: await checksumOf(photo),
+      },
+      cookie,
+    )
+    const session = (await response.json()) as {
+      existing: { asset: { id: string; status: string }; duplicate: boolean } | null
+    }
+
+    expect(response.status).toBe(201)
+    expect(session.existing?.duplicate).toBe(true)
+    expect(session.existing?.asset.id).toBe(first.asset.id)
+    expect(session.existing?.asset.status).toBe('failed')
+    expect(await services.queue.drain()).toBe(0)
+
+    // Completing the upload is what asks again, and that carries the bytes.
+    expect(await processingOf(first.asset.id)).toMatchObject({ status: 'failed' })
+  })
+
+  test('re-uploading a photograph that is already ready queues no work', async () => {
+    // Only a failed photograph is worth running again; every other duplicate would put
+    // the whole library through the pipeline a second time.
+    const { cookie } = await signUp()
+    const photo = await makePhoto()
+    await upload(cookie, photo)
+    await services.queue.drain()
+
+    const response = await upload(cookie, photo)
+
+    expect(((await response.json()) as { duplicate: boolean }).duplicate).toBe(true)
+    expect(await services.queue.drain()).toBe(0)
+  })
+
+  test('a device asset id the client re-sends does not run the pipeline again', async () => {
+    // Only the bytes are the owner holding the photograph and asking for it again. A
+    // device asset id is a name the client chose, and a phone that re-offers its library
+    // on every scan sends those by the thousand -- each one would put a broken original
+    // through ffmpeg once more, to fail the same way, for as long as it stayed broken.
+    const { cookie } = await signUp()
+    const fields = { deviceAssetId: 'android:1:68' }
+    const first = (await (await upload(cookie, await makePhoto(), fields)).json()) as {
+      asset: { id: string }
+    }
+    await services.queue.drain()
+    await markFailed(first.asset.id)
+
+    const response = await upload(cookie, await makePhoto('edited.jpg'), fields)
+    const second = (await response.json()) as {
+      asset: { id: string; status: string }
+      duplicate: boolean
+    }
+
+    expect(second.duplicate).toBe(true)
+    expect(second.asset.id).toBe(first.asset.id)
+    expect(second.asset.status).toBe('failed')
+    expect(await services.queue.drain()).toBe(0)
+    expect(await processingOf(first.asset.id)).toMatchObject({ status: 'failed' })
   })
 
   test('a twin of a vaulted photograph answers the same on both upload paths', async () => {

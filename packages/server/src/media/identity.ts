@@ -14,6 +14,12 @@ export type ExistingAsset = {
   row: AssetRow
   /** The match was in the trash and has just been brought back. */
   restored: boolean
+  /**
+   * The caller holds the photograph's own bytes -- the checksum or the content hash --
+   * rather than only a device asset id, which is a name the client chose and may have
+   * moved to a different file since (#61).
+   */
+  matchedBytes: boolean
 }
 
 /**
@@ -72,7 +78,11 @@ export async function claimExistingAsset(
     )
     .limit(1)
   if (!row) return undefined
-  if (!row.deletedAt) return { row, restored: false }
+
+  const matchedBytes =
+    (keys.checksum !== undefined && row.checksum === keys.checksum) ||
+    (keys.contentHash != null && row.contentHash === keys.contentHash)
+  if (!row.deletedAt) return { row, restored: false, matchedBytes }
 
   // Guarded on `deletedAt` so a sweep that destroyed the row in the meantime reads as
   // no match, and the upload stores the photograph afresh rather than pointing at a
@@ -82,7 +92,7 @@ export async function claimExistingAsset(
     .set({ deletedAt: null, updatedAt: new Date() })
     .where(and(eq(assets.id, row.id), isNotNull(assets.deletedAt)))
     .returning()
-  return restored ? { row: restored, restored: true } : undefined
+  return restored ? { row: restored, restored: true, matchedBytes } : undefined
 }
 
 /**
