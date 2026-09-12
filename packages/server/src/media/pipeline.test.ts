@@ -97,6 +97,25 @@ async function makeJpegWithGpsRationals(
   return path
 }
 
+/**
+ * A raw AMR-NB bitstream: the magic header, then frames of AMR 4.75 silence (a mode byte
+ * of `0x04` — frame type 0, quality bit set — and twelve bytes of payload).
+ *
+ * Written by hand rather than encoded, because AMR-NB needs libopencore, which a stock
+ * ffmpeg build does not carry. This is exactly the shape of the voice notes that reach
+ * ingest with a `.3gp` extension: ffprobe reports `format_name=amr` and a single audio
+ * stream, and there is no picture anywhere in it to make a poster frame from.
+ */
+async function makeRawAmr(path: string, frames = 40) {
+  const frame = Buffer.alloc(13)
+  frame[0] = 0x04
+  await Bun.write(
+    path,
+    Buffer.concat([Buffer.from('#!AMR\n', 'ascii'), ...Array(frames).fill(frame)]),
+  )
+  return path
+}
+
 /** Whether a command exists on this machine, so a fixture can degrade instead of lying. */
 async function hasCommand(command: string): Promise<boolean> {
   return (await Bun.spawn(['which', command], { stdout: 'ignore', stderr: 'ignore' }).exited) === 0
@@ -121,6 +140,8 @@ async function encodeHeic(source: string, out: string): Promise<boolean> {
 let jpegPath: string
 let heicPath: string
 let videoPath: string
+let audioOnlyPath: string
+let video3gpPath: string
 
 /*
  * Detected at module scope, not in beforeAll: `test.skipIf` is evaluated while the file
@@ -155,6 +176,15 @@ beforeAll(async () => {
 
   videoPath = join(workDir, 'clip.mp4')
   await Bun.$`ffmpeg -y -loglevel error -f lavfi -i testsrc=duration=2:size=640x480:rate=24 -pix_fmt yuv420p ${videoPath}`
+    .quiet()
+    .nothrow()
+
+  audioOnlyPath = await makeRawAmr(join(workDir, 'voice-note.3gp'))
+
+  // mpeg4 rather than the container default: it is ffmpeg's own encoder, so a build
+  // without libx264 still produces the fixture.
+  video3gpPath = join(workDir, 'clip.3gp')
+  await Bun.$`ffmpeg -y -loglevel error -f lavfi -i testsrc=duration=2:size=176x144:rate=15 -pix_fmt yuv420p -c:v mpeg4 ${video3gpPath}`
     .quiet()
     .nothrow()
 })
@@ -555,6 +585,42 @@ describe('video processing', () => {
     expect(result.duration).toBeCloseTo(2, 0)
     expect(result.thumbnail).not.toBeNull()
     expect((await sharp(result.thumbnail!).metadata()).format).toBe('webp')
+  })
+
+  /*
+   * A 3GP carrying real video is the half of the `.3gp` uploads that always worked. It is
+   * guarded here so the audio-only refusal below cannot grow into a refusal of the
+   * extension.
+   */
+  test('posters a 3gp that really does carry video', async () => {
+    const result = await pipeline.process(video3gpPath, {
+      mimeType: 'video/3gpp',
+      filename: 'clip.3gp',
+    })
+
+    expect(result.error).toBeNull()
+    expect(result.type).toBe('video')
+    expect(result.width).toBe(176)
+    expect(result.height).toBe(144)
+    expect(result.thumbnail).not.toBeNull()
+    expect(result.preview).not.toBeNull()
+  })
+
+  /*
+   * Voice notes are saved with a `.3gp` extension, which `classify` reads as video. No
+   * frame can ever be read from one, so the generic "could not read a frame" reads as a
+   * decoder problem and sent people hunting for a missing codec.
+   */
+  test('names audio-only as the reason rather than a frame it could not read', async () => {
+    const result = await pipeline.process(audioOnlyPath, {
+      mimeType: 'audio/3gpp',
+      filename: 'voice-note.3gp',
+    })
+
+    expect(result.error).toContain('audio')
+    expect(result.error).not.toContain('frame')
+    expect(result.thumbnail).toBeNull()
+    expect(result.preview).toBeNull()
   })
 
   test("does not treat ffprobe's creation time as carrying an offset", async () => {

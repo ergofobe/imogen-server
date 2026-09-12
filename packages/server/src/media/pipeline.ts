@@ -276,6 +276,13 @@ export class MediaPipeline {
       result.capturedAtHasOffset = false
     }
 
+    if (probe?.audioOnly) {
+      return {
+        ...result,
+        error: 'This file contains only audio and no video, so no preview can be made from it',
+      }
+    }
+
     // Seek a little way in: the first frame of a phone video is often black.
     const seek = probe?.duration && probe.duration > 1 ? Math.min(probe.duration / 3, 3) : 0
     const frame = await decodeWithFfmpeg(path, this.options.ffmpegPath, seek)
@@ -385,6 +392,7 @@ export class MediaPipeline {
         format?: Record<string, unknown>
       }
       const video = data.streams?.find((s) => s.codec_type === 'video')
+      const audio = data.streams?.find((s) => s.codec_type === 'audio')
       const duration = Number(data.format?.duration ?? video?.duration)
       const creation =
         (data.format?.tags as Record<string, string> | undefined)?.creation_time ??
@@ -394,6 +402,17 @@ export class MediaPipeline {
         height: typeof video?.height === 'number' ? video.height : null,
         duration: Number.isFinite(duration) ? duration : null,
         creationTime: creation ? asDate(creation) : null,
+        /**
+         * Voice notes are saved with a `.3gp` extension, which `classify` reads as video,
+         * and no frame can ever be read from one. ffprobe has already listed every stream
+         * to get the dimensions above, so the absence of a picture costs nothing here; a
+         * second probe pass would be the only other way to learn it.
+         *
+         * Narrower than `!video` on purpose: a file ffprobe parses but finds nothing in is
+         * broken rather than audio, and the frame read below still gives the better
+         * account of it.
+         */
+        audioOnly: !video && audio !== undefined,
       }
     } catch {
       return null
