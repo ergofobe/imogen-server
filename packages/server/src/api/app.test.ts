@@ -737,10 +737,12 @@ describe('uploading', () => {
     expect(await processingOf(first.asset.id)).toMatchObject({ status: 'ready' })
   })
 
-  test('beginning a resumable upload of a failed photograph retries it before any bytes move', async () => {
-    // The fast path answers that the server already has the file and the client sends
-    // nothing, so a retry that only happened on the direct path would leave exactly the
-    // uploads too big to redo -- the videos -- with no way to ask again.
+  test('beginning a resumable upload of a failed photograph does not retry it', async () => {
+    // The checksum here is one the client asserts; it has sent nothing, and the server
+    // has hashed nothing. A backup that opens a session per photograph on every scan
+    // would re-run the pipeline over every broken original it holds, every time. Another
+    // attempt is paid for by the bytes, and this path is where a client is told it need
+    // not send them.
     const { cookie } = await signUp()
     const photo = await makePhoto()
     const first = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
@@ -765,10 +767,11 @@ describe('uploading', () => {
     expect(response.status).toBe(201)
     expect(session.existing?.duplicate).toBe(true)
     expect(session.existing?.asset.id).toBe(first.asset.id)
-    expect(session.existing?.asset.status).toBe('pending')
+    expect(session.existing?.asset.status).toBe('failed')
+    expect(await services.queue.drain()).toBe(0)
 
-    await services.queue.drain()
-    expect(await processingOf(first.asset.id)).toMatchObject({ status: 'ready' })
+    // Completing the upload is what asks again, and that carries the bytes.
+    expect(await processingOf(first.asset.id)).toMatchObject({ status: 'failed' })
   })
 
   test('re-uploading a photograph that is already ready queues no work', async () => {

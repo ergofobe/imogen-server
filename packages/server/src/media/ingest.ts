@@ -142,16 +142,24 @@ export class IngestService {
    * row as it now stands.
    *
    * Sending the file again is the owner asking for the derivatives it never got. The
-   * bytes in the library are already the bytes just sent, so there is nothing to store,
-   * and before this the duplicate answer stopped there: the row kept its `failed`
-   * status and its checksum, every later upload matched it, and the only way out was to
-   * wait for the retention sweep to destroy it (#68).
+   * library already holds those bytes, so the copy is dropped as any duplicate is, and
+   * before this the answer stopped there: the row kept its `failed` status and its
+   * checksum, every later upload matched it, and the only way out was to wait for the
+   * retention sweep to destroy it (#68).
    *
-   * Only a match on the bytes counts. A device asset id is a name the client chose and
-   * may have moved to a different file since (#61), so it is not the owner holding this
-   * photograph -- and a phone that re-offers its library on every scan sends those by
-   * the thousand, each of which would put a broken original through ffmpeg again, to
-   * fail the same way, for as long as it stayed broken.
+   * Only a match on the bytes counts -- the checksum the server hashed for itself, or
+   * the content hash of the same payload under rewritten metadata (#60). A device asset
+   * id is a name the client chose and may have moved to a different file since (#61),
+   * so it is not the owner holding this photograph; a phone that re-offers its library
+   * on every scan sends those by the thousand, and each would put a broken original
+   * through ffmpeg again, to fail the same way, for as long as it stayed broken. For
+   * the same reason the resumable fast path does not call this: there the checksum is
+   * one the client asserts before sending anything. Another attempt is paid for by the
+   * bytes.
+   *
+   * What runs is the stored original, so a file that cannot be decoded at all fails
+   * again; this recovers the photographs whose processing failed for a reason that has
+   * since been fixed, which is what a failed row cannot tell you apart from the rest.
    *
    * The update is guarded on the status that was read, so two uploads racing to retry
    * the same photograph queue one job between them.
