@@ -142,6 +142,10 @@ async function addFace(assetId: string, personId: string, faceOwnerId = ownerId,
 
 /** Races work against a deadline so a regression fails the test rather than wedging it. */
 function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | 'timed out'> {
+  // Racing leaves the loser unobserved, and the loser here rejects for the very reason
+  // the test exists: a regression hits `lock_timeout`. Unhandled, that fails the whole
+  // file rather than this one assertion.
+  work.catch(() => {})
   let timer: ReturnType<typeof setTimeout> | undefined
   const deadline = new Promise<'timed out'>((resolve) => {
     timer = setTimeout(() => resolve('timed out'), ms)

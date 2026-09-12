@@ -366,6 +366,12 @@ export class FaceService {
    * the authoritative decision is always made again under it. A face that joins somebody
    * already known therefore contends with that person alone.
    *
+   * Creating someone stays owner-wide, and cannot be narrowed: the whole question is
+   * whether a person exists, so there is nothing to name. What that costs is bounded by
+   * how many people a library has rather than how many faces, since every face after the
+   * first of each person joins instead. It is the same hold as before — one candidate
+   * query and the writes — and the unlocked probe that precedes it is outside it.
+   *
    * Detection and embedding, where the time actually goes, are outside all of this.
    */
   private async recordFace(
@@ -606,6 +612,13 @@ export class FaceService {
    * Folds one person into another. The surviving person keeps its name if it has one,
    * and every moved face is marked confirmed so re-clustering never undoes a human's
    * decision.
+   *
+   * The move, the delete and the new centroid are one locked transaction over everybody
+   * involved. The delete used to stand on its own, outside any lock, which left a scan
+   * free to file a face onto one of the people being merged away — between the move and
+   * the delete, so the face is not moved and the person it points at is gone. That is the
+   * `faces_person_id_people_id_fk` violation the housekeeping comments describe, arrived
+   * at from the other direction.
    */
   async mergePeople(ownerId: string, keepId: string, mergeIds: string[]): Promise<number> {
     const keep = await this.getPerson(ownerId, keepId)
@@ -614,17 +627,21 @@ export class FaceService {
 
     for (const id of others) await this.getPerson(ownerId, id)
 
-    const moved = await this.db
-      .update(faces)
-      .set({ personId: keepId, confirmed: true })
-      .where(and(eq(faces.ownerId, ownerId), inArray(faces.personId, others)))
-      .returning({ id: faces.id })
+    const moved = await this.lockedForPeople(ownerId, [keepId, ...others], async (tx) => {
+      const rows = await tx
+        .update(faces)
+        .set({ personId: keepId, confirmed: true })
+        .where(and(eq(faces.ownerId, ownerId), inArray(faces.personId, others)))
+        .returning({ id: faces.id })
 
-    await this.db.delete(people).where(inArray(people.id, others))
-    await this.lockedForPeople(ownerId, [keepId], (tx) => this.recomputeCentroid(keepId, tx))
+      await tx.delete(people).where(inArray(people.id, others))
+      await this.recomputeCentroid(keepId, tx)
+      return rows.length
+    })
+
     await this.refreshCounts(ownerId)
     void keep
-    return moved.length
+    return moved
   }
 
   /** Moves specific faces to a different person — the fix when clustering guessed wrong. */
