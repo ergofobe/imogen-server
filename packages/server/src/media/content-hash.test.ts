@@ -204,3 +204,223 @@ test('returns null for a PNG-ish buffer', async () => {
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
   expect(await hashOf(png)).toBeNull()
 })
+
+function fullBox(type: string, version: number, payload: Buffer): Buffer {
+  const head = Buffer.alloc(4)
+  head.writeUInt8(version, 0)
+  return box(type, Buffer.concat([head, payload]))
+}
+
+/** `brands[0]` is the major brand; the rest are the compatible brands. */
+function heifFtypBox(brands: string[]): Buffer {
+  return box(
+    'ftyp',
+    Buffer.concat([
+      Buffer.from(brands[0]!, 'ascii'),
+      Buffer.from([0, 0, 0, 0]),
+      Buffer.from(brands.slice(1).join(''), 'ascii'),
+    ]),
+  )
+}
+
+function pitmBox(id: number): Buffer {
+  const payload = Buffer.alloc(2)
+  payload.writeUInt16BE(id, 0)
+  return fullBox('pitm', 0, payload)
+}
+
+type ItemRef = { kind: string; from: number; to: number[] }
+
+function irefBox(refs: ItemRef[]): Buffer {
+  const children = refs.map(({ kind, from, to }) => {
+    const payload = Buffer.alloc(4 + to.length * 2)
+    payload.writeUInt16BE(from, 0)
+    payload.writeUInt16BE(to.length, 2)
+    for (const [i, id] of to.entries()) payload.writeUInt16BE(id, 4 + i * 2)
+    return box(kind, payload)
+  })
+  return fullBox('iref', 0, Buffer.concat(children))
+}
+
+type Extent = { offset: number; length: number }
+type ItemLocation = { id: number; construction: number; extents: Extent[] }
+
+/** An `iloc` version 1 with 4-byte offsets and lengths and no base offset or extent index. */
+function ilocBox(items: ItemLocation[]): Buffer {
+  const head = Buffer.alloc(4)
+  head.writeUInt8(0x44, 0) // offset_size = 4, length_size = 4
+  head.writeUInt8(0x00, 1) // base_offset_size = 0, index_size = 0
+  head.writeUInt16BE(items.length, 2)
+
+  const entries = items.map((item) => {
+    const buf = Buffer.alloc(8 + item.extents.length * 8)
+    buf.writeUInt16BE(item.id, 0)
+    buf.writeUInt16BE(item.construction, 2)
+    buf.writeUInt16BE(0, 4) // data_reference_index: 0 means "this file"
+    buf.writeUInt16BE(item.extents.length, 6)
+    item.extents.forEach((extent, i) => {
+      buf.writeUInt32BE(extent.offset, 8 + i * 8)
+      buf.writeUInt32BE(extent.length, 12 + i * 8)
+    })
+    return buf
+  })
+
+  return fullBox('iloc', 1, Buffer.concat([head, ...entries]))
+}
+
+const GRID_DESCRIPTOR = Buffer.from([0x00, 0x00, 0x01, 0x01, 0x02, 0x00, 0x02, 0x00])
+
+type HeifSpec = {
+  tiles: Buffer[]
+  xmp: Buffer
+  /** An `auxl` item — a gain map or depth map — stored after the tiles. */
+  aux?: Buffer
+  brands?: string[]
+  omitItemIndex?: boolean
+}
+
+const PRIMARY_ID = 1
+const XMP_ID = 90
+const AUX_ID = 91
+
+/**
+ * A HEIF shaped like the ones `sips` and iPhones write: a `grid` primary whose descriptor
+ * lives in `idat`, its tiles and the XMP item side by side in `mdat`.
+ */
+function heif(spec: HeifSpec): Buffer {
+  const ftyp = heifFtypBox(spec.brands ?? ['heic', 'mif1', 'heic'])
+  const tileIds = spec.tiles.map((_, i) => 10 + i)
+  const payloads = [...spec.tiles, spec.xmp, ...(spec.aux ? [spec.aux] : [])]
+
+  // Offsets are fixed-width, so a first pass with zeros measures a `meta` of the final size.
+  const build = (mdatPayloadStart: number): { meta: Buffer; mdat: Buffer } => {
+    let cursor = mdatPayloadStart
+    const extents = payloads.map((payload) => {
+      const extent = { offset: cursor, length: payload.length }
+      cursor += payload.length
+      return extent
+    })
+
+    const locations: ItemLocation[] = [
+      { id: PRIMARY_ID, construction: 1, extents: [{ offset: 0, length: GRID_DESCRIPTOR.length }] },
+      ...tileIds.map((id, i) => ({ id, construction: 0, extents: [extents[i]!] })),
+      { id: XMP_ID, construction: 0, extents: [extents[spec.tiles.length]!] },
+      ...(spec.aux
+        ? [{ id: AUX_ID, construction: 0, extents: [extents[spec.tiles.length + 1]!] }]
+        : []),
+    ]
+
+    const refs: ItemRef[] = [
+      { kind: 'dimg', from: PRIMARY_ID, to: tileIds },
+      { kind: 'cdsc', from: XMP_ID, to: [PRIMARY_ID] },
+      ...(spec.aux ? [{ kind: 'auxl', from: AUX_ID, to: [PRIMARY_ID] }] : []),
+    ]
+
+    const index = spec.omitItemIndex
+      ? Buffer.alloc(0)
+      : Buffer.concat([pitmBox(PRIMARY_ID), irefBox(refs), ilocBox(locations)])
+
+    return {
+      meta: fullBox('meta', 0, Buffer.concat([index, box('idat', GRID_DESCRIPTOR)])),
+      mdat: box('mdat', Buffer.concat(payloads)),
+    }
+  }
+
+  const measured = build(0)
+  const final = build(ftyp.length + measured.meta.length + 8)
+  return Buffer.concat([ftyp, final.meta, final.mdat])
+}
+
+describe('contentHash HEIF', () => {
+  const tiles = [randomBytes(512), randomBytes(384), randomBytes(400), randomBytes(256)]
+
+  test('is stable when a metadata rewrite resizes the XMP item inside mdat', async () => {
+    const before = heif({ tiles, xmp: Buffer.from('<x:xmpmeta>rating 0</x:xmpmeta>') })
+    const after = heif({ tiles, xmp: Buffer.from('<x:xmpmeta>rating 1, and longer</x:xmpmeta>') })
+
+    const hash = await hashOf(before)
+    expect(hash).not.toBeNull()
+    expect(await hashOf(after)).toBe(hash)
+  })
+
+  test('differs for different tile bytes', async () => {
+    const xmp = Buffer.from('<x:xmpmeta/>')
+    const other = [...tiles.slice(0, 3), randomBytes(256)]
+    expect(await hashOf(heif({ tiles: other, xmp }))).not.toBe(await hashOf(heif({ tiles, xmp })))
+  })
+
+  test('a copy missing its auxiliary image does not collapse into the richer file', async () => {
+    const xmp = Buffer.from('<x:xmpmeta/>')
+    const aux = randomBytes(128)
+    expect(await hashOf(heif({ tiles, xmp, aux }))).not.toBe(await hashOf(heif({ tiles, xmp })))
+  })
+
+  test('every HEIF-family brand takes the item route, major or compatible', async () => {
+    const shortXmp = Buffer.from('<x/>')
+    const longXmp = Buffer.from('<x>padded out a good deal further</x>')
+    const brandSets = ['heic', 'heix', 'mif1', 'msf1', 'avif']
+      .map((brand) => [brand])
+      .concat([['isom', 'iso2', 'heic']])
+
+    for (const brands of brandSets) {
+      const hash = await hashOf(heif({ tiles, xmp: shortXmp, brands }))
+      expect(hash).not.toBeNull()
+      expect(await hashOf(heif({ tiles, xmp: longXmp, brands }))).toBe(hash)
+    }
+  })
+
+  test('falls back to the mdat rule when the meta box carries no item index', async () => {
+    const xmp = Buffer.from('<x:xmpmeta/>')
+    const a = heif({ tiles, xmp, omitItemIndex: true })
+    const b = heif({
+      tiles,
+      xmp: Buffer.from('<x:xmpmeta>longer</x:xmpmeta>'),
+      omitItemIndex: true,
+    })
+    expect(await hashOf(a)).not.toBeNull()
+    expect(await hashOf(b)).not.toBe(await hashOf(a))
+  })
+
+  test('a non-HEIF brand keeps the mdat rule even with a meta box', async () => {
+    const xmp = Buffer.from('<x:xmpmeta/>')
+    const brands = ['isom', 'isom', 'iso2']
+    const a = heif({ tiles, xmp, brands })
+    const b = heif({ tiles, xmp: Buffer.from('<x:xmpmeta>longer</x:xmpmeta>'), brands })
+    expect(await hashOf(a)).not.toBeNull()
+    expect(await hashOf(b)).not.toBe(await hashOf(a))
+  })
+})
+
+/** Whether a command exists on this machine, so a fixture can degrade instead of lying. */
+async function hasCommand(command: string): Promise<boolean> {
+  return (await Bun.spawn(['which', command], { stdout: 'ignore', stderr: 'ignore' }).exited) === 0
+}
+
+/*
+ * Detected at module scope, not in beforeAll: `test.skipIf` is evaluated while the file is
+ * being read, so a flag set later is always still false and every test silently skips.
+ */
+const realHeicAvailable = (await hasCommand('sips')) && (await hasCommand('exiftool'))
+
+test.skipIf(!realHeicAvailable)(
+  'a real HEIC survives an exiftool XMP rewrite',
+  async () => {
+    const png = join(workDir, 'real.png')
+    await sharp({ create: { width: 512, height: 512, channels: 3, background: '#4a7' } })
+      .png()
+      .toFile(png)
+
+    const original = join(workDir, 'real.heic')
+    await Bun.$`sips -s format heic ${png} --out ${original}`.quiet().nothrow()
+    if (!(await Bun.file(original).exists())) return
+
+    const rewritten = join(workDir, 'real-rewritten.heic')
+    await Bun.write(rewritten, Bun.file(original))
+    await Bun.$`exiftool -overwrite_original -XMP:Rating=1 ${rewritten}`.quiet().nothrow()
+
+    const hash = await contentHash(original)
+    expect(hash).not.toBeNull()
+    expect(await contentHash(rewritten)).toBe(hash)
+  },
+  30000,
+)
