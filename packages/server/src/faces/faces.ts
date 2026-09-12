@@ -624,6 +624,12 @@ export class FaceService {
    * the delete, so the face is not moved and the person it points at is gone. That is the
    * `faces_person_id_people_id_fk` violation the housekeeping comments describe, arrived
    * at from the other direction.
+   *
+   * The survivor is confirmed again inside that transaction. `getPerson` answers for the
+   * caller — whose person this is, and a 404 rather than a constraint — but it answers
+   * before the lock is granted, and an unscoped recount deleting a `keep` whose photos
+   * have all just been trashed is exactly what that window lets through. A merged-away
+   * person needs no such check: the move simply matches nothing.
    */
   async mergePeople(ownerId: string, keepId: string, mergeIds: string[]): Promise<number> {
     const keep = await this.getPerson(ownerId, keepId)
@@ -633,6 +639,8 @@ export class FaceService {
     for (const id of others) await this.getPerson(ownerId, id)
 
     const moved = await this.lockedForPeople(ownerId, [keepId, ...others], async (tx) => {
+      if (!(await this.stillThere(tx, keepId))) throw notFound('No such person')
+
       const rows = await tx
         .update(faces)
         .set({ personId: keepId, confirmed: true })
@@ -656,6 +664,8 @@ export class FaceService {
    * reason `mergePeople` gives: between the check that they exist and the write that
    * points a face at them, a recount is free to find them empty and delete them.
    * Unassigning names nobody, and writing a null cannot point at a person who has gone.
+   * `getPerson` above answers for the caller and cannot bind, since it runs before the
+   * lock is granted; the re-read inside does the binding.
    */
   async reassignFaces(ownerId: string, faceIds: string[], personId: string | null) {
     const move = (tx: Tx | Database) =>
@@ -667,6 +677,7 @@ export class FaceService {
     if (personId) {
       await this.getPerson(ownerId, personId)
       await this.lockedForPeople(ownerId, [personId], async (tx) => {
+        if (!(await this.stillThere(tx, personId))) throw notFound('No such person')
         await move(tx)
         await this.recomputeCentroid(personId, tx)
       })
@@ -675,6 +686,16 @@ export class FaceService {
     }
 
     await this.refreshCounts(ownerId)
+  }
+
+  /** Whether the person is still there, asked under the lock, where the answer holds. */
+  private async stillThere(tx: Tx, personId: string): Promise<boolean> {
+    const [row] = await tx
+      .select({ id: people.id })
+      .from(people)
+      .where(eq(people.id, personId))
+      .limit(1)
+    return row !== undefined
   }
 
   private async recomputeCentroid(personId: string, tx: Tx): Promise<void> {
