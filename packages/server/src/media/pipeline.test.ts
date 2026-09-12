@@ -375,6 +375,61 @@ describe('metadata extraction', () => {
     expect(result.location).toBeNull()
   })
 
+  /**
+   * A finite number that is not a place. Unlike the NaN above it survives every check a
+   * type can make, so nothing short of the range itself catches it -- and every SDK port
+   * now decodes such a coordinate away, leaving a row nothing will ever display.
+   */
+  test('refuses a GPS latitude outside its range', async () => {
+    const withBadGps = join(workDir, 'gps-lat-200.jpg')
+    await makeJpegWithGpsRationals(withBadGps, {
+      latitude: [200, 1, 0, 1, 0, 1],
+      longitude: [12, 1, 30, 1, 0, 1],
+    })
+
+    const result = await pipeline.process(withBadGps, {
+      mimeType: 'image/jpeg',
+      filename: 'gps-lat-200.jpg',
+    })
+
+    expect(result.location).toBeNull()
+  })
+
+  // The bounds differ per coordinate, so a guard that checked both against 90 would pass
+  // the case above and still let this one through.
+  test('refuses a GPS longitude outside its range', async () => {
+    const withBadGps = join(workDir, 'gps-lon-200.jpg')
+    await makeJpegWithGpsRationals(withBadGps, {
+      latitude: [38, 1, 43, 1, 20, 1],
+      longitude: [200, 1, 0, 1, 0, 1],
+    })
+
+    const result = await pipeline.process(withBadGps, {
+      mimeType: 'image/jpeg',
+      filename: 'gps-lon-200.jpg',
+    })
+
+    expect(result.location).toBeNull()
+  })
+
+  // Without this, dropping every coordinate the pipeline is unsure of would pass the two
+  // cases above.
+  test('keeps a GPS coordinate sitting exactly on both bounds', async () => {
+    const atTheBounds = join(workDir, 'gps-bounds.jpg')
+    await makeJpegWithGpsRationals(atTheBounds, {
+      latitude: [90, 1, 0, 1, 0, 1],
+      longitude: [180, 1, 0, 1, 0, 1],
+    })
+
+    const result = await pipeline.process(atTheBounds, {
+      mimeType: 'image/jpeg',
+      filename: 'gps-bounds.jpg',
+    })
+
+    expect(result.location?.latitude).toBe(90)
+    expect(result.location?.longitude).toBe(180)
+  })
+
   test('reports no capture time rather than inventing one', async () => {
     const result = await pipeline.process(jpegPath, {
       mimeType: 'image/jpeg',

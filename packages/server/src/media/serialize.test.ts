@@ -82,4 +82,40 @@ describe('location', () => {
 
     expect(toAsset(row).location?.altitude).toBeNull()
   })
+
+  /**
+   * A row stored before the ingest path applied the bound still has to stop being served
+   * as a location: every port now decodes such a coordinate away, so what the row holds
+   * is a location no client will ever show and no user is told to correct.
+   */
+  test('does not serve a latitude outside its range as a location', async () => {
+    const row = await addAsset({ latitude: 200, longitude: 12.5 })
+
+    expect(row.latitude).toBe(200)
+    expect(toAsset(row).location).toBeNull()
+  })
+
+  // The bounds differ per coordinate, so a guard that checked both against 90 would pass
+  // the case above and still let this one through.
+  test('does not serve a longitude outside its range as a location', async () => {
+    const row = await addAsset({ latitude: 38.7223, longitude: -200.5 })
+
+    expect(toAsset(row).location).toBeNull()
+  })
+
+  // Without this, dropping every location the serializer is unsure of would pass the two
+  // cases above.
+  test('keeps a location sitting exactly on both bounds', async () => {
+    const row = await addAsset({ latitude: -90, longitude: 180 })
+
+    expect(toAsset(row).location).toMatchObject({ latitude: -90, longitude: 180 })
+  })
+
+  // Altitude has no bound of its own: a photograph taken from an aeroplane is still a
+  // photograph of somewhere.
+  test('keeps an altitude that would be out of range for a coordinate', async () => {
+    const row = await addAsset({ latitude: 38.7223, longitude: -9.1393, altitude: 11_000 })
+
+    expect(toAsset(row).location?.altitude).toBe(11_000)
+  })
 })
