@@ -140,6 +140,15 @@ async function addFace(assetId: string, personId: string, faceOwnerId = ownerId,
   return row!.id
 }
 
+/** Races work against a deadline so a regression fails the test rather than wedging it. */
+function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | 'timed out'> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<'timed out'>((resolve) => {
+    timer = setTimeout(() => resolve('timed out'), ms)
+  })
+  return Promise.race([work, deadline]).finally(() => clearTimeout(timer))
+}
+
 async function seedOwner(): Promise<string> {
   const [row] = await db
     .insert(users)
@@ -467,6 +476,77 @@ describe('recounting under concurrency', () => {
 
     expect(finished).toBe(true)
   })
+})
+
+/**
+ * Every face for one owner used to be filed under a single `faces:<owner>` advisory
+ * lock, so a library with one owner — the ordinary case — filed strictly one face at a
+ * time across every job worker. With `lock_timeout` set the waiters are not queued but
+ * cancelled, and a live import logged several thousand `canceling statement due to lock
+ * timeout` from this one lock.
+ *
+ * What the lock has to keep is that two scans cannot split one person in two, and that
+ * housekeeping cannot delete a person out from under a face being filed onto them.
+ * Neither needs the owner: a face whose person is already known needs only that person.
+ *
+ * So the holder below is exactly what a filing in progress now holds — the owner's key
+ * in *shared* mode, and its own person's key exclusively — and the test asks the two
+ * questions that separate a per-person lock from a per-owner one: another person's face
+ * goes in regardless, and the same person's face waits.
+ */
+describe.skipIf(!canRun)('filing faces under concurrency', () => {
+  test('a face waits for its own person, not for everyone the owner has', async () => {
+    const portraitA = await addPhoto('person-a.png')
+    const portraitB = await addPhoto('person-b.png')
+    await service.processAsset(portraitA.id)
+    await service.processAsset(portraitB.id)
+
+    const [faceA] = await service.facesForAsset(ownerId, portraitA.id)
+    const personA = faceA!.personId!
+
+    const againA = await addPhoto('person-a.png', (i) => i.modulate({ brightness: 1.2 }))
+    const againB = await addPhoto('person-b.png', (i) => i.modulate({ brightness: 1.2 }))
+
+    let release!: () => void
+    const held = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let locked!: () => void
+    const isLocked = new Promise<void>((resolve) => {
+      locked = resolve
+    })
+
+    const holder = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock_shared(hashtext(${`faces:${ownerId}`}))`)
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`faces:person:${personA}`}))`)
+      locked()
+      await held
+    })
+    await isLocked
+
+    let filedA = false
+    const scanA = service.processAsset(againA.id).then(() => {
+      filedA = true
+    })
+
+    try {
+      // Started second and still first: unfixed, this waits on the owner's lock behind
+      // a person it has nothing to do with.
+      const scanB = await withDeadline(service.processAsset(againB.id), 20_000)
+      expect(scanB).toBe(1)
+      // And the lock that remains is a real one: A's face is still waiting for A.
+      expect(filedA).toBe(false)
+    } finally {
+      release()
+      await holder
+      await scanA
+    }
+
+    expect(filedA).toBe(true)
+    const found = await service.listPeople(ownerId)
+    expect(found).toHaveLength(2)
+    expect(found.map((p) => p.faceCount)).toEqual([2, 2])
+  }, 60_000)
 })
 
 /**
