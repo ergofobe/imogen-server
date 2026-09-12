@@ -130,7 +130,7 @@ async function streamRangeInto(
   start: number,
   end: number,
 ): Promise<void> {
-  const buffer = Buffer.alloc(READ_CHUNK_BYTES)
+  const buffer = Buffer.alloc(Math.min(READ_CHUNK_BYTES, end - start))
   let position = start
   while (position < end) {
     const toRead = Math.min(READ_CHUNK_BYTES, end - position)
@@ -139,6 +139,22 @@ async function streamRangeInto(
     hash.update(buffer.subarray(0, bytesRead))
     position += bytesRead
   }
+}
+
+/** Fills `length` bytes of `buf` from `position`; false at end of file. A short read is legal. */
+async function readExact(
+  handle: FileHandle,
+  buf: Buffer,
+  length: number,
+  position: number,
+): Promise<boolean> {
+  let filled = 0
+  while (filled < length) {
+    const { bytesRead } = await handle.read(buf, filled, length - filled, position + filled)
+    if (bytesRead === 0) return false
+    filled += bytesRead
+  }
+  return true
 }
 
 type Child = { type: string; start: number; end: number }
@@ -333,8 +349,7 @@ async function hashHeifItems(
   const metaLength = meta.payloadEnd - meta.payloadStart
   if (metaLength < 4 || metaLength > MAX_META_BYTES) return null
   const buf = Buffer.alloc(metaLength)
-  const { bytesRead } = await handle.read(buf, 0, metaLength, meta.payloadStart)
-  if (bytesRead < metaLength) return null
+  if (!(await readExact(handle, buf, metaLength, meta.payloadStart))) return null
 
   // `meta` is a FullBox, so its children start after the version and flags.
   const children = childBoxes(buf, 4, metaLength)
@@ -389,15 +404,14 @@ async function readBrands(handle: FileHandle, ftyp: BoxHeader): Promise<string[]
   const length = Math.min(ftyp.payloadEnd - ftyp.payloadStart, MAX_FTYP_BYTES)
   if (length < 4) return []
   const buf = Buffer.alloc(length)
-  const { bytesRead } = await handle.read(buf, 0, length, ftyp.payloadStart)
-  if (bytesRead < 4) return []
+  if (!(await readExact(handle, buf, length, ftyp.payloadStart))) return []
 
   const brands = [buf.toString('ascii', 0, 4)]
-  for (let at = 8; at + 4 <= bytesRead; at += 4) brands.push(buf.toString('ascii', at, at + 4))
+  for (let at = 8; at + 4 <= length; at += 4) brands.push(buf.toString('ascii', at, at + 4))
   return brands
 }
 
-type Layout = { brands: string[]; meta: BoxHeader | null; mdats: BoxHeader[] }
+type Layout = { brands: string[]; meta: BoxHeader | null; mdats: BoxHeader[]; hasTracks: boolean }
 
 /** Walks the top-level boxes once, recording only what the two hashing rules need. */
 async function readLayout(handle: FileHandle, fileSize: number): Promise<Layout | null> {
@@ -405,22 +419,25 @@ async function readLayout(handle: FileHandle, fileSize: number): Promise<Layout 
   const mdats: BoxHeader[] = []
   let brands: string[] = []
   let meta: BoxHeader | null = null
+  let hasTracks = false
   let offset = 0
   let boxCount = 0
 
   while (offset < fileSize) {
     if (boxCount++ >= MAX_BOXES) return null
-    const { bytesRead } = await handle.read(headerBuf, 0, Math.min(16, fileSize - offset), offset)
-    if (bytesRead < 8) return null
-    const box = readBoxHeader(headerBuf.subarray(0, bytesRead), offset, fileSize)
+    const want = Math.min(16, fileSize - offset)
+    if (want < 8) return null
+    if (!(await readExact(handle, headerBuf, want, offset))) return null
+    const box = readBoxHeader(headerBuf.subarray(0, want), offset, fileSize)
     if (box === null) return null
 
     if (box.type === 'mdat') mdats.push(box)
+    if (box.type === 'moov') hasTracks = true
     if (box.type === 'meta' && meta === null) meta = box
     if (box.type === 'ftyp' && brands.length === 0) brands = await readBrands(handle, box)
     offset = box.payloadEnd
   }
-  return { brands, meta, mdats }
+  return { brands, meta, mdats, hasTracks }
 }
 
 /**
@@ -433,9 +450,18 @@ async function hashIsoBmff(path: string, fileSize: number): Promise<string | nul
     const layout = await readLayout(handle, fileSize)
     if (layout === null) return null
 
-    if (layout.meta !== null && layout.brands.some((brand) => HEIF_BRANDS.has(brand))) {
-      const items = await hashHeifItems(handle, fileSize, layout.meta)
-      if (items !== null) return items
+    // `msf1` and `avis` also brand image *sequences*, whose frames are tracks: those carry a
+    // `meta` with a cover item, and hashing it alone would call two animations the same file.
+    if (
+      layout.meta !== null &&
+      !layout.hasTracks &&
+      layout.brands.some((brand) => HEIF_BRANDS.has(brand))
+    ) {
+      // A HEIF's picture is its items, and there is no second rule to fall back on: two rules
+      // for one file would mean one photograph hashing two ways depending on what parsed.
+      // Awaited, not returned bare: the `finally` below would otherwise close the handle
+      // out from under the walk.
+      return await hashHeifItems(handle, fileSize, layout.meta)
     }
 
     if (layout.mdats.length === 0) return null

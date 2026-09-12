@@ -277,6 +277,8 @@ type HeifSpec = {
   aux?: Buffer
   brands?: string[]
   omitItemIndex?: boolean
+  /** A `moov`, which makes the file an image sequence rather than a still. */
+  withTracks?: boolean
 }
 
 const PRIMARY_ID = 1
@@ -320,8 +322,12 @@ function heif(spec: HeifSpec): Buffer {
       ? Buffer.alloc(0)
       : Buffer.concat([pitmBox(PRIMARY_ID), irefBox(refs), ilocBox(locations)])
 
+    const tracks = spec.withTracks ? moovBox(Buffer.from('tracks')) : Buffer.alloc(0)
     return {
-      meta: fullBox('meta', 0, Buffer.concat([index, box('idat', GRID_DESCRIPTOR)])),
+      meta: Buffer.concat([
+        fullBox('meta', 0, Buffer.concat([index, box('idat', GRID_DESCRIPTOR)])),
+        tracks,
+      ]),
       mdat: box('mdat', Buffer.concat(payloads)),
     }
   }
@@ -369,13 +375,20 @@ describe('contentHash HEIF', () => {
     }
   })
 
-  test('falls back to the mdat rule when the meta box carries no item index', async () => {
+  test('returns null when a HEIF brand carries no item index to walk', async () => {
     const xmp = Buffer.from('<x:xmpmeta/>')
-    const a = heif({ tiles, xmp, omitItemIndex: true })
+    expect(await hashOf(heif({ tiles, xmp, omitItemIndex: true }))).toBeNull()
+  })
+
+  test('an image sequence keeps the mdat rule despite its cover item', async () => {
+    const xmp = Buffer.from('<x:xmpmeta/>')
+    const brands = ['msf1', 'msf1', 'avis']
+    const a = heif({ tiles, xmp, brands, withTracks: true })
     const b = heif({
-      tiles,
-      xmp: Buffer.from('<x:xmpmeta>longer</x:xmpmeta>'),
-      omitItemIndex: true,
+      tiles: [...tiles.slice(0, 3), randomBytes(400)],
+      xmp,
+      brands,
+      withTracks: true,
     })
     expect(await hashOf(a)).not.toBeNull()
     expect(await hashOf(b)).not.toBe(await hashOf(a))
