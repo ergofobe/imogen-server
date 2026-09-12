@@ -277,6 +277,8 @@ type HeifSpec = {
   aux?: Buffer
   brands?: string[]
   omitItemIndex?: boolean
+  /** A second top-level `mdat` no item claims, the shape a motion photo's video takes. */
+  trailer?: Buffer
   /** A `moov`, which makes the file an image sequence rather than a still. */
   withTracks?: boolean
   /**
@@ -349,7 +351,8 @@ function heif(spec: HeifSpec): Buffer {
 
   const measured = build(0)
   const final = build(ftyp.length + measured.meta.length + 8)
-  return Buffer.concat([ftyp, final.meta, final.mdat])
+  const trailer = spec.trailer ? box('mdat', spec.trailer) : Buffer.alloc(0)
+  return Buffer.concat([ftyp, final.meta, final.mdat, trailer])
 }
 
 describe('contentHash HEIF', () => {
@@ -368,6 +371,21 @@ describe('contentHash HEIF', () => {
     const xmp = Buffer.from('<x:xmpmeta/>')
     const other = [...tiles.slice(0, 3), randomBytes(256)]
     expect(await hashOf(heif({ tiles: other, xmp }))).not.toBe(await hashOf(heif({ tiles, xmp })))
+  })
+
+  test('a copy missing a trailer no item claims does not collapse into the richer file', async () => {
+    const xmp = Buffer.from('<x:xmpmeta/>')
+    const withVideo = heif({ tiles, xmp, trailer: randomBytes(512) })
+    expect(await hashOf(withVideo)).not.toBe(await hashOf(heif({ tiles, xmp })))
+  })
+
+  test('a trailer survives a metadata rewrite that resizes the XMP item', async () => {
+    const trailer = randomBytes(512)
+    const before = heif({ tiles, xmp: Buffer.from('<x/>'), trailer })
+    const after = heif({ tiles, xmp: Buffer.from('<x>rewritten, and longer</x>'), trailer })
+    const hash = await hashOf(before)
+    expect(hash).not.toBeNull()
+    expect(await hashOf(after)).toBe(hash)
   })
 
   test('a copy missing its auxiliary image does not collapse into the richer file', async () => {
@@ -448,7 +466,8 @@ test.skipIf(!realHeicAvailable)(
 
     const original = join(workDir, 'real.heic')
     await Bun.$`sips -s format heic ${png} --out ${original}`.quiet().nothrow()
-    if (!(await Bun.file(original).exists())) return
+    // `sips` was found on this machine, so producing nothing is a failure, not a degradation.
+    expect(await Bun.file(original).exists()).toBe(true)
 
     const rewritten = join(workDir, 'real-rewritten.heic')
     await Bun.write(rewritten, Bun.file(original))

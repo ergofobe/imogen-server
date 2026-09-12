@@ -352,11 +352,48 @@ function collectItemIds(primary: number, refs: ItemReferences): number[] | null 
   return walkDerived(auxiliary, derived, ordered, seen) ? ordered : null
 }
 
+type Range = { start: number; end: number }
+
+/**
+ * The parts of the top-level `mdat` boxes that no item claims at all.
+ *
+ * Exif and XMP are items, so their bytes are claimed and stay out of the hash however they are
+ * rewritten. A motion photo's video is not an item: it rides in `mdat` beside the tiles with
+ * nothing pointing at it, and hashing the item extents alone would make a copy stripped of it
+ * hash the same — the richer file would then be discarded as a duplicate on ingest. This is
+ * the JPEG trailer-after-EOI rule in HEIF's shape.
+ */
+function unclaimedRanges(mdats: BoxHeader[], claimed: Extent[]): Range[] {
+  const merged: Range[] = []
+  const spans = claimed
+    .map((extent) => ({ start: extent.start, end: extent.start + extent.length }))
+    .sort((a, b) => a.start - b.start)
+  for (const span of spans) {
+    const last = merged[merged.length - 1]
+    if (last !== undefined && span.start <= last.end) last.end = Math.max(last.end, span.end)
+    else merged.push({ ...span })
+  }
+
+  const gaps: Range[] = []
+  for (const mdat of mdats) {
+    let cursor = mdat.payloadStart
+    for (const span of merged) {
+      if (span.start >= mdat.payloadEnd) break
+      if (span.end <= cursor) continue
+      if (span.start > cursor) gaps.push({ start: cursor, end: span.start })
+      cursor = span.end
+    }
+    if (cursor < mdat.payloadEnd) gaps.push({ start: cursor, end: mdat.payloadEnd })
+  }
+  return gaps
+}
+
 /** Hashes the image items' extents, or null if the `meta` box does not yield a clean walk. */
 async function hashHeifItems(
   handle: FileHandle,
   fileSize: number,
   meta: BoxHeader,
+  mdats: BoxHeader[],
 ): Promise<string | null> {
   const metaLength = meta.payloadEnd - meta.payloadStart
   if (metaLength < 4 || metaLength > MAX_META_BYTES) return null
@@ -408,6 +445,14 @@ async function hashHeifItems(
       hash.update(buf.subarray(from, from + extent.length))
     }
   }
+
+  const claimed = [...locations.values()]
+    .filter((location) => location.construction === 0)
+    .flatMap((location) => location.extents)
+  for (const gap of unclaimedRanges(mdats, claimed)) {
+    await streamRangeInto(handle, hash, gap.start, gap.end)
+  }
+
   return hash.digest('hex')
 }
 
@@ -473,7 +518,7 @@ async function hashIsoBmff(path: string, fileSize: number): Promise<string | nul
       // for one file would mean one photograph hashing two ways depending on what parsed.
       // Awaited, not returned bare: the `finally` below would otherwise close the handle
       // out from under the walk.
-      return await hashHeifItems(handle, fileSize, layout.meta)
+      return await hashHeifItems(handle, fileSize, layout.meta, layout.mdats)
     }
 
     if (layout.mdats.length === 0) return null
