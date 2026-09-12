@@ -1,6 +1,6 @@
 import { rm, stat } from 'node:fs/promises'
 import type { AssetUploadMetadata, AssetUploadResult } from '@imogen/shared'
-import { eq, sql } from 'drizzle-orm'
+import { and, eq, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { assetFiles, assets, users } from '../db/schema.ts'
 import { conflict, quotaExceeded, unsupportedMediaType } from '../lib/errors.ts'
@@ -93,7 +93,8 @@ export class IngestService {
     if (claim.duplicate) {
       // Already have this photograph. Drop the copy rather than storing it twice.
       await rm(input.tempPath, { force: true })
-      return { asset: toAsset(claim.row), duplicate: true, restored: claim.restored }
+      const row = await this.retryIfFailed(claim.row)
+      return { asset: toAsset(row), duplicate: true, restored: claim.restored }
     }
 
     const assetId = claim.id
@@ -131,9 +132,52 @@ export class IngestService {
     return { asset: await this.hydrate(assetId), duplicate: false, restored: false }
   }
 
+  /**
+   * Queues another attempt at a photograph the pipeline rejected, and answers with the
+   * row as it now stands.
+   *
+   * Sending the file again is the owner asking for the derivatives it never got. The
+   * bytes in the library are already the bytes just sent, so there is nothing to store,
+   * and before this the duplicate answer stopped there: the row kept its `failed`
+   * status and its checksum, every later upload matched it, and the only way out was to
+   * wait for the retention sweep to destroy it (#68).
+   *
+   * The update is guarded on the status that was read, so two uploads racing to retry
+   * the same photograph queue one job between them.
+   */
+  async retryIfFailed(row: AssetRow): Promise<AssetRow> {
+    if (row.status !== 'failed') return row
+
+    const [pending] = await this.db
+      .update(assets)
+      .set({ status: 'pending', processingError: null, updatedAt: new Date() })
+      .where(and(eq(assets.id, row.id), eq(assets.status, 'failed')))
+      .returning()
+    if (!pending) return (await this.rowOf(row.id)) ?? row
+
+    try {
+      await this.enqueue(INGEST_JOB, { assetId: row.id })
+    } catch (error) {
+      // Put the failure back if the job never reached the queue. `pending` with nothing
+      // queued is a photograph no retry can reach again -- this one refuses it, and the
+      // error the owner was shown is gone with it -- which is worse than the `failed` it
+      // replaced.
+      await this.db
+        .update(assets)
+        .set({
+          status: 'failed',
+          processingError: row.processingError,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(assets.id, row.id), eq(assets.status, 'pending')))
+      throw error
+    }
+    return pending
+  }
+
   /** Generates derivatives and fills in metadata. Runs in a worker, never on a request. */
   async process(assetId: string): Promise<void> {
-    const [asset] = await this.db.select().from(assets).where(eq(assets.id, assetId)).limit(1)
+    const asset = await this.rowOf(assetId)
     if (!asset) return
 
     await this.db.update(assets).set({ status: 'processing' }).where(eq(assets.id, assetId))
@@ -280,9 +324,14 @@ export class IngestService {
   }
 
   private async hydrate(assetId: string) {
-    const [row] = await this.db.select().from(assets).where(eq(assets.id, assetId)).limit(1)
+    const row = await this.rowOf(assetId)
     if (!row) throw conflict('Asset disappeared during upload')
     return toAsset(row)
+  }
+
+  private async rowOf(assetId: string): Promise<AssetRow | undefined> {
+    const [row] = await this.db.select().from(assets).where(eq(assets.id, assetId)).limit(1)
+    return row
   }
 }
 

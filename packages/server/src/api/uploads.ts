@@ -56,13 +56,17 @@ export function createUploadRoutes() {
       const existing = await claimExistingAsset(services.db, principal.user.id, body)
       if (existing) {
         if (existing.restored) await services.faces.refreshFor(principal.user.id)
+        // This path tells the client not to send the bytes, so a photograph the pipeline
+        // rejected has to be queued again from here too; otherwise the uploads too big to
+        // repeat -- the videos -- are the ones with no way to ask again (#68).
+        const row = await services.ingest.retryIfFailed(existing.row)
         return c.json(
           {
             id: crypto.randomUUID(),
             offset: body.sizeBytes,
             sizeBytes: body.sizeBytes,
             expiresAt: new Date().toISOString(),
-            existing: { asset: toAsset(existing.row), duplicate: true },
+            existing: { asset: toAsset(row), duplicate: true },
           },
           201,
         )
