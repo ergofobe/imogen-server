@@ -10,6 +10,11 @@ ALTER TABLE "assets" ADD COLUMN "content_hash_scheme" integer;--> statement-brea
 -- library upgrading from before the column needs -- claiming those had been hashed would
 -- mean they never are.
 --
+-- This rewrites every hashed row and holds their locks until it commits, so a large
+-- library waits on it before the server comes up. It is still the cheap end of the
+-- choice: the alternative is the backfill reading every original off disk to learn what
+-- this statement already knows.
+--
 UPDATE "assets" SET "content_hash_scheme" = 1 WHERE "content_hash" IS NOT NULL;--> statement-breakpoint
 --
 -- The walk's bookkeeping stops being a boolean. `{"done": true}` meant "this library is

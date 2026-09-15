@@ -249,7 +249,7 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
       const hashed = await rowVersion(asset.id)
 
       const [recorded] = await db.select().from(settings).where(eq(settings.key, SCHEME_KEY))
-      expect(recorded!.value).toEqual({ scheme: CONTENT_HASH_SCHEME })
+      expect(recorded!.value).toEqual({ scheme: CONTENT_HASH_SCHEME, seen: CONTENT_HASH_SCHEME })
 
       // The library is at the current scheme, so boot schedules nothing...
       expect(await scheduleContentHashBackfill(queue, db)).toBe(false)
@@ -261,22 +261,32 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
       expect(await rowVersion(asset.id)).toBe(hashed)
     })
 
-    test('a pass on a build older than the library does not lower the record', async () => {
+    test('a pass on a build older than the library does not lower what it has seen', async () => {
       const queue = setup()
-      await db
-        .insert(settings)
-        .values({ key: SCHEME_KEY, value: { scheme: CONTENT_HASH_SCHEME + 1 } })
+      const ahead = { scheme: CONTENT_HASH_SCHEME + 1, seen: CONTENT_HASH_SCHEME + 1 }
+      await db.insert(settings).values({ key: SCHEME_KEY, value: ahead })
 
       // A rollback leaves a job from the newer build in the queue. It finds nothing to
       // hash -- every row is stamped above this binary's rule -- and must not answer by
-      // writing its own scheme over the library's, which would silence the warning that
-      // dedup has stopped working.
+      // calling the library its own.
       await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, {})
       await queue.drain()
 
-      const [recorded] = await db.select().from(settings).where(eq(settings.key, SCHEME_KEY))
-      expect(recorded!.value).toEqual({ scheme: CONTENT_HASH_SCHEME + 1 })
+      const [afterJob] = await db.select().from(settings).where(eq(settings.key, SCHEME_KEY))
+      expect(afterJob!.value).toEqual(ahead)
+
+      // Booting on this build clamps what the walk covers down to what it can hash,
+      // because its own uploads are stamped with its own rule from here on. That is what
+      // makes the upgrade back walk the rows written in between rather than read its own
+      // scheme in the record and do nothing. What the library has *seen* is not lowered,
+      // so the warning keeps naming the rows this build cannot recognise.
       expect(await scheduleContentHashBackfill(queue, db)).toBe(false)
+
+      const [afterBoot] = await db.select().from(settings).where(eq(settings.key, SCHEME_KEY))
+      expect(afterBoot!.value).toEqual({
+        scheme: CONTENT_HASH_SCHEME,
+        seen: CONTENT_HASH_SCHEME + 1,
+      })
     })
 
     test('a recorded value the walk cannot read counts as no walk at all', async () => {
@@ -310,7 +320,7 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
       // have the whole library re-read at every boot for ever; the row waits for the
       // next rule change instead.
       const [recorded] = await db.select().from(settings).where(eq(settings.key, SCHEME_KEY))
-      expect(recorded!.value).toEqual({ scheme: CONTENT_HASH_SCHEME })
+      expect(recorded!.value).toEqual({ scheme: CONTENT_HASH_SCHEME, seen: CONTENT_HASH_SCHEME })
       expect(await scheduleContentHashBackfill(queue, db)).toBe(false)
     })
   })

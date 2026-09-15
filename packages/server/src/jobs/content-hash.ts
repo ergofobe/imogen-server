@@ -68,10 +68,12 @@ export function registerContentHashJobs(queue: JobQueue, deps: ContentHashJobDep
       return
     }
 
-    // Recorded only now, at the end of the walk. A server that restarts partway through
-    // starts the pass again rather than calling a library hashed that is not: a second
-    // look at an asset costs one hash read and changes nothing, while a skipped one keeps
-    // its stale content_hash until the scheme changes again.
+    // Recorded only now, at the end of the walk, so a server that restarts partway
+    // through starts the pass again rather than calling a library hashed that is not: a
+    // second look at an asset costs one hash read and changes nothing, while a skipped
+    // one keeps its stale content_hash until the scheme changes again. Two chains racing
+    // -- boot enqueues a fresh one beside a pending `{after}` job -- can still record
+    // while the other is mid-library, which is the scheduler's missing dedup (#92).
     await markSchemeWalked(deps.db, CONTENT_HASH_SCHEME)
   })
 }
@@ -103,33 +105,69 @@ function pendingContentHash(db: Database, limit: number, after: string | null) {
     .limit(limit)
 }
 
-/** The scheme the last completed walk covered, or 0 if none has finished. */
-async function walkedScheme(db: Database): Promise<number> {
+/**
+ * What the library's walk record says.
+ *
+ * `scheme` is what the last completed walk covered. `seen` is the highest rule any
+ * server has run against this library, which is the only way to notice a rollback: the
+ * rows themselves cannot say, since a build can only read schemes it knows about.
+ */
+type WalkRecord = { scheme: number; seen: number }
+
+async function readWalkRecord(db: Database): Promise<WalkRecord> {
   const [row] = await db.select().from(settings).where(eq(settings.key, SCHEME_KEY)).limit(1)
   // `value` is `json not null`, which still admits the JSON value null, so this reads the
   // row defensively rather than through it: a throw here happens at boot and takes the
   // server with it. Anything unreadable counts as no walk at all -- one needless pass is
   // the cheap mistake, and leaving stale hashes in place is the expensive one.
   const value: unknown = row?.value
-  if (typeof value !== 'object' || value === null) return 0
-  const scheme = (value as Record<string, unknown>).scheme
-  return typeof scheme === 'number' ? scheme : 0
+  if (typeof value !== 'object' || value === null) return { scheme: 0, seen: 0 }
+
+  const fields = value as Record<string, unknown>
+  const scheme = typeof fields.scheme === 'number' ? fields.scheme : 0
+  // The migration writes `{scheme}` alone, and so did the first build to record one.
+  const seen = typeof fields.seen === 'number' ? fields.seen : scheme
+  return { scheme, seen }
+}
+
+async function writeWalkRecord(db: Database, record: WalkRecord): Promise<void> {
+  await db
+    .insert(settings)
+    .values({ key: SCHEME_KEY, value: record })
+    .onConflictDoUpdate({
+      target: settings.key,
+      set: { value: record, updatedAt: new Date() },
+    })
 }
 
 /** Records `scheme` as walked. Never lowers what is already there. */
 async function markSchemeWalked(db: Database, scheme: number): Promise<void> {
-  // A build older than the library would otherwise write its own scheme over a higher
-  // one -- a stale job left in the queue across a rollback finds no rows to hash and
-  // "completes" -- and silence the warning below that says dedup has stopped working.
-  if ((await walkedScheme(db)) >= scheme) return
+  // A stale job left in the queue across a rollback finds no rows to hash and
+  // "completes"; writing its own, older scheme over the library's would then look like
+  // an ordinary walk rather than the rollback it is.
+  const record = await readWalkRecord(db)
+  if (record.scheme >= scheme) return
 
-  await db
-    .insert(settings)
-    .values({ key: SCHEME_KEY, value: { scheme } })
-    .onConflictDoUpdate({
-      target: settings.key,
-      set: { value: { scheme }, updatedAt: new Date() },
-    })
+  await writeWalkRecord(db, { scheme, seen: Math.max(record.seen, scheme) })
+}
+
+/**
+ * Records that a server hashing at `scheme` is about to take uploads, and answers with
+ * the library's record as it now stands.
+ *
+ * The record is clamped down to `scheme` here, which is what makes a rollback survivable.
+ * Every upload this build accepts is stamped with its own rule, so a library served by it
+ * cannot be further along than it is, whatever a newer binary recorded before the
+ * rollback. Leave the record high and the upgrade back reads its own scheme in it, walks
+ * nothing, and every photograph uploaded in between keeps a superseded hash for good.
+ */
+async function noteServing(db: Database, scheme: number): Promise<WalkRecord> {
+  const record = await readWalkRecord(db)
+  const served = { scheme: Math.min(record.scheme, scheme), seen: Math.max(record.seen, scheme) }
+  if (served.scheme !== record.scheme || served.seen !== record.seen) {
+    await writeWalkRecord(db, served)
+  }
+  return served
 }
 
 /**
@@ -139,18 +177,17 @@ async function markSchemeWalked(db: Database, scheme: number): Promise<void> {
  * left to do once a pass has reached the end of a library hashed under an older one.
  */
 export async function scheduleContentHashBackfill(queue: JobQueue, db: Database): Promise<boolean> {
-  const walked = await walkedScheme(db)
-  if (walked > CONTENT_HASH_SCHEME) {
-    // A rollback to a binary older than the library. Every row is stamped with a rule
-    // this build does not have, so none is selectable and new uploads hash under the
-    // older rule and match nothing stored. Nothing here can mend that -- say so, rather
-    // than let dedup quietly stop working.
+  const record = await noteServing(db, CONTENT_HASH_SCHEME)
+  if (record.seen > CONTENT_HASH_SCHEME) {
+    // A rollback to a binary older than the library. Rows stamped with a rule this build
+    // does not have are not selectable by it, so they stay unmatched by anything it
+    // hashes. Nothing here can mend that -- say so, rather than let dedup quietly stop
+    // working until someone upgrades again.
     console.warn(
-      `content hash: library is at scheme ${walked}, this server hashes at ${CONTENT_HASH_SCHEME}; duplicate detection is off until it is upgraded again`,
+      `content hash: library has been hashed at scheme ${record.seen}, this server hashes at ${CONTENT_HASH_SCHEME}; photographs stored under the newer rule will not be recognised until it is upgraded again`,
     )
-    return false
   }
-  if (walked === CONTENT_HASH_SCHEME) return false
+  if (record.scheme >= CONTENT_HASH_SCHEME) return false
 
   await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, {})
   return true
