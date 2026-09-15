@@ -16,7 +16,7 @@ import { countUnscanned } from '../jobs/faces.ts'
 import { notFound } from '../lib/errors.ts'
 import { openOriginal } from '../media/decode.ts'
 import { toAsset } from '../media/serialize.ts'
-import { ERROR_RESPONSES, NO_CONTENT, ok, security } from './openapi.ts'
+import { ERROR_RESPONSES, NO_CONTENT, ok, security, WireBoolean } from './openapi.ts'
 import { vaultIsOpen } from './vault.ts'
 
 const IdParam = z.object({ id: z.uuid() })
@@ -84,7 +84,14 @@ export function createFaceRoutes() {
       summary: 'Everyone the library has grouped',
       security: security(),
       middleware: [requireScope('library:read')] as const,
-      request: { query: z.object({ includeHidden: z.coerce.boolean().default(false) }) },
+      request: {
+        query: z.object({
+          // The `.openapi()` on WireBoolean replaces the whole generated schema, taking
+          // the default with it, so the default is restated here — where it belongs
+          // anyway, since `covers` shares the schema and has no default of its own.
+          includeHidden: WireBoolean.default(false).openapi({ type: 'boolean', default: false }),
+        }),
+      },
       responses: {
         ...ok(z.object({ items: z.array(Person) }), 'People, most photographed first'),
         ...ERROR_RESPONSES,

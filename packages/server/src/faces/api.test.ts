@@ -1,9 +1,10 @@
 import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { sql } from 'drizzle-orm'
+import { eq, sql } from 'drizzle-orm'
 import sharp from 'sharp'
 import { createApp } from '../app.ts'
+import { people, users } from '../db/schema.ts'
 import { createServices } from '../services.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
 import { ModelStore } from './models.ts'
@@ -462,5 +463,121 @@ describe.skipIf(!canRun)('what an assistant can see', () => {
     const said = await textOf(await call(token, 'search_by_person', { name: 'Anna' }))
 
     expect(said).toContain('switched off')
+  })
+})
+
+/*
+ * imogen-server#100. `includeHidden` was declared `z.coerce.boolean()`, which reads a
+ * query parameter by JavaScript truthiness — where every string but the empty one is
+ * true. So the string `"false"` arrived as `true`, and since every SDK port defaults
+ * `includeHidden` to false and *sends* it, an ordinary `people.list()` carried
+ * `?includeHidden=false` and was answered with the hidden people. Somebody who hid a
+ * person had them shown to every client anyway, in the shipped v0.6.0.
+ *
+ * These seed the rows directly instead of going through the detector. Everything above
+ * is skipped without the 190 MB face fixtures — which CI does not have, so none of it
+ * runs there — and a privacy regression must not be able to hide behind a skip. What is
+ * under test is how the query string is read, not how a face is found.
+ */
+describe('includeHidden is read by its spelling', () => {
+  /** A library with one visible person and one hidden one, and no detector involved. */
+  async function libraryOfTwo() {
+    const cookie = await signUp()
+    // By email rather than "the only row": a case that signs up twice would otherwise
+    // seed these under whichever owner came back first, and fail somewhere unrelated.
+    const [owner] = await harness.db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.email, 'owner@example.com'))
+    await harness.db.insert(people).values([
+      { ownerId: owner!.id, name: 'Visible', hidden: false, faceCount: 2 },
+      { ownerId: owner!.id, name: 'Hidden', hidden: true, faceCount: 1 },
+    ])
+    return cookie
+  }
+
+  /** Who `GET /api/v1/people` names for a given query string, and the status it answered. */
+  async function listedBy(query: string, cookie: string) {
+    const response = await request(`/api/v1/people${query}`, { headers: { Cookie: cookie } })
+    const body = (await response.json()) as { items?: Array<{ name: string }> }
+    return { status: response.status, names: (body.items ?? []).map((p) => p.name) }
+  }
+
+  // The defect itself: this is the request every first-party client actually makes.
+  test('includeHidden=false does not return a hidden person', async () => {
+    const cookie = await libraryOfTwo()
+
+    expect(await listedBy('?includeHidden=false', cookie)).toEqual({
+      status: 200,
+      names: ['Visible'],
+    })
+  })
+
+  test('includeHidden=true returns them', async () => {
+    const cookie = await libraryOfTwo()
+
+    expect(await listedBy('?includeHidden=true', cookie)).toEqual({
+      status: 200,
+      names: ['Visible', 'Hidden'],
+    })
+  })
+
+  test('omitting it keeps them hidden', async () => {
+    const cookie = await libraryOfTwo()
+
+    expect(await listedBy('', cookie)).toEqual({ status: 200, names: ['Visible'] })
+  })
+
+  // The other spelling a hand-written client reaches for.
+  test('0 and 1 are read as false and true', async () => {
+    const cookie = await libraryOfTwo()
+
+    expect(await listedBy('?includeHidden=0', cookie)).toEqual({
+      status: 200,
+      names: ['Visible'],
+    })
+    expect(await listedBy('?includeHidden=1', cookie)).toEqual({
+      status: 200,
+      names: ['Visible', 'Hidden'],
+    })
+  })
+
+  /*
+   * Present but empty is how `?includeHidden=` arrives from a link built with no query at
+   * all. It carries no opinion, so it reads as no value rather than as true — the safe
+   * direction, and the one the SDK's own WireBoolean takes.
+   */
+  test('an empty value keeps them hidden', async () => {
+    const cookie = await libraryOfTwo()
+
+    expect(await listedBy('?includeHidden=', cookie)).toEqual({
+      status: 200,
+      names: ['Visible'],
+    })
+  })
+
+  /*
+   * Refused rather than guessed at. A rejected request is a bug report; a hidden person
+   * quietly listed is not, which is exactly how this shipped.
+   */
+  test.each(['yes', 'no', 'on', 'off', 'True', 'FALSE', '2', '-1', 'null'])(
+    'includeHidden=%s is refused',
+    async (spelling) => {
+      const cookie = await libraryOfTwo()
+
+      expect((await listedBy(`?includeHidden=${spelling}`, cookie)).status).toBe(400)
+    },
+  )
+
+  // A refusal is only a bug report if it says what was expected. Zod's own union message
+  // is "Invalid input", which names none of the four spellings that would have worked.
+  test('the refusal names the spellings it would have taken', async () => {
+    const cookie = await libraryOfTwo()
+
+    const response = await request('/api/v1/people?includeHidden=yes', {
+      headers: { Cookie: cookie },
+    })
+
+    expect(JSON.stringify(await response.json())).toContain('expected true, false, 1 or 0')
   })
 })

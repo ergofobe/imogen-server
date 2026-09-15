@@ -512,3 +512,43 @@ describe('moving photos back out of the vault', () => {
     expect(response.status).toBe(400)
   })
 })
+
+/*
+ * imogen-server#100, the second instance. `covers` was declared `z.coerce.boolean()`,
+ * which reads a query parameter by truthiness — so `?covers=false` asked for covers and
+ * got them. Benign here, unlike the hidden people the same defect leaked, but it is the
+ * same defect, and the pattern is what the issue is about.
+ */
+describe('covers is read by its spelling', () => {
+  /** The vault holds exactly one photograph, so one day bucket with one cover. */
+  const bucketsFor = async (query: string, cookie: string) => {
+    const response = await request(`/api/v1/vault/timeline${query}`, {
+      headers: { Cookie: cookie },
+    })
+    if (response.status !== 200) return { status: response.status, covers: [] as unknown[] }
+    const body = (await response.json()) as { buckets: Array<{ coverAssetId: string | null }> }
+    return { status: 200, covers: body.buckets.map((b) => b.coverAssetId) }
+  }
+
+  test('covers=false asks for no covers', async () => {
+    const { bothCookies, secretId } = await setup()
+
+    expect(await bucketsFor('?covers=true', bothCookies)).toEqual({
+      status: 200,
+      covers: [secretId],
+    })
+    expect(await bucketsFor('?covers=false', bothCookies)).toEqual({ status: 200, covers: [null] })
+  })
+
+  test('an empty value carries no opinion, the same as omitting it', async () => {
+    const { bothCookies } = await setup()
+
+    expect(await bucketsFor('?covers=', bothCookies)).toEqual(await bucketsFor('', bothCookies))
+  })
+
+  test('a spelling nobody agreed on is refused rather than guessed at', async () => {
+    const { bothCookies } = await setup()
+
+    expect((await bucketsFor('?covers=yes', bothCookies)).status).toBe(400)
+  })
+})
