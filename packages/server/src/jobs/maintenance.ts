@@ -37,8 +37,13 @@ export function registerMaintenanceJobs(queue: JobQueue, deps: MaintenanceDeps):
 
 /**
  * Permanently removes assets that have been in the trash past the retention window.
- * Files go first: a row without its bytes is a broken thumbnail, but bytes without a row
- * are invisible garbage that nothing will ever clean up.
+ *
+ * The row goes first, and its files only once the delete has actually claimed it. A
+ * restore can land at any point here, and whichever side of it the sweep is caught on,
+ * one of the two failures follows: bytes with no row, or a row with no bytes. `assetFiles`
+ * holds the `original` — the photograph itself, not a derivative — so a row with no bytes
+ * is the destruction of the only copy, while bytes with no row is disk nobody reclaims.
+ * Losing disk is recoverable and losing the photograph is not, so the delete leads.
  *
  * Returns how many assets it actually destroyed, which is not the size of the batch it
  * picked: a row restored while the batch is in progress is left where it is.
@@ -64,8 +69,9 @@ export async function sweepTrash(deps: MaintenanceDeps): Promise<number> {
   for (const asset of doomed) {
     // The batch above is a snapshot, and a restore can land while an earlier row is
     // still being swept — since #64 an upload of a trashed photograph restores it, so
-    // that happens without anybody clicking anything. Ask again before destroying the
-    // files, and guard the delete on the same condition so the two cannot disagree.
+    // that happens without anybody clicking anything. This asks again to skip the work
+    // for a row that has plainly come back; the guard on the delete below is the one
+    // that decides, because only it and the restore contend for the same row.
     const [stillDoomed] = await deps.db
       .select({ id: assets.id })
       .from(assets)
@@ -73,20 +79,15 @@ export async function sweepTrash(deps: MaintenanceDeps): Promise<number> {
       .limit(1)
     if (!stillDoomed) continue
 
+    // Read the paths before the delete, which cascades these rows away with the asset.
     const files = await deps.db.select().from(assetFiles).where(eq(assetFiles.assetId, asset.id))
-
-    for (const file of files) {
-      const store = file.variant === 'original' ? deps.library : deps.thumbnails
-      await store.remove(file.path).catch(() => {})
-    }
 
     const [deleted] = await deps.db
       .delete(assets)
       .where(isDoomed(asset.id))
       .returning({ id: assets.id })
-    // Restored in the window the file removal above opened. The bytes are already gone,
-    // which is the broken thumbnail the note prefers to invisible garbage, but the row
-    // stays: its caller was told the photograph is live.
+    // Restored between the re-check and here: the row stays, its caller was told the
+    // photograph is live, and nothing has been removed from disk yet to contradict that.
     if (!deleted) continue
 
     swept += 1
@@ -94,6 +95,14 @@ export async function sweepTrash(deps: MaintenanceDeps): Promise<number> {
       .update(users)
       .set({ usedBytes: sql`greatest(${users.usedBytes} - ${asset.sizeBytes}, 0)` })
       .where(eq(users.id, asset.ownerId))
+
+    // The row is gone, so nothing can reach these paths any more and no restore can
+    // resurrect them. A crash before this finishes strands the bytes, which is the
+    // failure the ordering is chosen to prefer.
+    for (const file of files) {
+      const store = file.variant === 'original' ? deps.library : deps.thumbnails
+      await store.remove(file.path).catch(() => {})
+    }
   }
 
   await removeEmptyTombstones(deps)

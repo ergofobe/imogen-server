@@ -86,6 +86,52 @@ async function restore(id: string) {
   await db.update(assets).set({ deletedAt: null }).where(eq(assets.id, id))
 }
 
+/**
+ * Wraps a drizzle query builder so `before` runs at the moment the chain is awaited,
+ * rather than when it is built: the statement has to be the next thing that happens.
+ */
+function runBefore<T extends object>(builder: T, before: () => Promise<void>): T {
+  return new Proxy(builder, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop) as unknown
+      if (typeof value !== 'function') return value
+      const method = value as (...args: unknown[]) => unknown
+      if (prop === 'then') {
+        return (onFulfilled?: unknown, onRejected?: unknown) =>
+          before()
+            .then(() => method.call(target) as Promise<unknown>)
+            .then(onFulfilled as never, onRejected as never)
+      }
+      return (...args: unknown[]) => {
+        const next = method.apply(target, args)
+        return next && typeof next === 'object' ? runBefore(next, before) : next
+      }
+    },
+  })
+}
+
+/**
+ * A database that restores `id` in the instant before the sweep's guarded delete runs —
+ * the one window the sweep cannot close, because the row is doomed when it is read and
+ * live by the time it dies. Nothing the sweep destroys before that point can be undone.
+ */
+function restoringBeforeDelete(id: string): Database {
+  let done = false
+  const before = async () => {
+    if (done) return
+    done = true
+    await restore(id)
+  }
+  return new Proxy(db, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop) as unknown
+      if (prop !== 'delete' || typeof value !== 'function') return value
+      const method = value as (...args: unknown[]) => object
+      return (...args: unknown[]) => runBefore(method.apply(target, args), before)
+    },
+  }) as Database
+}
+
 const assetById = async (id: string) => (await db.select().from(assets).where(eq(assets.id, id)))[0]
 const usedBytesOf = async (id: string) =>
   (await db.select().from(users).where(eq(users.id, id)))[0]!.usedBytes
@@ -145,24 +191,21 @@ describe('sweepTrash', () => {
   })
 
   // The narrower half of the same race: the re-check passed, then the restore landed.
-  // The files are already gone — files-first is deliberate — but the row must survive,
-  // because its caller was told the photograph is live.
-  test('keeps the row when the restore lands after the re-check', async () => {
+  // The row must survive, because its caller was told the photograph is live — and so
+  // must its original. The upload that restored it answered `duplicate: true` and threw
+  // away the bytes it was sent, so what is on disk here is the only copy in the world.
+  test('keeps the row and its original when the restore lands after the re-check', async () => {
     const owner = await makeUser(1000)
     const rescued = await makeTrashedAsset(owner.id, 31, 400)
     const deps = makeDeps()
     await deps.library.write(rescued.originalPath, 'bytes')
 
-    deps.library.onRemove = async () => {
-      deps.library.onRemove = null
-      await restore(rescued.id)
-    }
-
-    expect(await sweepTrash(deps)).toBe(0)
+    expect(await sweepTrash({ ...deps, db: restoringBeforeDelete(rescued.id) })).toBe(0)
 
     const survivor = await assetById(rescued.id)
     expect(survivor).toBeDefined()
     expect(survivor!.deletedAt).toBeNull()
+    expect(await exists(deps, rescued.originalPath)).toBe(true)
     expect(await usedBytesOf(owner.id)).toBe(1000)
   })
 })
