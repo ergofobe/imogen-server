@@ -1,6 +1,16 @@
 import { createHash, type Hash } from 'node:crypto'
 import { type FileHandle, open, stat } from 'node:fs/promises'
 
+/**
+ * The version of the rule below, stored beside every hash it produces.
+ *
+ * Bump it in the same commit as any change to which bytes are fed to the hash. Rows
+ * stored under a lower version are re-hashed by the backfill; without the bump the
+ * rule changes and every hash already in the library silently keeps the old answer,
+ * so the same photograph uploaded again no longer matches itself (#86).
+ */
+export const CONTENT_HASH_SCHEME = 1
+
 const MAX_JPEG_BYTES = 256 * 1024 * 1024
 const MDAT_CHUNK_BYTES = 1024 * 1024
 // A long fragmented recording is a few thousand moof/mdat pairs; this is generous headroom

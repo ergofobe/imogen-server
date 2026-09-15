@@ -3,7 +3,7 @@ import { eq, inArray, isNotNull, sql } from 'drizzle-orm'
 import sharp from 'sharp'
 import type { Database } from '../db/index.ts'
 import { assets, jobs, settings, users } from '../db/schema.ts'
-import { contentHash } from '../media/content-hash.ts'
+import { CONTENT_HASH_SCHEME, contentHash } from '../media/content-hash.ts'
 import { LocalStorage } from '../media/storage.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
 import {
@@ -41,6 +41,9 @@ async function makeJpeg(seed: string): Promise<Buffer> {
     .jpeg()
     .toBuffer()
 }
+
+/** Where the walk records the scheme it covered. */
+const SCHEME_KEY = 'assets.contentHashScheme'
 
 function setup() {
   const queue = new JobQueue(db, { concurrency: 1, idlePollMs: 5 })
@@ -101,10 +104,7 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
     const [unknownRow] = await db.select().from(assets).where(eq(assets.id, unknownAsset.id))
     expect(unknownRow!.contentHash).toBeNull()
 
-    const [done] = await db
-      .select()
-      .from(settings)
-      .where(eq(settings.key, 'assets.contentHashBackfillDone'))
+    const [done] = await db.select().from(settings).where(eq(settings.key, SCHEME_KEY))
     expect(done).toBeDefined()
   })
 
@@ -136,10 +136,7 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
     const failed = await db.select().from(jobs).where(eq(jobs.status, 'failed'))
     expect(failed).toEqual([])
 
-    const [done] = await db
-      .select()
-      .from(settings)
-      .where(eq(settings.key, 'assets.contentHashBackfillDone'))
+    const [done] = await db.select().from(settings).where(eq(settings.key, SCHEME_KEY))
     expect(done).toBeDefined()
   })
 
@@ -185,5 +182,102 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
     // More than one batch means more than one job ran to finish the walk.
     const runs = await db.select().from(jobs).where(eq(jobs.name, CONTENT_HASH_BACKFILL_JOB))
     expect(runs.length).toBeGreaterThan(1)
+  })
+
+  describe('rows stored under a superseded hashing rule', () => {
+    const STALE_SCHEME = CONTENT_HASH_SCHEME - 1
+
+    /**
+     * Postgres bumps `xmin` on any UPDATE, including one that writes the same values
+     * back. `updated_at` is set by hand in this codebase and the walk does not touch
+     * it, so only `xmin` can tell "left alone" from "rewritten identically".
+     */
+    async function rowVersion(id: string): Promise<string> {
+      const [row] = await db
+        .select({ xmin: sql<string>`xmin::text` })
+        .from(assets)
+        .where(eq(assets.id, id))
+      return row!.xmin
+    }
+
+    async function storedJpeg(seed: string): Promise<string> {
+      const path = `${crypto.randomUUID()}.jpg`
+      await storage.write(path, await makeJpeg(seed))
+      return path
+    }
+
+    test('re-hashes a row below the current scheme and leaves one at it untouched', async () => {
+      const queue = setup()
+
+      const stalePath = await storedJpeg('stale')
+      const stale = await insertAsset({
+        originalPath: stalePath,
+        contentHash: 'a'.repeat(64),
+        contentHashScheme: STALE_SCHEME,
+      })
+
+      const currentPath = await storedJpeg('current')
+      const current = await insertAsset({
+        originalPath: currentPath,
+        contentHash: 'b'.repeat(64),
+        contentHashScheme: CONTENT_HASH_SCHEME,
+      })
+      const untouched = await rowVersion(current.id)
+
+      expect(await scheduleContentHashBackfill(queue, db)).toBe(true)
+      await queue.drain()
+
+      const [staleRow] = await db.select().from(assets).where(eq(assets.id, stale.id))
+      expect(staleRow!.contentHash).toBe(await contentHash(storage.absolutePath(stalePath)))
+      expect(staleRow!.contentHashScheme).toBe(CONTENT_HASH_SCHEME)
+
+      const [currentRow] = await db.select().from(assets).where(eq(assets.id, current.id))
+      expect(currentRow!.contentHash).toBe('b'.repeat(64))
+      expect(await rowVersion(current.id)).toBe(untouched)
+    })
+
+    test('records the scheme it walked, and a second pass rewrites nothing', async () => {
+      const queue = setup()
+      const asset = await insertAsset({
+        originalPath: await storedJpeg('idempotent'),
+        contentHash: 'a'.repeat(64),
+        contentHashScheme: STALE_SCHEME,
+      })
+
+      expect(await scheduleContentHashBackfill(queue, db)).toBe(true)
+      await queue.drain()
+      const hashed = await rowVersion(asset.id)
+
+      const [recorded] = await db.select().from(settings).where(eq(settings.key, SCHEME_KEY))
+      expect(recorded!.value).toEqual({ scheme: CONTENT_HASH_SCHEME })
+
+      // The library is at the current scheme, so boot schedules nothing...
+      expect(await scheduleContentHashBackfill(queue, db)).toBe(false)
+
+      // ...and a pass that runs anyway -- a restart mid-walk leaves one queued -- finds
+      // no work rather than writing every row back unchanged.
+      await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, {})
+      await queue.drain()
+      expect(await rowVersion(asset.id)).toBe(hashed)
+    })
+
+    test('keeps the hash it has when the file cannot be read', async () => {
+      const queue = setup()
+      const asset = await insertAsset({
+        originalPath: `${crypto.randomUUID()}.jpg`,
+        contentHash: 'a'.repeat(64),
+        contentHashScheme: STALE_SCHEME,
+      })
+
+      expect(await scheduleContentHashBackfill(queue, db)).toBe(true)
+      await queue.drain()
+
+      // A stale hash still finds the twins it was computed against. Replacing it with
+      // null because the disk hiccuped would lose that and gain nothing, so the row
+      // keeps its old scheme and the next pass tries again.
+      const [row] = await db.select().from(assets).where(eq(assets.id, asset.id))
+      expect(row!.contentHash).toBe('a'.repeat(64))
+      expect(row!.contentHashScheme).toBe(STALE_SCHEME)
+    })
   })
 })

@@ -127,6 +127,13 @@ export const assets = pgTable(
      * photograph. Null when the container is one the hasher does not understand.
      */
     contentHash: text('content_hash'),
+    /**
+     * Which hashing rule produced `content_hash`, so a row stored under a superseded
+     * rule can be found and re-hashed rather than kept for ever (#86). Null exactly
+     * when `content_hash` is null: the two are written together and mean nothing
+     * apart. `CONTENT_HASH_SCHEME` in `media/content-hash.ts` is the current value.
+     */
+    contentHashScheme: integer('content_hash_scheme'),
     sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull(),
     /** Path relative to the library root, so the data directory can move. */
     originalPath: text('original_path').notNull(),

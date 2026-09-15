@@ -7,6 +7,7 @@ import { createApp } from '../app.ts'
 import { createDatabase } from '../db/index.ts'
 import { albumAssets, assets, users } from '../db/schema.ts'
 import { COVER_SAMPLE } from '../lib/batch.ts'
+import { CONTENT_HASH_SCHEME } from '../media/content-hash.ts'
 import { createServices } from '../services.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
 
@@ -456,6 +457,20 @@ describe('uploading', () => {
 
     const rows = await harness.db.select({ id: assets.id }).from(assets)
     expect(rows.length).toBe(1)
+  })
+
+  test('an upload records the hashing rule its content hash came from', async () => {
+    // Without this the backfill would read every freshly uploaded original back off disk
+    // looking for a rule it already knows, and the row would keep being re-hashed (#86).
+    const { cookie } = await signUp()
+    const first = (await (await upload(cookie, await makePhoto())).json()) as {
+      asset: { id: string }
+    }
+
+    const [row] = await harness.db.select().from(assets).where(eq(assets.id, first.asset.id))
+
+    expect(row!.contentHash).not.toBeNull()
+    expect(row!.contentHashScheme).toBe(CONTENT_HASH_SCHEME)
   })
 
   test('a metadata-only rewrite of a photo the owner already has is a duplicate', async () => {
