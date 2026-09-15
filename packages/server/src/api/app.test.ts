@@ -10,6 +10,7 @@ import { COVER_SAMPLE } from '../lib/batch.ts'
 import { CONTENT_HASH_SCHEME } from '../media/content-hash.ts'
 import { createServices } from '../services.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
+import { DocumentedAssetSelection } from './openapi.ts'
 
 const harness = await createTestDatabase()
 const config = createTestConfig({ publicUrl: 'http://localhost:3000' })
@@ -307,6 +308,27 @@ describe('health and docs', () => {
       expect(body(path)?.properties?.query?.properties?.trashed).toEqual({ type: 'boolean' })
     }
     expect(body('/api/v1/uploads')?.properties?.favorite).toEqual({ type: 'boolean' })
+  })
+
+  /*
+   * `DocumentedAssetSelection` is what actually parses those six bodies, and it is built
+   * with `.safeExtend()` because plain `.extend()` drops the refinement that enforces
+   * exactly one of `assetIds` or `query`. Losing it would not fail loudly: a body carrying
+   * both `assetIds` and `except` would be accepted, and `selectionConditions` takes the
+   * `assetIds` branch without ever reading `except` — trashing precisely the photographs
+   * the caller asked to spare. So the refinement is asserted here rather than trusted to
+   * a zod release note.
+   */
+  test('the documented selection still refuses what the contract refuses', async () => {
+    const id = '00000000-0000-4000-8000-000000000001'
+
+    expect(DocumentedAssetSelection.safeParse({}).success).toBe(false)
+    expect(DocumentedAssetSelection.safeParse({ assetIds: [id], query: {} }).success).toBe(false)
+    expect(DocumentedAssetSelection.safeParse({ assetIds: [id] }).success).toBe(true)
+
+    // And the annotation did not cost the parsing: "false" is still read by its spelling.
+    const parsed = DocumentedAssetSelection.safeParse({ query: { trashed: 'false' } })
+    expect(parsed.success && parsed.data.query?.trashed).toBe(false)
   })
 
   /**

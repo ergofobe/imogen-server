@@ -47,7 +47,8 @@ export function createAssetRoutes() {
       summary: 'List and search photos and videos',
       security: security(),
       middleware: [requireScope('library:read')] as const,
-      // Annotation only; see `documentWireBooleans`. `AssetQuery` is still what parses.
+      // Annotation only; see `documentWireBooleans`. What parses is a clone of
+      // `AssetQuery` carrying document metadata — the fields, and their rules, are its own.
       request: { query: documentWireBooleans(AssetQuery, 'favorite', 'archived', 'trashed') },
       responses: { ...ok(pageOf(Asset), 'A page of assets'), ...ERROR_RESPONSES },
     }),
