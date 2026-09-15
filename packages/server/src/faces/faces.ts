@@ -1,4 +1,4 @@
-import { and, cosineDistance, desc, eq, inArray, isNotNull, isNull, sql } from 'drizzle-orm'
+import { and, cosineDistance, desc, eq, gt, inArray, isNotNull, isNull, sql } from 'drizzle-orm'
 import type ort from 'onnxruntime-node'
 import type { Database } from '../db/index.ts'
 import { assets, faces, people, settings } from '../db/schema.ts'
@@ -490,7 +490,9 @@ export class FaceService {
 
   /**
    * Recomputes how many faces each person has, counting only photos that are actually
-   * visible — a person's count must never include a vaulted or trashed photo.
+   * visible — a person's count must never include a vaulted or trashed photo — and
+   * deletes whoever has no faces left at all. Counting and deleting ask different
+   * questions on purpose; see the statements below.
    *
    * Under the same locks a filing takes, and for the same reason. This rewrites `people`
    * rows and then deletes the empty ones, so it is housekeeping of exactly the kind those
@@ -540,17 +542,37 @@ export class FaceService {
         where ${people.id} = counted.person_id and ${people.ownerId} = ${ownerId}
       `)
 
-      // A person whose every photo went to the vault or the trash is no longer a person.
+      // A person whose every photo went to the vault or the trash counts for nothing and
+      // shows nobody: the statement above only reaches people who still have a visible
+      // face, so without this their last count and cover stand for ever. The cover
+      // especially — left pointing at a face on a vaulted photograph, it puts that
+      // photograph's crop back on the People page, which is the whole thing the vault is
+      // for. Guarded so a person already at zero is not rewritten for nothing.
       await tx.execute(sql`
-        delete from ${people}
+        update ${people} set face_count = 0, cover_face_id = null
         where ${people.ownerId} = ${ownerId}
           ${peopleInScope}
+          and (${people.faceCount} <> 0 or ${people.coverFaceId} is not null)
           and not exists (
             select 1 from ${faces} f
             join ${assets} a on a.id = f.asset_id
             where f.person_id = ${people.id}
               and a.vaulted_at is null
               and a.deleted_at is null
+          )
+      `)
+
+      // A person with no faces left *anywhere* is no longer a person. Deliberately not
+      // "no faces I can see": `faces.person_id` is `on delete set null`, so deleting
+      // someone whose remaining faces are merely out of sight detaches those faces for
+      // good, and restoring the photograph brings the face back belonging to nobody. The
+      // grouping was never wrong — the recount simply could not see it.
+      await tx.execute(sql`
+        delete from ${people}
+        where ${people.ownerId} = ${ownerId}
+          ${peopleInScope}
+          and not exists (
+            select 1 from ${faces} f where f.person_id = ${people.id}
           )
       `)
     }
@@ -660,32 +682,54 @@ export class FaceService {
   /**
    * Moves specific faces to a different person — the fix when clustering guessed wrong.
    *
-   * Naming a person puts the move under their lock alongside the new centroid, for the
-   * reason `mergePeople` gives: between the check that they exist and the write that
-   * points a face at them, a recount is free to find them empty and delete them.
-   * Unassigning names nobody, and writing a null cannot point at a person who has gone.
-   * `getPerson` above answers for the caller and cannot bind, since it runs before the
-   * lock is granted; the re-read inside does the binding.
+   * Every person the move touches is recomputed, source and destination alike. Only the
+   * destination used to be, so each person a face was taken *off* kept that face's
+   * embedding in its mean and went on attracting faces it no longer contained: the
+   * correction moved the face and left the mistake behind.
+   *
+   * Owner-wide and exclusive, where naming a destination once took that person's key
+   * alone. The people losing a face are not known until the faces are read, and a lock
+   * key has to be chosen before the transaction that reads them — the same bind
+   * `recordFace` hits when the person it needs does not exist yet, and it answers the
+   * same way. Nothing else is available: only the owner's key covers a set discovered
+   * that late, and taking a person key afterwards would break the fixed order the
+   * lattice depends on. It costs nothing either, since the recount on the way out takes
+   * that key already, so a reassignment has always serialised on it.
+   *
+   * Under that lock the destination is re-read, for the reason `mergePeople` gives:
+   * between the check that they exist and the write that points a face at them, a
+   * recount is free to find them empty and delete them. `getPerson` above answers for
+   * the caller — whose person this is, and a 404 rather than a constraint — but it runs
+   * before the lock is granted and cannot bind.
    */
   async reassignFaces(ownerId: string, faceIds: string[], personId: string | null) {
-    const move = (tx: Tx | Database) =>
-      tx
+    if (personId) await this.getPerson(ownerId, personId)
+
+    await this.lockedForOwner(ownerId, async (tx) => {
+      if (personId && !(await this.stillThere(tx, personId))) throw notFound('No such person')
+
+      // Read before the move: afterwards nothing records where these faces came from.
+      const sources = await this.peopleOfFaces(tx, ownerId, faceIds)
+
+      await tx
         .update(faces)
         .set({ personId, confirmed: true })
         .where(and(eq(faces.ownerId, ownerId), inArray(faces.id, faceIds)))
 
-    if (personId) {
-      await this.getPerson(ownerId, personId)
-      await this.lockedForPeople(ownerId, [personId], async (tx) => {
-        if (!(await this.stillThere(tx, personId))) throw notFound('No such person')
-        await move(tx)
-        await this.recomputeCentroid(personId, tx)
-      })
-    } else {
-      await move(this.db)
-    }
+      const touched = new Set(personId ? [...sources, personId] : sources)
+      for (const id of touched) await this.recomputeCentroid(id, tx)
+    })
 
     await this.refreshCounts(ownerId)
+  }
+
+  /** Who the named faces belong to now — the people a move is about to take from. */
+  private async peopleOfFaces(tx: Tx, ownerId: string, faceIds: string[]): Promise<string[]> {
+    const rows = await tx
+      .selectDistinct({ personId: faces.personId })
+      .from(faces)
+      .where(and(eq(faces.ownerId, ownerId), inArray(faces.id, faceIds), isNotNull(faces.personId)))
+    return rows.map((row) => row.personId).filter((id): id is string => id !== null)
   }
 
   /** Whether the person is still there, asked under the lock, where the answer holds. */
@@ -788,7 +832,14 @@ export class FaceService {
     }))
   }
 
-  /** Finds people by name, for search and for the assistant tool. */
+  /**
+   * Finds people by name, for search and for the assistant tool.
+   *
+   * Empty people are excluded for the same reason `listPeople` filters them: someone
+   * whose every photograph is in the vault or the trash is still a person — their faces
+   * are kept so a restore brings the grouping back — but offering them, with nothing to
+   * show, would answer a search with a photograph the owner has put out of sight.
+   */
   async findPeopleByName(ownerId: string, query: string) {
     return this.db
       .select({ id: people.id, name: people.name, faceCount: people.faceCount })
@@ -797,6 +848,7 @@ export class FaceService {
         and(
           eq(people.ownerId, ownerId),
           eq(people.hidden, false),
+          gt(people.faceCount, 0),
           isNotNull(people.name),
           sql`${people.name} ilike ${`%${query}%`}`,
         ),
