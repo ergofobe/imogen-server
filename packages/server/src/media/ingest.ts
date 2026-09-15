@@ -4,7 +4,7 @@ import { and, eq, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { assetFiles, assets, users } from '../db/schema.ts'
 import { conflict, quotaExceeded, unsupportedMediaType } from '../lib/errors.ts'
-import { contentHash } from './content-hash.ts'
+import { CONTENT_HASH_SCHEME, contentHash } from './content-hash.ts'
 import {
   type AssetRow,
   claimExistingAsset,
@@ -79,6 +79,9 @@ export class IngestService {
     const claim = await this.claimIdentity(input.ownerId, size, {
       checksum,
       contentHash: content,
+      // Null together: an unsupported container has no hash, so it has no rule either,
+      // and the backfill picks it up again the next time the rule changes.
+      contentHashScheme: content === null ? null : CONTENT_HASH_SCHEME,
       type,
       status: 'pending',
       originalFilename: input.metadata.filename ?? input.filename,

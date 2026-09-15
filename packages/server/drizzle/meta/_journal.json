@@ -85,6 +85,13 @@
       "when": 1788905334197,
       "tag": "0011_large_echo",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1789500179077,
+      "tag": "0012_large_lockjaw",
+      "breakpoints": true
     }
   ]
 }

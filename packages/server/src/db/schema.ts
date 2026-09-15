@@ -127,6 +127,18 @@ export const assets = pgTable(
      * photograph. Null when the container is one the hasher does not understand.
      */
     contentHash: text('content_hash'),
+    /**
+     * Which hashing rule produced `content_hash`, so a row stored under a superseded
+     * rule can be found and re-hashed rather than kept for ever (#86). Null when
+     * `content_hash` is: the two are written together and mean nothing apart.
+     * `CONTENT_HASH_SCHEME` in `media/content-hash.ts` is the current value.
+     *
+     * Only the builds that know about schemes keep that pairing. One from before #86,
+     * running against a database this migration has already touched, hashes rows
+     * without stamping them; the walk reads those back as never hashed and does them
+     * again, which costs a re-read and settles the column rather than trusting it.
+     */
+    contentHashScheme: integer('content_hash_scheme'),
     sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull(),
     /** Path relative to the library root, so the data directory can move. */
     originalPath: text('original_path').notNull(),

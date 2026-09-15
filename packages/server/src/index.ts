@@ -30,10 +30,11 @@ await scheduleMaintenance(services.queue)
 await scheduleFaceRepair(services.queue, services.db, services.faces)
 
 // Every asset uploaded before content_hash existed still reads as null, so a re-export
-// twin of one of them would not be recognised. Runs once, then records that it has.
-// Unattended on purpose, unlike the repairs #54 wants an administrator to start: this
-// fills a derived column from the original file and touches nothing a person can see or
-// would ever need to undo, so it is an index build, not a rewrite.
+// twin of one of them would not be recognised -- and so does every asset hashed under a
+// rule the current one has replaced (#86). Runs once per hashing scheme, then records
+// which one it covered. Unattended on purpose, unlike the repairs #54 wants an
+// administrator to start: it derives a column from the original file and touches nothing
+// a person can see or would ever need to undo, so it is an index build, not a rewrite.
 await scheduleContentHashBackfill(services.queue, services.db)
 
 const server = Bun.serve({
