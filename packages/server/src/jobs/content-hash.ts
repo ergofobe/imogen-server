@@ -50,9 +50,11 @@ export function registerContentHashJobs(queue: JobQueue, deps: ContentHashJobDep
         hash = null
       }
       // Nothing is written when the hash comes back null. A row re-hashed under a new
-      // scheme already holds an answer, and overwriting it with null because the disk
-      // hiccuped would lose the twins it still finds; the row keeps its old scheme, so
-      // the next pass tries again.
+      // scheme already holds an answer, and overwriting it with null because the file is
+      // unreadable would lose the twins it still finds. The row keeps its old scheme and
+      // this walk still finishes: an original that cannot be read is broken in a way a
+      // hashing pass cannot mend, and blocking the record on it would re-read the whole
+      // library at every boot for ever. It is picked up again at the next rule change.
       if (hash !== null) {
         await deps.db
           .update(assets)
@@ -127,7 +129,18 @@ async function markSchemeWalked(db: Database, scheme: number): Promise<void> {
  * left to do once a pass has reached the end of a library hashed under an older one.
  */
 export async function scheduleContentHashBackfill(queue: JobQueue, db: Database): Promise<boolean> {
-  if ((await walkedScheme(db)) >= CONTENT_HASH_SCHEME) return false
+  const walked = await walkedScheme(db)
+  if (walked > CONTENT_HASH_SCHEME) {
+    // A rollback to a binary older than the library. Every row is stamped with a rule
+    // this build does not have, so none is selectable and new uploads hash under the
+    // older rule and match nothing stored. Nothing here can mend that -- say so, rather
+    // than let dedup quietly stop working.
+    console.warn(
+      `content hash: library is at scheme ${walked}, this server hashes at ${CONTENT_HASH_SCHEME}; duplicate detection is off until it is upgraded again`,
+    )
+    return false
+  }
+  if (walked === CONTENT_HASH_SCHEME) return false
 
   await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, {})
   return true

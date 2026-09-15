@@ -278,6 +278,13 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
       const [row] = await db.select().from(assets).where(eq(assets.id, asset.id))
       expect(row!.contentHash).toBe('a'.repeat(64))
       expect(row!.contentHashScheme).toBe(STALE_SCHEME)
+
+      // And the walk still finishes. An original that stays unreadable would otherwise
+      // have the whole library re-read at every boot for ever; the row waits for the
+      // next rule change instead.
+      const [recorded] = await db.select().from(settings).where(eq(settings.key, SCHEME_KEY))
+      expect(recorded!.value).toEqual({ scheme: CONTENT_HASH_SCHEME })
+      expect(await scheduleContentHashBackfill(queue, db)).toBe(false)
     })
   })
 })
