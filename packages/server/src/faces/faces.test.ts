@@ -558,6 +558,38 @@ describe('reassigning faces away from a person', () => {
     return { annaId: anna!.id, beaId: bea!.id, moving }
   }
 
+  /**
+   * `mergePeople` and `reassignFaces` both commit their transaction and then recount in
+   * a second one, which takes the owner's exclusive lock — the lock this codebase has
+   * watched time out under an import. Since the count now gates the People list and
+   * search, whatever the first transaction leaves behind has to stand on its own: a
+   * survivor holding three visible photographs must not read as empty because the
+   * recount never ran.
+   */
+  test('leaves a merge survivor visible when the recount afterwards fails', async () => {
+    const trashed = await addBareAsset({ deletedAt: new Date() })
+    const visible = await addBareAsset()
+    const [keep] = await db.insert(people).values({ ownerId, name: 'Keep' }).returning()
+    const [gone] = await db.insert(people).values({ ownerId, name: 'Gone' }).returning()
+    await addFace(trashed.id, keep!.id, ownerId, 0.9, unit(0))
+    await addFace(visible.id, gone!.id, ownerId, 0.9, unit(0))
+
+    await service.refreshCounts(ownerId)
+    expect((await personRow(keep!.id))?.faceCount).toBe(0)
+
+    const recounts = spyOn(service, 'refreshCounts').mockImplementation(() => {
+      throw new Error('canceling statement due to lock timeout')
+    })
+    try {
+      await expect(service.mergePeople(ownerId, keep!.id, [gone!.id])).rejects.toThrow()
+    } finally {
+      recounts.mockRestore()
+    }
+
+    expect((await personRow(keep!.id))?.faceCount).toBe(1)
+    expect((await service.listPeople(ownerId)).map((p) => p.id)).toContain(keep!.id)
+  })
+
   test('recomputes the source centroid, not only the destination', async () => {
     const { annaId, beaId, moving } = await misgrouped()
 

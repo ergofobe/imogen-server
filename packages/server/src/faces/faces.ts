@@ -486,8 +486,12 @@ export class FaceService {
    * face they have, trashed ones included — a person whose photographs are all in the
    * trash keeps both — so the shown figure drifts from it, and at zero it does worse
    * than drift: `updateCentroid` reads a count of nothing as a brand new person and
-   * replaces a mean built from fifty faces with the single face being filed. The count
-   * is one index lookup against work already dominated by detection and embedding.
+   * replaces a mean built from fifty faces with the single face being filed.
+   *
+   * An index-only count, so it does cost more the more often the person appears. Set
+   * against the detection and the embedding that produced the face being filed, that is
+   * not the term worth optimising; a column maintained beside the centroid would be, if
+   * it ever is.
    */
   private async centroidSize(tx: Tx, personId: string): Promise<number> {
     const [row] = await tx
@@ -779,26 +783,41 @@ export class FaceService {
    * of the hold is the cost. `avg` is pgvector's own aggregate and `l2_normalize` is the
    * final divide the JavaScript did.
    *
-   * A person with no faces left is not named by the grouping and so is left alone: their
-   * mean stops meaning anything, but the recount that follows every caller deletes them.
+   * Driven from `people` by a left join rather than from `faces`, so a person the move
+   * emptied is named too: their mean goes null, which is what stops them attracting a
+   * face they no longer contain — `bestPerson` only considers a person who has one. A
+   * grouping over `faces` alone would skip them and leave the mean that the reassignment
+   * was correcting.
    *
-   * `face_count` is deliberately not written here. It is the figure the library shows,
-   * counts only visible photographs, and now gates who appears in the People list and in
-   * search — so setting it from a count that includes trashed faces, and leaving the
-   * correction to a `refreshCounts` in a later transaction, would put a person with
-   * nothing in view back in both for as long as that recount failed to run.
+   * `face_count` is written here, and written the way `refreshCounts` writes it — only
+   * photographs the owner can see. Both halves matter. Not writing it at all left a
+   * merge survivor whose own photographs were in the trash sitting at zero until a
+   * separate transaction corrected it, and since that column now gates the People list
+   * and search, a recount that failed in between made both people vanish. Writing the
+   * raw face total instead would do the opposite, listing someone with nothing to show.
+   * The cover is left to `refreshCounts`: it is the only quantity here that needs to
+   * choose among faces rather than count them.
    */
   private async recomputeCentroids(tx: Tx, ownerId: string, personIds: string[]): Promise<void> {
     if (personIds.length === 0) return
     await tx.execute(sql`
-      update ${people} set centroid = l2_normalize(counted.mean), updated_at = now()
+      update ${people} set
+        centroid = counted.mean,
+        face_count = counted.visible,
+        updated_at = now()
       from (
-        select f.person_id, avg(f.embedding) as mean
-        from ${faces} f
-        where f.owner_id = ${ownerId} and ${inArray(sql`f.person_id`, personIds)}
-        group by f.person_id
+        select p.id,
+               l2_normalize(avg(f.embedding)) as mean,
+               count(f.id) filter (
+                 where a.vaulted_at is null and a.deleted_at is null
+               )::int as visible
+        from ${people} p
+        left join ${faces} f on f.person_id = p.id
+        left join ${assets} a on a.id = f.asset_id
+        where p.owner_id = ${ownerId} and ${inArray(sql`p.id`, personIds)}
+        group by p.id
       ) as counted
-      where ${people.id} = counted.person_id and ${people.ownerId} = ${ownerId}
+      where ${people.id} = counted.id and ${people.ownerId} = ${ownerId}
     `)
   }
 
