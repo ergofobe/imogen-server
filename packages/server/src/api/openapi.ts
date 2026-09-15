@@ -52,35 +52,50 @@ export const security = (): Array<Record<string, string[]>> => [
  * report, a silently listed hidden person is not.
  *
  * This mirrors `WireBoolean` in `@imogen/shared`, which landed on imogen-sdk `main` after
- * the `v0.5.0` tag this repository is pinned to (imogen-sdk#36). These schemas are declared
- * server-side, so that fix does not reach them and neither would moving the pin. Kept
- * identical so it can be swapped for the SDK's export, once pinned, without a behaviour
- * change — including the JSON-shaped branches a query string cannot itself produce.
+ * the `v0.5.0` tag this repository is pinned to (imogen-sdk#36). It is a local copy only
+ * because the two schemas that use it — `includeHidden` here and the vault's `covers` —
+ * are declared in this repository, so the SDK's fix cannot reach them however the pin
+ * moves. Kept identical so they can be swapped for the SDK's export once it is pinned,
+ * without a behaviour change — including the JSON-shaped branches a query string cannot
+ * itself produce.
+ *
+ * It does NOT cover this server's other wire booleans, which come from the pinned SDK and
+ * are still `z.coerce.boolean()` at v0.5.0: `favorite`, `archived` and `trashed` on
+ * `AssetFilter`, `covers` on `TimelineQuery` (so `GET /timeline` and the share timeline
+ * disagree with `/vault/timeline` until the pin moves), and `AssetUploadMetadata.favorite`,
+ * where an upload sent `favorite=false` is favourited. Those are fixed on SDK `main`; the
+ * fix here is a pin move, which is its own PR. Do not paper over them by redeclaring the
+ * SDK's fields locally — the contract lives in `@imogen/shared`, not here.
  *
  * No type is exported alongside it. Every branch that carries no opinion parses to
  * `undefined`, so the inferred type is `boolean | undefined` — a name a caller would
  * reasonably read as a plain boolean and be wrong about.
  */
 export const WireBoolean = z
-  .union([
-    z.boolean(),
-    /*
-     * The two ways a field arrives carrying no opinion: present but empty, which is how
-     * `?covers=` comes from a link built with no query at all, and an explicit null. Both
-     * parse to `undefined` — the same as never having been sent, rather than as `false`,
-     * which for a filter means something of its own. Refusing them instead would turn a
-     * link with an empty parameter into a 400.
-     *
-     * Note what `.default()` then does to that: zod re-applies a default to an `undefined`
-     * *output*, not just to an absent input, so `WireBoolean.default(x)` reads an empty
-     * value as `x`. That is why `includeHidden` defaults to `false` and not to `true` — a
-     * `.default(true)` here would quietly turn `?flag=`, the case that carries no opinion,
-     * into an opinion. Use `.optional()` where undefined has to survive.
-     */
-    z.literal('').transform(() => undefined),
-    z.null().transform(() => undefined),
-    z.enum(['true', 'false', '1', '0']).transform((value) => value === 'true' || value === '1'),
-  ])
+  .union(
+    [
+      z.boolean(),
+      /*
+       * The two ways a field arrives carrying no opinion: present but empty, which is how
+       * `?covers=` comes from a link built with no query at all, and an explicit null. Both
+       * parse to `undefined` — the same as never having been sent, rather than as `false`,
+       * which for a filter means something of its own. Refusing them instead would turn a
+       * link with an empty parameter into a 400.
+       *
+       * Note what `.default()` then does to that: zod re-applies a default to an `undefined`
+       * *output*, not just to an absent input, so `WireBoolean.default(x)` reads an empty
+       * value as `x`. That is why `includeHidden` defaults to `false` and not to `true` — a
+       * `.default(true)` here would quietly turn `?flag=`, the case that carries no opinion,
+       * into an opinion. Use `.optional()` where undefined has to survive.
+       */
+      z.literal('').transform(() => undefined),
+      z.null().transform(() => undefined),
+      z.enum(['true', 'false', '1', '0']).transform((value) => value === 'true' || value === '1'),
+    ],
+    // Zod's own union message is "Invalid input", which names none of the spellings it
+    // would have taken. A refusal is only a bug report if it says what was expected.
+    { error: 'expected true, false, 1 or 0' },
+  )
   /*
    * The document keeps saying `boolean` while the parser stays strict. Without this the
    * generated `openapi.json` — a published artifact, and what the reference page and any

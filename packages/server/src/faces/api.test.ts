@@ -568,4 +568,16 @@ describe('includeHidden is read by its spelling', () => {
       expect((await listedBy(`?includeHidden=${spelling}`, cookie)).status).toBe(400)
     },
   )
+
+  // A refusal is only a bug report if it says what was expected. Zod's own union message
+  // is "Invalid input", which names none of the four spellings that would have worked.
+  test('the refusal names the spellings it would have taken', async () => {
+    const cookie = await libraryOfTwo()
+
+    const response = await request('/api/v1/people?includeHidden=yes', {
+      headers: { Cookie: cookie },
+    })
+
+    expect(JSON.stringify(await response.json())).toContain('expected true, false, 1 or 0')
+  })
 })
