@@ -35,7 +35,15 @@ export function registerContentHashJobs(queue: JobQueue, deps: ContentHashJobDep
    * every rule change, and reads every original when it does.
    */
   queue.register(CONTENT_HASH_BACKFILL_JOB, async (payload) => {
-    const after = typeof payload.after === 'string' ? payload.after : null
+    // A chain pages by id, so it is only resumable under the rule it started with. The
+    // one event that changes the rule is the one that restarts the server, so a chain
+    // left `{after: X}` by an upgrade is the ordinary case: resuming it would cover the
+    // tail of the library and then record the new scheme as walked over a head it never
+    // read. Start again from the beginning instead. A payload with no scheme is one this
+    // build inherited from an older one, which is the same situation.
+    const walking = typeof payload.scheme === 'number' ? payload.scheme : null
+    const resumable = walking === CONTENT_HASH_SCHEME
+    const after = resumable && typeof payload.after === 'string' ? payload.after : null
     const batch = await pendingContentHash(deps.db, BATCH, after)
 
     for (const asset of batch) {
@@ -64,7 +72,10 @@ export function registerContentHashJobs(queue: JobQueue, deps: ContentHashJobDep
     }
 
     if (batch.length === BATCH) {
-      await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, { after: batch[batch.length - 1]!.id })
+      await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, {
+        after: batch[batch.length - 1]!.id,
+        scheme: CONTENT_HASH_SCHEME,
+      })
       return
     }
 
@@ -198,5 +209,7 @@ export async function scheduleContentHashBackfill(queue: JobQueue, db: Database)
   }
   if (record.scheme >= CONTENT_HASH_SCHEME) return false
 
-  return (await queue.enqueueUnique(CONTENT_HASH_BACKFILL_JOB, {})) !== null
+  return (
+    (await queue.enqueueUnique(CONTENT_HASH_BACKFILL_JOB, { scheme: CONTENT_HASH_SCHEME })) !== null
+  )
 }

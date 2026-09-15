@@ -12,7 +12,11 @@ export type AssetRow = typeof assets.$inferSelect
 
 export type ExistingAsset = {
   row: AssetRow
-  /** The match was in the trash and has just been brought back. */
+  /**
+   * The match was in the trash when this claim looked at it, and is live now. True as
+   * well when a concurrent caller was the one that brought it back: it drives a face
+   * recount, and that is owed either way.
+   */
   restored: boolean
   /**
    * The caller holds the photograph's own bytes -- the checksum or the content hash --

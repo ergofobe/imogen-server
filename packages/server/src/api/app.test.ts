@@ -215,8 +215,16 @@ async function heldOpen(change: (tx: Transaction) => Promise<unknown>) {
     applied = resolve
   })
 
+  let failure: unknown
   const transaction = harness.db.transaction(async (tx) => {
-    await change(tx)
+    try {
+      await change(tx)
+    } catch (error) {
+      // Held rather than thrown here: a rejection would leave the caller waiting on a
+      // transaction that is never going to apply anything, and the test would hang
+      // instead of reporting the failure. It is re-thrown from the commit below.
+      failure = error
+    }
     applied()
     await held
   })
@@ -225,6 +233,7 @@ async function heldOpen(change: (tx: Transaction) => Promise<unknown>) {
   return async () => {
     commit()
     await transaction
+    if (failure !== undefined) throw failure
   }
 }
 

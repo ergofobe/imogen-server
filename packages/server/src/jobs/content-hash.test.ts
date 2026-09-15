@@ -289,6 +289,69 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
       expect(await rowVersion(asset.id)).toBe(hashed)
     })
 
+    /**
+     * The one event that bumps the scheme is the one that restarts the server, so a
+     * chain left `{after: X}` by the upgrade is the ordinary case rather than a corner.
+     * It pages by id, so resuming it under the new rule would cover the tail of the
+     * library and then record the new scheme as walked over the head it never read --
+     * and the head is exactly the part hashed under the rule that just changed.
+     */
+    test('a chain interrupted by an upgrade walks the library again from the start', async () => {
+      const queue = setup()
+
+      const firstPath = await storedJpeg('head-of-library')
+      const first = await insertAsset({
+        originalPath: firstPath,
+        contentHash: 'a'.repeat(64),
+        contentHashScheme: STALE_SCHEME,
+      })
+      const secondPath = await storedJpeg('tail-of-library')
+      const second = await insertAsset({
+        originalPath: secondPath,
+        contentHash: 'b'.repeat(64),
+        contentHashScheme: STALE_SCHEME,
+      })
+      const [head, tail] = [first, second].toSorted((a, b) => (a.id < b.id ? -1 : 1))
+
+      // Where the walk had got to when the server went down to be upgraded.
+      await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, {
+        after: head!.id,
+        scheme: STALE_SCHEME,
+      })
+      // Boot leaves the resumed chain to it rather than starting a second walk (#92).
+      expect(await scheduleContentHashBackfill(queue, db)).toBe(false)
+      await queue.drain()
+
+      const [headRow] = await db.select().from(assets).where(eq(assets.id, head!.id))
+      expect(headRow!.contentHash).toBe(await contentHash(storage.absolutePath(head!.originalPath)))
+      expect(headRow!.contentHashScheme).toBe(CONTENT_HASH_SCHEME)
+
+      const [tailRow] = await db.select().from(assets).where(eq(assets.id, tail!.id))
+      expect(tailRow!.contentHashScheme).toBe(CONTENT_HASH_SCHEME)
+    })
+
+    test('a chain resumes where it stopped while the rule has not changed', async () => {
+      const queue = setup()
+
+      const alreadyWalked = await insertAsset({
+        originalPath: await storedJpeg('already-walked'),
+        contentHash: 'a'.repeat(64),
+        contentHashScheme: STALE_SCHEME,
+      })
+
+      // Restarted mid-walk under the same rule: the head has been hashed already, so
+      // re-reading it would be the wasted work #92 is about.
+      await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, {
+        after: alreadyWalked.id,
+        scheme: CONTENT_HASH_SCHEME,
+      })
+      await queue.drain()
+
+      const [row] = await db.select().from(assets).where(eq(assets.id, alreadyWalked.id))
+      expect(row!.contentHash).toBe('a'.repeat(64))
+      expect(row!.contentHashScheme).toBe(STALE_SCHEME)
+    })
+
     test('a pass on a build older than the library does not lower what it has seen', async () => {
       const queue = setup()
       const ahead = { scheme: CONTENT_HASH_SCHEME + 1, seen: CONTENT_HASH_SCHEME + 1 }
