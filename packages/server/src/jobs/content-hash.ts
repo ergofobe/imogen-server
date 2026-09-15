@@ -71,9 +71,9 @@ export function registerContentHashJobs(queue: JobQueue, deps: ContentHashJobDep
     // Recorded only now, at the end of the walk, so a server that restarts partway
     // through starts the pass again rather than calling a library hashed that is not: a
     // second look at an asset costs one hash read and changes nothing, while a skipped
-    // one keeps its stale content_hash until the scheme changes again. Two chains racing
-    // -- boot enqueues a fresh one beside a pending `{after}` job -- can still record
-    // while the other is mid-library, which is the scheduler's missing dedup (#92).
+    // one keeps its stale content_hash until the scheme changes again. One chain reaching
+    // the end therefore means the library has been walked, which holds only because the
+    // scheduler below refuses to start a second one beside the first (#92).
     await markSchemeWalked(deps.db, CONTENT_HASH_SCHEME)
   })
 }
@@ -178,6 +178,12 @@ async function noteServing(db: Database, scheme: number): Promise<WalkRecord> {
  *
  * Every new upload fills the column under the current scheme itself, so there is nothing
  * left to do once a pass has reached the end of a library hashed under an older one.
+ *
+ * `enqueueUnique`, because a restart mid-walk leaves the chain's `{after}` job queued and
+ * it resumes on its own. A fresh chain beside it would re-read every original a second
+ * time, and whichever of the two reached a short batch first would record the scheme
+ * while the other was still mid-library — the record is only honest while there is one
+ * walk (#92).
  */
 export async function scheduleContentHashBackfill(queue: JobQueue, db: Database): Promise<boolean> {
   const record = await noteServing(db, CONTENT_HASH_SCHEME)
@@ -192,6 +198,5 @@ export async function scheduleContentHashBackfill(queue: JobQueue, db: Database)
   }
   if (record.scheme >= CONTENT_HASH_SCHEME) return false
 
-  await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, {})
-  return true
+  return (await queue.enqueueUnique(CONTENT_HASH_BACKFILL_JOB, {})) !== null
 }

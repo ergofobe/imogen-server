@@ -152,6 +152,34 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
     ).toHaveLength(1)
   })
 
+  /**
+   * A restart mid-walk leaves the chain's `{after}` job queued, and boot used to enqueue
+   * a fresh `{}` beside it. Both then walked the library, and whichever reached a short
+   * batch first recorded the scheme while the other was still mid-library -- the race
+   * #86 inherited and left to the scheduler to close (#92).
+   */
+  test('does not schedule a second walk while one is still queued', async () => {
+    const queue = setup()
+    await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, { after: 'some-asset-id' })
+
+    expect(await scheduleContentHashBackfill(queue, db)).toBe(false)
+
+    const queued = await db.select().from(jobs).where(eq(jobs.name, CONTENT_HASH_BACKFILL_JOB))
+    expect(queued).toHaveLength(1)
+    expect(queued[0]!.payload).toMatchObject({ after: 'some-asset-id' })
+  })
+
+  test('does not schedule a second walk while one is running', async () => {
+    const queue = setup()
+    await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, { after: 'some-asset-id' })
+    await db.update(jobs).set({ status: 'running', startedAt: new Date() })
+
+    expect(await scheduleContentHashBackfill(queue, db)).toBe(false)
+    expect(
+      await db.select().from(jobs).where(eq(jobs.name, CONTENT_HASH_BACKFILL_JOB)),
+    ).toHaveLength(1)
+  })
+
   test('walks past a full batch via re-enqueue', async () => {
     const queue = setup()
 
