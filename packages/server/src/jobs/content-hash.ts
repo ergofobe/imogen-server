@@ -106,13 +106,23 @@ function pendingContentHash(db: Database, limit: number, after: string | null) {
 /** The scheme the last completed walk covered, or 0 if none has finished. */
 async function walkedScheme(db: Database): Promise<number> {
   const [row] = await db.select().from(settings).where(eq(settings.key, SCHEME_KEY)).limit(1)
-  const scheme = row?.value.scheme
-  // A value this cannot read counts as no walk at all: one needless pass is the cheap
-  // mistake here, and leaving stale hashes in place is the expensive one.
+  // `value` is `json not null`, which still admits the JSON value null, so this reads the
+  // row defensively rather than through it: a throw here happens at boot and takes the
+  // server with it. Anything unreadable counts as no walk at all -- one needless pass is
+  // the cheap mistake, and leaving stale hashes in place is the expensive one.
+  const value: unknown = row?.value
+  if (typeof value !== 'object' || value === null) return 0
+  const scheme = (value as Record<string, unknown>).scheme
   return typeof scheme === 'number' ? scheme : 0
 }
 
+/** Records `scheme` as walked. Never lowers what is already there. */
 async function markSchemeWalked(db: Database, scheme: number): Promise<void> {
+  // A build older than the library would otherwise write its own scheme over a higher
+  // one -- a stale job left in the queue across a rollback finds no rows to hash and
+  // "completes" -- and silence the warning below that says dedup has stopped working.
+  if ((await walkedScheme(db)) >= scheme) return
+
   await db
     .insert(settings)
     .values({ key: SCHEME_KEY, value: { scheme } })

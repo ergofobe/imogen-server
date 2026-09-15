@@ -261,6 +261,33 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
       expect(await rowVersion(asset.id)).toBe(hashed)
     })
 
+    test('a pass on a build older than the library does not lower the record', async () => {
+      const queue = setup()
+      await db
+        .insert(settings)
+        .values({ key: SCHEME_KEY, value: { scheme: CONTENT_HASH_SCHEME + 1 } })
+
+      // A rollback leaves a job from the newer build in the queue. It finds nothing to
+      // hash -- every row is stamped above this binary's rule -- and must not answer by
+      // writing its own scheme over the library's, which would silence the warning that
+      // dedup has stopped working.
+      await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, {})
+      await queue.drain()
+
+      const [recorded] = await db.select().from(settings).where(eq(settings.key, SCHEME_KEY))
+      expect(recorded!.value).toEqual({ scheme: CONTENT_HASH_SCHEME + 1 })
+      expect(await scheduleContentHashBackfill(queue, db)).toBe(false)
+    })
+
+    test('a recorded value the walk cannot read counts as no walk at all', async () => {
+      const queue = setup()
+      // `settings.value` is `json not null`, which still admits the JSON value null.
+      // Reading through it used to throw, at boot, before anything served a request.
+      await db.execute(sql`insert into settings (key, value) values (${SCHEME_KEY}, 'null'::json)`)
+
+      expect(await scheduleContentHashBackfill(queue, db)).toBe(true)
+    })
+
     test('keeps the hash it has when the file cannot be read', async () => {
       const queue = setup()
       const asset = await insertAsset({
