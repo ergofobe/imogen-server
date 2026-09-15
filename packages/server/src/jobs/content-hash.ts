@@ -87,9 +87,12 @@ export function registerContentHashJobs(queue: JobQueue, deps: ContentHashJobDep
  *
  * No `deletedAt` filter, unlike the face jobs: a trashed asset is still a duplicate of
  * whatever new upload arrives, so leaving it out would let the exact copy dedup is meant
- * to catch slip through. A row the hasher cannot answer for (unsupported container,
- * unreadable file) keeps its scheme and is not revisited within this pass — paging by id
- * past it is enough, and this query would otherwise reselect it on every batch.
+ * to catch slip through.
+ *
+ * A row the hasher cannot answer for keeps whatever scheme it had, so paging by id is
+ * what carries this pass past it — the query would otherwise reselect it on every batch.
+ * It is read again by every future walk, which for an unsupported container is the point:
+ * a later rule may know the format this one does not.
  */
 function pendingContentHash(db: Database, limit: number, after: string | null) {
   return db
