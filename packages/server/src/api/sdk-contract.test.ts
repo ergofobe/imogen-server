@@ -155,6 +155,24 @@ describe('uploading', () => {
     expect(events.at(-1)).toBeGreaterThan(0)
   })
 
+  /**
+   * The headline case of imogen-sdk#36, on the path that made it expensive.
+   * `AssetUploadMetadata.favorite` came off a multipart body, where the client writes
+   * `String(false)` — so an importer that set the flag honestly on every line favourited
+   * the entire library, and no value of the field could say otherwise. Asserting the
+   * `true` case alongside it keeps this a test of the spelling rather than of whether the
+   * field is wired up at all.
+   */
+  test('uploading with favorite=false does not favourite the photograph', async () => {
+    await signUp()
+
+    const plain = await client.assets.upload(await photo('plain.jpg'), { favorite: false })
+    const starred = await client.assets.upload(await photo('starred.jpg'), { favorite: true })
+
+    expect(plain.asset.favorite).toBe(false)
+    expect(starred.asset.favorite).toBe(true)
+  })
+
   test('recognises a duplicate instead of storing it twice', async () => {
     await signUp()
     const file = await photo()
@@ -309,6 +327,25 @@ describe('browsing', () => {
     expect(notFavorite.items.map((a) => a.id)).not.toContain(favoriteId)
     expect(notFavorite.items).toHaveLength(10)
     expect(favorite.items.map((a) => a.id)).toEqual([favoriteId])
+  })
+
+  /**
+   * The third field the same union covers, on the route that reads it. `covers` decides
+   * whether a bucket carries a cover id at all, so under the bug asking for a timeline
+   * *without* covers built every cover — the expensive half of the query, silently on.
+   * `/vault/timeline` was never affected: its `covers` is declared in this repository and
+   * was fixed in imogen-server#101, which is why the vault suite did not catch this one.
+   */
+  test('covers=false on the timeline means no covers', async () => {
+    await library()
+
+    const without = await client.assets.timeline({ covers: false })
+    const with_ = await client.assets.timeline({ covers: true })
+
+    expect(without.buckets.length).toBeGreaterThan(0)
+    expect(without.buckets.every((b) => b.coverAssetId === null)).toBe(true)
+    // Asked for, they arrive — so the false case is a decision, not an empty library.
+    expect(with_.buckets.some((b) => b.coverAssetId !== null)).toBe(true)
   })
 
   test('builds a usable image URL', async () => {

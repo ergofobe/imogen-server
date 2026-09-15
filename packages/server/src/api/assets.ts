@@ -66,7 +66,9 @@ export function createAssetRoutes() {
       summary: 'Per-day counts, so a client can size its scrollbar before loading anything',
       security: security(),
       middleware: [requireScope('library:read')] as const,
-      request: { query: TimelineQuery },
+      request: {
+        query: documentWireBooleans(TimelineQuery, 'favorite', 'archived', 'trashed', 'covers'),
+      },
       responses: {
         ...ok(z.object({ buckets: z.array(TimelineBucket) }), 'Day buckets, newest first'),
         ...ERROR_RESPONSES,
@@ -94,7 +96,9 @@ export function createAssetRoutes() {
         'from `GET /assets`.',
       security: security(),
       middleware: [requireScope('library:read')] as const,
-      request: { query: TimelineBucketQuery },
+      request: {
+        query: documentWireBooleans(TimelineBucketQuery, 'favorite', 'archived', 'trashed'),
+      },
       responses: { ...ok(pageOf(TimelineTile), 'A page of tiles'), ...ERROR_RESPONSES },
     }),
     async (c) => {

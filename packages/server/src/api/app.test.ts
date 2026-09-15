@@ -271,7 +271,15 @@ describe('health and docs', () => {
      */
     for (const name of ['favorite', 'archived', 'trashed']) {
       expect(parameter('/api/v1/assets', name)).toEqual({ type: 'boolean' })
+      expect(parameter('/api/v1/assets/timeline', name)).toEqual({ type: 'boolean' })
+      expect(parameter('/api/v1/assets/timeline/bucket', name)).toEqual({ type: 'boolean' })
     }
+    /*
+     * `covers` is the one field the document describes on two routes at once — here from
+     * the SDK's `TimelineQuery`, and on `/vault/timeline` from the local `WireBoolean`.
+     * The same name must not be two shapes in one document.
+     */
+    expect(parameter('/api/v1/assets/timeline', 'covers')).toEqual({ type: 'boolean' })
     // The annotation is confined to those: it must not flatten its neighbours.
     expect(parameter('/api/v1/assets', 'q')).toEqual({ type: 'string', maxLength: 512 })
   })
