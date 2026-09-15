@@ -455,9 +455,6 @@ export class FaceService {
     const centroid = new Float32Array(person.centroid as number[])
     if (!bestMatch(filing.embedding, [{ id: personId, centroid }])) return null
 
-    // Counted before the new face goes in, so it is the size of the mean being moved.
-    const size = await this.centroidSize(tx, personId)
-
     // Clustering agrees with the human: this is their face, found somewhere new. Each
     // orphaned row is taken once, so a second detection of the same person moves the
     // next one rather than the same one twice.
@@ -467,7 +464,8 @@ export class FaceService {
       return personId
     }
 
-    const moved = updateCentroid(centroid, size, filing.embedding)
+    // Counted before the new face goes in, so it is the size of the mean being moved.
+    const moved = updateCentroid(centroid, await this.centroidSize(tx, personId), filing.embedding)
     await tx
       .update(people)
       .set({
@@ -485,9 +483,9 @@ export class FaceService {
    *
    * Counted rather than read from `people.face_count`, which is the figure the library
    * *shows* and counts only photographs the owner can see. The mean is built from every
-   * face they have, vaulted and trashed included — a person whose photographs are all
-   * out of sight keeps both — so the shown figure drifts from it, and at zero it does
-   * worse than drift: `updateCentroid` reads a count of nothing as a brand new person and
+   * face they have, trashed ones included — a person whose photographs are all in the
+   * trash keeps both — so the shown figure drifts from it, and at zero it does worse
+   * than drift: `updateCentroid` reads a count of nothing as a brand new person and
    * replaces a mean built from fifty faces with the single face being filed. The count
    * is one index lookup against work already dominated by detection and embedding.
    */
@@ -564,12 +562,13 @@ export class FaceService {
         where ${people.id} = counted.person_id and ${people.ownerId} = ${ownerId}
       `)
 
-      // A person whose every photo went to the vault or the trash counts for nothing and
-      // shows nobody: the statement above only reaches people who still have a visible
-      // face, so without this their last count and cover stand for ever. The cover
-      // especially — left pointing at a face on a vaulted photograph, it puts that
-      // photograph's crop back on the People page, which is the whole thing the vault is
-      // for. Guarded so a person already at zero is not rewritten for nothing.
+      // A person with nothing left in view counts for nothing and shows nobody: the
+      // statement above only reaches people who still have a visible face, so without
+      // this their last count and cover stand for ever, and the cover would put a
+      // trashed photograph's crop on the People page. In practice this is the trash
+      // alone — vaulting a photograph deletes its faces in the same transaction that
+      // hides it, so a person with only vaulted photographs has no faces at all and is
+      // deleted below. Guarded so a person already at zero is not rewritten for nothing.
       await tx.execute(sql`
         update ${people} set face_count = 0, cover_face_id = null
         where ${people.ownerId} = ${ownerId}
@@ -629,12 +628,18 @@ export class FaceService {
       })
       .from(people)
       .where(
-        includeHidden
-          ? eq(people.ownerId, ownerId)
-          : and(eq(people.ownerId, ownerId), eq(people.hidden, false)),
+        and(
+          eq(people.ownerId, ownerId),
+          // In SQL rather than filtered out afterwards. A person with nothing in view is
+          // kept now rather than deleted, so on a library that uses the trash the
+          // discarded set grows without bound — one production owner has 5,758 people,
+          // and fetching all of them to throw most away is the whole table per page load.
+          gt(people.faceCount, 0),
+          includeHidden ? undefined : eq(people.hidden, false),
+        ),
       )
       .orderBy(desc(people.faceCount))
-    return rows.filter((p) => p.faceCount > 0)
+    return rows
   }
 
   async getPerson(ownerId: string, personId: string) {
@@ -692,7 +697,7 @@ export class FaceService {
         .returning({ id: faces.id })
 
       await tx.delete(people).where(inArray(people.id, others))
-      await this.recomputeCentroids(tx, [keepId])
+      await this.recomputeCentroids(tx, ownerId, [keepId])
       return rows.length
     })
 
@@ -739,7 +744,7 @@ export class FaceService {
         .where(and(eq(faces.ownerId, ownerId), inArray(faces.id, faceIds)))
 
       const touched = new Set(personId ? [...sources, personId] : sources)
-      await this.recomputeCentroids(tx, [...touched])
+      await this.recomputeCentroids(tx, ownerId, [...touched])
     })
 
     await this.refreshCounts(ownerId)
@@ -776,21 +781,24 @@ export class FaceService {
    *
    * A person with no faces left is not named by the grouping and so is left alone: their
    * mean stops meaning anything, but the recount that follows every caller deletes them.
+   *
+   * `face_count` is deliberately not written here. It is the figure the library shows,
+   * counts only visible photographs, and now gates who appears in the People list and in
+   * search — so setting it from a count that includes trashed faces, and leaving the
+   * correction to a `refreshCounts` in a later transaction, would put a person with
+   * nothing in view back in both for as long as that recount failed to run.
    */
-  private async recomputeCentroids(tx: Tx, personIds: string[]): Promise<void> {
+  private async recomputeCentroids(tx: Tx, ownerId: string, personIds: string[]): Promise<void> {
     if (personIds.length === 0) return
     await tx.execute(sql`
-      update ${people} set
-        centroid = l2_normalize(counted.mean),
-        face_count = counted.total,
-        updated_at = now()
+      update ${people} set centroid = l2_normalize(counted.mean), updated_at = now()
       from (
-        select f.person_id, avg(f.embedding) as mean, count(*)::int as total
+        select f.person_id, avg(f.embedding) as mean
         from ${faces} f
-        where ${inArray(sql`f.person_id`, personIds)}
+        where f.owner_id = ${ownerId} and ${inArray(sql`f.person_id`, personIds)}
         group by f.person_id
       ) as counted
-      where ${people.id} = counted.person_id
+      where ${people.id} = counted.person_id and ${people.ownerId} = ${ownerId}
     `)
   }
 

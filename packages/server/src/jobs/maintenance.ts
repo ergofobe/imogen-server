@@ -122,7 +122,14 @@ export async function sweepTrash(deps: MaintenanceDeps): Promise<number> {
   // would strand the owners behind it, skip `removeEmptyTombstones`, and report a sweep
   // that in fact succeeded. The work is pure bookkeeping and self-healing: the next
   // sweep, or any trash or restore, recounts the same owner.
-  for (const ownerId of sweptOwners) await deps.faces.refreshFor(ownerId).catch(() => {})
+  // Logged rather than discarded in silence: self-healing only heals if some later sweep
+  // succeeds, and one that fails every hour leaves covers pointing at destroyed faces
+  // with nothing anywhere to say so.
+  for (const ownerId of sweptOwners) {
+    await deps.faces.refreshFor(ownerId).catch((error: unknown) => {
+      console.warn(`sweepTrash: recounting faces for ${ownerId} failed`, error)
+    })
+  }
 
   await removeEmptyTombstones(deps)
 
