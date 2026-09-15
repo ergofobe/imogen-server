@@ -260,6 +260,20 @@ describe('health and docs', () => {
     })
     // The same schema without a default of its own must not acquire one.
     expect(parameter('/api/v1/vault/timeline', 'covers')).toEqual({ type: 'boolean' })
+
+    /*
+     * The SDK-declared half of the same concept. These come from `AssetFilter`, whose
+     * `WireBoolean` is the SDK's bare union with no annotation on it, so without the
+     * `documentWireBooleans` call on this route they publish the four-branch `anyOf` and
+     * the document describes one idea two ways. This is also what catches a wire boolean
+     * the SDK adds later: a new one is not in the named list, so it lands here as an
+     * `anyOf` and this assertion is where that surfaces.
+     */
+    for (const name of ['favorite', 'archived', 'trashed']) {
+      expect(parameter('/api/v1/assets', name)).toEqual({ type: 'boolean' })
+    }
+    // The annotation is confined to those: it must not flatten its neighbours.
+    expect(parameter('/api/v1/assets', 'q')).toEqual({ type: 'string', maxLength: 512 })
   })
 
   /**

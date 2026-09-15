@@ -109,3 +109,48 @@ export const WireBoolean = z
    * JSON null.
    */
   .openapi({ type: 'boolean' })
+
+/**
+ * The same annotation, for the wire booleans this repository does *not* declare.
+ *
+ * `WireBoolean` above can only carry `.openapi()` to the two fields declared here. The
+ * SDK's own export is a bare union — it has no OpenAPI document to generate and so no
+ * reason to annotate — so the moment the pin picked up imogen-sdk#36, `favorite`,
+ * `archived` and `trashed` began publishing the four-branch `anyOf` that annotation
+ * exists to suppress, while the vault's `covers` went on publishing `boolean`. One
+ * concept, two shapes, in the same document.
+ *
+ * This re-annotates the SDK's own field schema rather than restating it: what is annotated
+ * is whatever `schema.shape[key]` already holds, optionality and parsing included. That
+ * matters — redeclaring these fields here would put a second copy of the contract in the
+ * repository that does not own it, which is the thing the comment above forbids. Metadata
+ * is not a declaration, and nothing about what the server accepts moves.
+ *
+ * `.meta()` and not `.openapi()`, which is the whole reason this is a function rather than
+ * three call sites. `.openapi()` is not part of zod: `@hono/zod-openapi` patches it onto
+ * the prototype when it is imported, so whether a schema built in *another* package has it
+ * depends on whether that import happened to run first. It does under `bun run`, and it
+ * does not part-way through a full `bun test`, where these same three fields threw
+ * `field.openapi is not a function`. `.meta()` is zod's own, is always there, and produces
+ * a byte-identical parameter schema.
+ *
+ * Named keys rather than sniffing the shape for unions: a guess at which fields are wire
+ * booleans would quietly start annotating the wrong ones. The cost is that a wire boolean
+ * added to the SDK later is not covered until it is named here, which is what the document
+ * assertion in `app.test.ts` is for.
+ */
+export function documentWireBooleans<T extends z.ZodObject<z.ZodRawShape>>(
+  schema: T,
+  ...keys: string[]
+): T {
+  const annotated = Object.fromEntries(
+    keys.map((key) => {
+      // `ZodObject`'s shape is typed as the base `$ZodType`, which is narrower than what
+      // it actually holds; every field here is a full zod schema.
+      const field = schema.shape[key] as z.ZodType | undefined
+      if (!field) throw new Error(`documentWireBooleans: ${key} is not a field of this schema`)
+      return [key, field.meta({ type: 'boolean' })]
+    }),
+  )
+  return schema.extend(annotated) as unknown as T
+}

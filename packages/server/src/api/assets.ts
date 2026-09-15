@@ -22,7 +22,14 @@ import { eq } from 'drizzle-orm'
 import { type AppEnv, requireAuth, requireScope } from '../auth/middleware.ts'
 import { assetFiles, assets } from '../db/schema.ts'
 import { badRequest, notFound } from '../lib/errors.ts'
-import { created, ERROR_RESPONSES, NO_CONTENT, ok, security } from './openapi.ts'
+import {
+  created,
+  documentWireBooleans,
+  ERROR_RESPONSES,
+  NO_CONTENT,
+  ok,
+  security,
+} from './openapi.ts'
 import { assertVaultAccess, vaultIsOpen } from './vault.ts'
 
 const IdParam = z.object({ id: z.uuid() })
@@ -40,7 +47,8 @@ export function createAssetRoutes() {
       summary: 'List and search photos and videos',
       security: security(),
       middleware: [requireScope('library:read')] as const,
-      request: { query: AssetQuery },
+      // Annotation only; see `documentWireBooleans`. `AssetQuery` is still what parses.
+      request: { query: documentWireBooleans(AssetQuery, 'favorite', 'archived', 'trashed') },
       responses: { ...ok(pageOf(Asset), 'A page of assets'), ...ERROR_RESPONSES },
     }),
     async (c) => {
