@@ -10,6 +10,7 @@ import { COVER_SAMPLE } from '../lib/batch.ts'
 import { CONTENT_HASH_SCHEME } from '../media/content-hash.ts'
 import { createServices } from '../services.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
+import { DocumentedAssetSelection } from './openapi.ts'
 
 const harness = await createTestDatabase()
 const config = createTestConfig({ publicUrl: 'http://localhost:3000' })
@@ -260,6 +261,74 @@ describe('health and docs', () => {
     })
     // The same schema without a default of its own must not acquire one.
     expect(parameter('/api/v1/vault/timeline', 'covers')).toEqual({ type: 'boolean' })
+
+    /*
+     * The SDK-declared half of the same concept. These come from `AssetFilter`, whose
+     * `WireBoolean` is the SDK's bare union with no annotation on it, so without the
+     * `documentWireBooleans` call on this route they publish the four-branch `anyOf` and
+     * the document describes one idea two ways. This is also what catches a wire boolean
+     * the SDK adds later: a new one is not in the named list, so it lands here as an
+     * `anyOf` and this assertion is where that surfaces.
+     */
+    for (const name of ['favorite', 'archived', 'trashed']) {
+      expect(parameter('/api/v1/assets', name)).toEqual({ type: 'boolean' })
+      expect(parameter('/api/v1/assets/timeline', name)).toEqual({ type: 'boolean' })
+      expect(parameter('/api/v1/assets/timeline/bucket', name)).toEqual({ type: 'boolean' })
+    }
+    /*
+     * `covers` is the one field the document describes on two routes at once — here from
+     * the SDK's `TimelineQuery`, and on `/vault/timeline` from the local `WireBoolean`.
+     * The same name must not be two shapes in one document.
+     */
+    expect(parameter('/api/v1/assets/timeline', 'covers')).toEqual({ type: 'boolean' })
+    // The annotation is confined to those: it must not flatten its neighbours.
+    expect(parameter('/api/v1/assets', 'q')).toEqual({ type: 'string', maxLength: 512 })
+  })
+
+  /*
+   * The same fields in a JSON body, which is the worse half: a query string at least has
+   * only text to offer, while a body advertising `""`, null and `"0"` as spellings for a
+   * boolean is telling a client to write one of those instead of `false`. `AssetFilter`
+   * reaches four documented paths through `AssetSelection.query`, and `AssetUploadMetadata`
+   * reaches the upload session body directly.
+   */
+  test('a wire boolean in a request body is published as a boolean too', async () => {
+    type Shape = { type?: string; properties?: Record<string, Shape> }
+    const doc = (await (await request('/api/v1/openapi.json')).json()) as {
+      paths: Record<
+        string,
+        { post?: { requestBody?: { content: { 'application/json': { schema: Shape } } } } }
+      >
+    }
+    const body = (path: string) =>
+      doc.paths[path]?.post?.requestBody?.content['application/json'].schema
+
+    for (const path of ['/api/v1/assets/trash', '/api/v1/assets/restore']) {
+      expect(body(path)?.properties?.query?.properties?.favorite).toEqual({ type: 'boolean' })
+      expect(body(path)?.properties?.query?.properties?.trashed).toEqual({ type: 'boolean' })
+    }
+    expect(body('/api/v1/uploads')?.properties?.favorite).toEqual({ type: 'boolean' })
+  })
+
+  /*
+   * `DocumentedAssetSelection` is what actually parses those six bodies, and it is built
+   * with `.safeExtend()` because plain `.extend()` drops the refinement that enforces
+   * exactly one of `assetIds` or `query`. Losing it would not fail loudly: a body carrying
+   * both `assetIds` and `except` would be accepted, and `selectionConditions` takes the
+   * `assetIds` branch without ever reading `except` — trashing precisely the photographs
+   * the caller asked to spare. So the refinement is asserted here rather than trusted to
+   * a zod release note.
+   */
+  test('the documented selection still refuses what the contract refuses', async () => {
+    const id = '00000000-0000-4000-8000-000000000001'
+
+    expect(DocumentedAssetSelection.safeParse({}).success).toBe(false)
+    expect(DocumentedAssetSelection.safeParse({ assetIds: [id], query: {} }).success).toBe(false)
+    expect(DocumentedAssetSelection.safeParse({ assetIds: [id] }).success).toBe(true)
+
+    // And the annotation did not cost the parsing: "false" is still read by its spelling.
+    const parsed = DocumentedAssetSelection.safeParse({ query: { trashed: 'false' } })
+    expect(parsed.success && parsed.data.query?.trashed).toBe(false)
   })
 
   /**

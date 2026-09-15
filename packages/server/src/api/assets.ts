@@ -4,7 +4,6 @@ import { createRoute, OpenAPIHono, z } from '@hono/zod-openapi'
 import {
   Asset,
   AssetQuery,
-  AssetSelection,
   AssetUpdate,
   AssetUploadMetadata,
   AssetUploadResult,
@@ -22,7 +21,15 @@ import { eq } from 'drizzle-orm'
 import { type AppEnv, requireAuth, requireScope } from '../auth/middleware.ts'
 import { assetFiles, assets } from '../db/schema.ts'
 import { badRequest, notFound } from '../lib/errors.ts'
-import { created, ERROR_RESPONSES, NO_CONTENT, ok, security } from './openapi.ts'
+import {
+  created,
+  DocumentedAssetSelection,
+  documentWireBooleans,
+  ERROR_RESPONSES,
+  NO_CONTENT,
+  ok,
+  security,
+} from './openapi.ts'
 import { assertVaultAccess, vaultIsOpen } from './vault.ts'
 
 const IdParam = z.object({ id: z.uuid() })
@@ -40,7 +47,9 @@ export function createAssetRoutes() {
       summary: 'List and search photos and videos',
       security: security(),
       middleware: [requireScope('library:read')] as const,
-      request: { query: AssetQuery },
+      // Annotation only; see `documentWireBooleans`. What parses is a clone of
+      // `AssetQuery` carrying document metadata — the fields, and their rules, are its own.
+      request: { query: documentWireBooleans(AssetQuery, 'favorite', 'archived', 'trashed') },
       responses: { ...ok(pageOf(Asset), 'A page of assets'), ...ERROR_RESPONSES },
     }),
     async (c) => {
@@ -58,7 +67,9 @@ export function createAssetRoutes() {
       summary: 'Per-day counts, so a client can size its scrollbar before loading anything',
       security: security(),
       middleware: [requireScope('library:read')] as const,
-      request: { query: TimelineQuery },
+      request: {
+        query: documentWireBooleans(TimelineQuery, 'favorite', 'archived', 'trashed', 'covers'),
+      },
       responses: {
         ...ok(z.object({ buckets: z.array(TimelineBucket) }), 'Day buckets, newest first'),
         ...ERROR_RESPONSES,
@@ -86,7 +97,9 @@ export function createAssetRoutes() {
         'from `GET /assets`.',
       security: security(),
       middleware: [requireScope('library:read')] as const,
-      request: { query: TimelineBucketQuery },
+      request: {
+        query: documentWireBooleans(TimelineBucketQuery, 'favorite', 'archived', 'trashed'),
+      },
       responses: { ...ok(pageOf(TimelineTile), 'A page of tiles'), ...ERROR_RESPONSES },
     }),
     async (c) => {
@@ -238,7 +251,7 @@ export function createAssetRoutes() {
       description: 'Reversible. Assets are destroyed only after the retention window.',
       security: security(),
       middleware: [requireScope('library:write')] as const,
-      request: { body: { content: { 'application/json': { schema: AssetSelection } } } },
+      request: { body: { content: { 'application/json': { schema: DocumentedAssetSelection } } } },
       responses: { ...ok(CountResult, 'How many moved'), ...ERROR_RESPONSES },
     }),
     async (c) => {
@@ -259,7 +272,7 @@ export function createAssetRoutes() {
       summary: 'Restore assets from the trash',
       security: security(),
       middleware: [requireScope('library:write')] as const,
-      request: { body: { content: { 'application/json': { schema: AssetSelection } } } },
+      request: { body: { content: { 'application/json': { schema: DocumentedAssetSelection } } } },
       responses: { ...ok(CountResult, 'How many restored'), ...ERROR_RESPONSES },
     }),
     async (c) => {

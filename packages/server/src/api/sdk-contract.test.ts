@@ -155,6 +155,24 @@ describe('uploading', () => {
     expect(events.at(-1)).toBeGreaterThan(0)
   })
 
+  /**
+   * The headline case of imogen-sdk#36, on the path that made it expensive.
+   * `AssetUploadMetadata.favorite` came off a multipart body, where the client writes
+   * `String(false)` — so an importer that set the flag honestly on every line favourited
+   * the entire library, and no value of the field could say otherwise. Asserting the
+   * `true` case alongside it keeps this a test of the spelling rather than of whether the
+   * field is wired up at all.
+   */
+  test('uploading with favorite=false does not favourite the photograph', async () => {
+    await signUp()
+
+    const plain = await client.assets.upload(await photo('plain.jpg'), { favorite: false })
+    const starred = await client.assets.upload(await photo('starred.jpg'), { favorite: true })
+
+    expect(plain.asset.favorite).toBe(false)
+    expect(starred.asset.favorite).toBe(true)
+  })
+
   test('recognises a duplicate instead of storing it twice', async () => {
     await signUp()
     const file = await photo()
@@ -271,6 +289,63 @@ describe('browsing', () => {
 
     expect(afterTrash.items).toHaveLength(11)
     expect(afterRestore.items).toHaveLength(12)
+  })
+
+  /**
+   * imogen-sdk#36, reached through the client that provokes it. `AssetFilter` read these
+   * flags with `z.coerce.boolean()`, which calls every non-empty string true, and the
+   * client writes the filter as `String(false)` — so `trashed=false` arrived as
+   * `trashed=true` and the request for everything *except* the trash answered with the
+   * trash alone, the exact inversion of what was asked for. `favorite=false` did the same.
+   *
+   * Every assertion names ids rather than counting. A count alone cannot fail for the
+   * right reason here: eleven is what a working filter returns, and also what a filter
+   * that was ignored altogether returns, since only one of the twelve is trashed. Both
+   * flags therefore mark exactly one photograph and then check that `false` excludes it
+   * and `true` returns it alone — which no amount of ignoring the parameter satisfies.
+   */
+  test('a false filter on the wire means false, not true', async () => {
+    await library()
+    const all = await client.assets.list({ limit: 100 })
+    const trashedId = all.items[0]!.id
+    const favoriteId = all.items[1]!.id
+    await client.assets.trash([trashedId])
+    await client.assets.update(favoriteId, { favorite: true })
+
+    const notTrashed = await client.assets.list({ limit: 100, trashed: false })
+    const trashed = await client.assets.list({ limit: 100, trashed: true })
+    const notFavorite = await client.assets.list({ limit: 100, favorite: false })
+    const favorite = await client.assets.list({ limit: 100, favorite: true })
+
+    expect(notTrashed.items.map((a) => a.id)).not.toContain(trashedId)
+    expect(notTrashed.items).toHaveLength(11)
+    // The true spelling still selects the trash, so this is a filter, not a no-op.
+    expect(trashed.items.map((a) => a.id)).toEqual([trashedId])
+
+    // The same schema, the other half of the defect. Under the bug `favorite=false`
+    // returned the favourite alone; ignoring it would return all eleven including it.
+    expect(notFavorite.items.map((a) => a.id)).not.toContain(favoriteId)
+    expect(notFavorite.items).toHaveLength(10)
+    expect(favorite.items.map((a) => a.id)).toEqual([favoriteId])
+  })
+
+  /**
+   * The third field the same union covers, on the route that reads it. `covers` decides
+   * whether a bucket carries a cover id at all, so under the bug asking for a timeline
+   * *without* covers built every cover — the expensive half of the query, silently on.
+   * `/vault/timeline` was never affected: its `covers` is declared in this repository and
+   * was fixed in imogen-server#101, which is why the vault suite did not catch this one.
+   */
+  test('covers=false on the timeline means no covers', async () => {
+    await library()
+
+    const without = await client.assets.timeline({ covers: false })
+    const with_ = await client.assets.timeline({ covers: true })
+
+    expect(without.buckets.length).toBeGreaterThan(0)
+    expect(without.buckets.every((b) => b.coverAssetId === null)).toBe(true)
+    // Asked for, they arrive — so the false case is a decision, not an empty library.
+    expect(with_.buckets.some((b) => b.coverAssetId !== null)).toBe(true)
   })
 
   test('builds a usable image URL', async () => {

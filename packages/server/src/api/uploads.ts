@@ -13,7 +13,7 @@ import { uploadSessions } from '../db/schema.ts'
 import { badRequest, conflict, notFound } from '../lib/errors.ts'
 import { claimExistingAsset } from '../media/identity.ts'
 import { toAsset } from '../media/serialize.ts'
-import { created, ERROR_RESPONSES, ok, security } from './openapi.ts'
+import { created, documentWireBooleans, ERROR_RESPONSES, ok, security } from './openapi.ts'
 
 const SESSION_TTL_HOURS = 24
 
@@ -40,7 +40,13 @@ export function createUploadRoutes() {
         'was in the trash is restored.',
       security: security(),
       middleware: [requireScope('library:write')] as const,
-      request: { body: { content: { 'application/json': { schema: UploadSessionCreate } } } },
+      request: {
+        body: {
+          content: {
+            'application/json': { schema: documentWireBooleans(UploadSessionCreate, 'favorite') },
+          },
+        },
+      },
       responses: { ...created(UploadSession, 'The upload session'), ...ERROR_RESPONSES },
     }),
     async (c) => {
