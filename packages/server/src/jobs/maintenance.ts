@@ -3,6 +3,7 @@ import type { SettingsService } from '../admin/settings.ts'
 import type { SessionService } from '../auth/sessions.ts'
 import type { Database } from '../db/index.ts'
 import { assetFiles, assets, uploadSessions, users } from '../db/schema.ts'
+import type { FaceService } from '../faces/faces.ts'
 import type { Config } from '../lib/config.ts'
 import type { LocalStorage } from '../media/storage.ts'
 import type { JobQueue } from './queue.ts'
@@ -18,6 +19,7 @@ export type MaintenanceDeps = {
   thumbnails: LocalStorage
   sessions: SessionService
   settings: SettingsService
+  faces: Pick<FaceService, 'refreshFor'>
 }
 
 export function registerMaintenanceJobs(queue: JobQueue, deps: MaintenanceDeps): void {
@@ -65,6 +67,7 @@ export async function sweepTrash(deps: MaintenanceDeps): Promise<number> {
     .limit(500)
 
   let swept = 0
+  const sweptOwners = new Set<string>()
 
   for (const asset of doomed) {
     // The batch above is a snapshot, and a restore can land while an earlier row is
@@ -91,6 +94,7 @@ export async function sweepTrash(deps: MaintenanceDeps): Promise<number> {
     if (!deleted) continue
 
     swept += 1
+    sweptOwners.add(asset.ownerId)
     await deps.db
       .update(users)
       .set({ usedBytes: sql`greatest(${users.usedBytes} - ${asset.sizeBytes}, 0)` })
@@ -103,6 +107,28 @@ export async function sweepTrash(deps: MaintenanceDeps): Promise<number> {
       const store = file.variant === 'original' ? deps.library : deps.thumbnails
       await store.remove(file.path).catch(() => {})
     }
+  }
+
+  // Destroying the row cascades its faces away, and a person can be left with none at
+  // all. This is the only moment that shows: trashing a photograph deliberately spares a
+  // person whose faces are merely out of sight, because deleting them would detach those
+  // faces for good and a restore would bring them back belonging to nobody. Once the
+  // photograph itself is gone there is nothing left to restore, so here they really do
+  // stop being a person. Once per owner, not per photograph — the sweep takes 500 at a
+  // time and each recount takes that owner's exclusive lock.
+  //
+  // Swallowed per owner, because by now every deletion has committed. That lock is the
+  // one this codebase has watched time out under an import, and letting it fail the job
+  // would strand the owners behind it, skip `removeEmptyTombstones`, and report a sweep
+  // that in fact succeeded. The work is pure bookkeeping and self-healing: the next
+  // sweep, or any trash or restore, recounts the same owner.
+  // Logged rather than discarded in silence: self-healing only heals if some later sweep
+  // succeeds, and one that fails every hour leaves covers pointing at destroyed faces
+  // with nothing anywhere to say so.
+  for (const ownerId of sweptOwners) {
+    await deps.faces.refreshFor(ownerId).catch((error: unknown) => {
+      console.warn(`sweepTrash: recounting faces for ${ownerId} failed`, error)
+    })
   }
 
   await removeEmptyTombstones(deps)

@@ -90,7 +90,7 @@ export function createServices(config: Config, database?: Database): Services {
     // up the thumbnail appearing in the timeline.
     if (await faces.isEnabled()) await queue.enqueue(FACE_DETECT_JOB, { assetId })
   })
-  registerMaintenanceJobs(queue, { db, config, library, thumbnails, sessions, settings })
+  registerMaintenanceJobs(queue, { db, config, library, thumbnails, sessions, settings, faces })
   registerFaceJobs(queue, { db, faces, models, queue })
   registerContentHashJobs(queue, { db, storage: library })
   // Registered but never scheduled: see `jobs/repair.ts` for why these wait to be asked.

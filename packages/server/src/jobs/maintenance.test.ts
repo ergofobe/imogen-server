@@ -31,8 +31,9 @@ class HookedStorage extends LocalStorage {
   }
 }
 
-function makeDeps(): MaintenanceDeps & { library: HookedStorage } {
+function makeDeps(): MaintenanceDeps & { library: HookedStorage; recounted: string[] } {
   const library = new HookedStorage(config.libraryDir)
+  const recounted: string[] = []
   return {
     db,
     config,
@@ -40,6 +41,12 @@ function makeDeps(): MaintenanceDeps & { library: HookedStorage } {
     thumbnails: new LocalStorage(config.thumbsDir),
     sessions: new SessionService(db),
     settings: new SettingsService(db, { allowSignup: true, trashRetentionDays: 30 }),
+    recounted,
+    faces: {
+      refreshFor: async (ownerId: string) => {
+        recounted.push(ownerId)
+      },
+    },
   }
 }
 
@@ -148,6 +155,72 @@ describe('sweepTrash', () => {
     expect(await assetById(doomed.id)).toBeUndefined()
     expect(await exists(deps, doomed.originalPath)).toBe(false)
     expect(await usedBytesOf(owner.id)).toBe(600)
+  })
+
+  /**
+   * Trashing a photograph spares a person whose faces are only on it — deleting them
+   * would detach those faces for good, and a restore would bring the face back belonging
+   * to nobody. Destroying the photograph removes that reason, and nothing else would
+   * notice, so the sweep is what finally clears them. Once per owner: it takes 500
+   * photographs at a time and each recount takes that owner's exclusive lock.
+   */
+  test('recounts each owner it destroyed a photograph for, exactly once', async () => {
+    const owner = await makeUser(1000)
+    const other = await makeUser(1000)
+    const deps = makeDeps()
+    for (const asset of [
+      await makeTrashedAsset(owner.id, 31, 100),
+      await makeTrashedAsset(owner.id, 33, 100),
+      await makeTrashedAsset(other.id, 32, 100),
+    ]) {
+      await deps.library.write(asset.originalPath, 'bytes')
+    }
+
+    expect(await sweepTrash(deps)).toBe(3)
+
+    expect(deps.recounted.toSorted()).toEqual([owner.id, other.id].toSorted())
+  })
+
+  /**
+   * The deletions have already committed by the time the recount runs, and it takes the
+   * owner's advisory lock — the one this codebase has watched time out under an import.
+   * A failure there must not strand the owners behind it or report a sweep that worked
+   * as a failure.
+   */
+  test('finishes the sweep when an owner’s recount fails', async () => {
+    const owner = await makeUser(1000)
+    const other = await makeUser(1000)
+    const deps = makeDeps()
+    for (const asset of [
+      await makeTrashedAsset(owner.id, 33, 100),
+      await makeTrashedAsset(other.id, 31, 100),
+    ]) {
+      await deps.library.write(asset.originalPath, 'bytes')
+    }
+    const failing = {
+      ...deps,
+      faces: {
+        refreshFor: async (ownerId: string) => {
+          deps.recounted.push(ownerId)
+          if (ownerId === owner.id) throw new Error('canceling statement due to lock timeout')
+        },
+      },
+    }
+
+    expect(await sweepTrash(failing)).toBe(2)
+
+    expect(deps.recounted.toSorted()).toEqual([owner.id, other.id].toSorted())
+  })
+
+  test('recounts nobody when it destroyed nothing', async () => {
+    const owner = await makeUser(1000)
+    const recent = await makeTrashedAsset(owner.id, 3, 400)
+    const deps = makeDeps()
+    await deps.library.write(recent.originalPath, 'bytes')
+
+    expect(await sweepTrash(deps)).toBe(0)
+
+    expect(deps.recounted).toBeEmpty()
   })
 
   test('leaves an asset still inside the retention window alone', async () => {

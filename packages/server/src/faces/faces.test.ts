@@ -10,7 +10,7 @@ import type { Database } from '../db/index.ts'
 import { assets, faces, people, users } from '../db/schema.ts'
 import { COVER_SAMPLE } from '../lib/batch.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
-import { CLUSTER } from './cluster.ts'
+import { CLUSTER, cosine } from './cluster.ts'
 import { FaceService } from './faces.ts'
 import { ModelStore } from './models.ts'
 
@@ -122,7 +122,13 @@ async function addBareAsset(overrides: Partial<typeof assets.$inferInsert> = {})
   return row!
 }
 
-async function addFace(assetId: string, personId: string, faceOwnerId = ownerId, score = 0.9) {
+async function addFace(
+  assetId: string,
+  personId: string,
+  faceOwnerId = ownerId,
+  score = 0.9,
+  embedding: number[] = Array(512).fill(0),
+) {
   const [row] = await db
     .insert(faces)
     .values({
@@ -134,10 +140,33 @@ async function addFace(assetId: string, personId: string, faceOwnerId = ownerId,
       width: 10,
       height: 10,
       score,
-      embedding: Array(512).fill(0),
+      embedding,
     })
     .returning({ id: faces.id })
   return row!.id
+}
+
+/**
+ * A unit embedding pointing along one axis. Two of them are orthogonal, so a centroid
+ * built from a known set of them can be asserted on by value rather than by trusting
+ * that some function was called.
+ */
+function unit(axis: number): number[] {
+  const v = Array(512).fill(0)
+  v[axis] = 1
+  return v
+}
+
+/** The mean of unit vectors on distinct axes, normalised — what a centroid over them is. */
+function meanOf(axes: number[]): number[] {
+  const v = Array(512).fill(0)
+  for (const axis of axes) v[axis] = 1 / Math.sqrt(axes.length)
+  return v
+}
+
+async function personRow(id: string) {
+  const [row] = await db.select().from(people).where(eq(people.id, id))
+  return row
 }
 
 /** Races work against a deadline so a regression fails the test rather than wedging it. */
@@ -298,7 +327,7 @@ describe('recounting a named set of people', () => {
     expect(counted?.faceCount).toBe(1)
   })
 
-  test('still deletes a named person left with no visible faces', async () => {
+  test('still deletes a named person left with no faces at all', async () => {
     const [emptied] = await db.insert(people).values({ ownerId, name: 'Emptied' }).returning()
     const [kept] = await db.insert(people).values({ ownerId, name: 'Kept' }).returning()
     const asset = await addBareAsset()
@@ -326,7 +355,7 @@ describe('recounting a named set of people', () => {
     expect(await db.select().from(people).where(eq(people.id, orphan!.id))).toHaveLength(1)
   })
 
-  test('counts no vaulted or trashed photo, and deletes a person left with only those', async () => {
+  test('counts no vaulted or trashed photo, and keeps the person who is only in those', async () => {
     const visible = await addBareAsset()
     const vaulted = await addBareAsset({ vaultedAt: new Date() })
     const trashed = await addBareAsset({ deletedAt: new Date() })
@@ -341,8 +370,10 @@ describe('recounting a named set of people', () => {
 
     const [counted] = await db.select().from(people).where(eq(people.id, person!.id))
     expect(counted?.faceCount).toBe(1)
-    // Every photograph they appeared in is gone from view, so they are too.
-    expect(await db.select().from(people).where(eq(people.id, hidden!.id))).toBeEmpty()
+    // Out of sight is not gone: the grouping is still there to come back to.
+    const [survivor] = await db.select().from(people).where(eq(people.id, hidden!.id))
+    expect(survivor?.faceCount).toBe(0)
+    expect(survivor?.coverFaceId).toBeNull()
   })
 
   /**
@@ -439,6 +470,171 @@ describe('recounting a named set of people', () => {
  * Holding the lock elsewhere and watching the recount wait is the deterministic version
  * of that: a deadlock itself is a race, but "does not run concurrently" is not.
  */
+/**
+ * `faces.person_id` is `on delete set null`, so deleting a person does not merely tidy
+ * up a row — it silently unassigns every face still pointing at them. A recount can only
+ * see visible photographs, so a person whose remaining faces all sit in the vault or the
+ * trash looked empty and was deleted, and restoring the photograph afterwards brought the
+ * face back belonging to nobody. The grouping was never wrong; the recount was blind.
+ *
+ * So deletion is driven by "has no faces at all" while the count stays "has no faces I
+ * can see" — the two questions are different and were being answered by the same join.
+ */
+describe('a person whose photographs are all out of sight', () => {
+  test('survives the recount, keeps its faces, and comes back on restore', async () => {
+    const trashed = await addBareAsset({ deletedAt: new Date() })
+    const [person] = await db.insert(people).values({ ownerId, name: 'Away' }).returning()
+    const faceId = await addFace(trashed.id, person!.id)
+
+    await service.refreshCounts(ownerId)
+
+    expect((await personRow(person!.id))?.faceCount).toBe(0)
+    const [face] = await db.select().from(faces).where(eq(faces.id, faceId))
+    expect(face?.personId).toBe(person!.id)
+
+    await db.update(assets).set({ deletedAt: null }).where(eq(assets.id, trashed.id))
+    await service.refreshFor(ownerId)
+
+    const restored = await personRow(person!.id)
+    expect(restored?.faceCount).toBe(1)
+    expect(restored?.coverFaceId).toBe(faceId)
+  })
+
+  /**
+   * Kept is not the same as offered. `listPeople` has always filtered on the count, and
+   * search is the other way in: a name that answers with a photograph the owner has put
+   * out of sight is the vault leaking through the search box.
+   */
+  test('is not offered by a search for their name', async () => {
+    const trashed = await addBareAsset({ deletedAt: new Date() })
+    const [person] = await db.insert(people).values({ ownerId, name: 'Away' }).returning()
+    await addFace(trashed.id, person!.id)
+
+    await service.refreshCounts(ownerId)
+
+    expect(await personRow(person!.id)).toBeDefined()
+    expect(await service.listPeople(ownerId)).toBeEmpty()
+    expect(await service.findPeopleByName(ownerId, 'away')).toBeEmpty()
+  })
+
+  test('is deleted only once it has no faces left anywhere', async () => {
+    const vaulted = await addBareAsset({ vaultedAt: new Date() })
+    const [person] = await db.insert(people).values({ ownerId, name: 'Vaulted' }).returning()
+    await addFace(vaulted.id, person!.id)
+
+    await service.refreshCounts(ownerId)
+    expect(await personRow(person!.id)).toBeDefined()
+
+    // Vaulting deletes the faces themselves, which is what actually ends a person.
+    await service.forgetAssets([vaulted.id], ownerId)
+
+    expect(await personRow(person!.id)).toBeUndefined()
+  })
+})
+
+/**
+ * Correcting a misgrouping has to take the mistake out of both means. `reassignFaces`
+ * recomputed only the destination, so every person a face was moved *off* kept that
+ * face's embedding in its centroid and went on attracting faces it no longer contained.
+ *
+ * Asserted on the value rather than on a call: orthogonal unit embeddings make the mean
+ * something the test can spell out, and a stale one is visibly a different vector.
+ */
+describe('reassigning faces away from a person', () => {
+  /** Anna on two axes, Bea on a third; the face on axis 1 is the one that moves. */
+  async function misgrouped() {
+    const asset = await addBareAsset()
+    const [anna] = await db
+      .insert(people)
+      .values({ ownerId, name: 'Anna', centroid: meanOf([0, 1]), faceCount: 2 })
+      .returning()
+    const [bea] = await db
+      .insert(people)
+      .values({ ownerId, name: 'Bea', centroid: unit(2), faceCount: 1 })
+      .returning()
+    await addFace(asset.id, anna!.id, ownerId, 0.9, unit(0))
+    const moving = await addFace(asset.id, anna!.id, ownerId, 0.8, unit(1))
+    await addFace(asset.id, bea!.id, ownerId, 0.7, unit(2))
+    return { annaId: anna!.id, beaId: bea!.id, moving }
+  }
+
+  /**
+   * `mergePeople` and `reassignFaces` both commit their transaction and then recount in
+   * a second one, which takes the owner's exclusive lock — the lock this codebase has
+   * watched time out under an import. Since the count now gates the People list and
+   * search, whatever the first transaction leaves behind has to stand on its own: a
+   * survivor holding three visible photographs must not read as empty because the
+   * recount never ran.
+   */
+  test('leaves a merge survivor visible when the recount afterwards fails', async () => {
+    const trashed = await addBareAsset({ deletedAt: new Date() })
+    const visible = await addBareAsset()
+    const [keep] = await db.insert(people).values({ ownerId, name: 'Keep' }).returning()
+    const [gone] = await db.insert(people).values({ ownerId, name: 'Gone' }).returning()
+    await addFace(trashed.id, keep!.id, ownerId, 0.9, unit(0))
+    await addFace(visible.id, gone!.id, ownerId, 0.9, unit(0))
+
+    await service.refreshCounts(ownerId)
+    expect((await personRow(keep!.id))?.faceCount).toBe(0)
+
+    const recounts = spyOn(service, 'refreshCounts').mockImplementation(() => {
+      throw new Error('canceling statement due to lock timeout')
+    })
+    try {
+      await expect(service.mergePeople(ownerId, keep!.id, [gone!.id])).rejects.toThrow()
+    } finally {
+      recounts.mockRestore()
+    }
+
+    expect((await personRow(keep!.id))?.faceCount).toBe(1)
+    expect((await service.listPeople(ownerId)).map((p) => p.id)).toContain(keep!.id)
+  })
+
+  test('recomputes the source centroid, not only the destination', async () => {
+    const { annaId, beaId, moving } = await misgrouped()
+
+    await service.reassignFaces(ownerId, [moving], beaId)
+
+    const anna = (await personRow(annaId))?.centroid as number[]
+    expect(anna[0]).toBeCloseTo(1, 5)
+    // Unfixed, Anna's mean still leans on the axis of the face she no longer has.
+    expect(anna[1]).toBeCloseTo(0, 5)
+
+    const bea = (await personRow(beaId))?.centroid as number[]
+    expect(bea[1]).toBeCloseTo(Math.SQRT1_2, 5)
+    expect(bea[2]).toBeCloseTo(Math.SQRT1_2, 5)
+  })
+
+  test('recomputes the source centroid when the face is unassigned entirely', async () => {
+    const { annaId, moving } = await misgrouped()
+
+    await service.reassignFaces(ownerId, [moving], null)
+
+    const anna = (await personRow(annaId))?.centroid as number[]
+    expect(anna[0]).toBeCloseTo(1, 5)
+    expect(anna[1]).toBeCloseTo(0, 5)
+  })
+
+  test('recomputes every source when the faces come from more than one person', async () => {
+    const { annaId, beaId, moving } = await misgrouped()
+    const asset = await addBareAsset()
+    const [cass] = await db
+      .insert(people)
+      .values({ ownerId, name: 'Cass', centroid: meanOf([3, 4]), faceCount: 2 })
+      .returning()
+    await addFace(asset.id, cass!.id, ownerId, 0.9, unit(3))
+    const alsoMoving = await addFace(asset.id, cass!.id, ownerId, 0.8, unit(4))
+
+    await service.reassignFaces(ownerId, [moving, alsoMoving], beaId)
+
+    const anna = (await personRow(annaId))?.centroid as number[]
+    expect(anna[1]).toBeCloseTo(0, 5)
+    const cassAfter = (await personRow(cass!.id))?.centroid as number[]
+    expect(cassAfter[3]).toBeCloseTo(1, 5)
+    expect(cassAfter[4]).toBeCloseTo(0, 5)
+  })
+})
+
 describe('recounting under concurrency', () => {
   test('recounting waits for the same per-owner lock that files a face', async () => {
     const asset = await addBareAsset()
@@ -1113,6 +1309,37 @@ describe.skipIf(!canRun)('repairing a photograph that lost its faces', () => {
 })
 
 describe.skipIf(!canRun)('grouping faces into people', () => {
+  /**
+   * A person whose photographs are all in the trash is kept, but their *visible* count
+   * is zero — and the running mean is not a function of what is visible. Read as the
+   * size of the mean, a count of nothing says "brand new person", and `updateCentroid`
+   * then throws away an identity built from every earlier photograph and replaces it
+   * with the single face being filed. The count the arithmetic needs is how many faces
+   * the person actually has.
+   */
+  test('a person out of sight keeps their mean when a new face joins them', async () => {
+    const first = await addPhoto('person-a.png')
+    const second = await addPhoto('person-a.png', (i) => i.modulate({ brightness: 1.3 }))
+    for (const asset of [first, second]) await service.processAsset(asset.id)
+    const [person] = await service.listPeople(ownerId)
+
+    await db.update(assets).set({ deletedAt: new Date() }).where(eq(assets.ownerId, ownerId))
+    await service.refreshFor(ownerId)
+    expect((await personRow(person!.id))?.faceCount).toBe(0)
+
+    const third = await addPhoto('person-a.png', (i) => i.rotate(8, { background: '#fff' }))
+    await service.processAsset(third.id)
+
+    const [joined] = await db.select().from(faces).where(eq(faces.assetId, third.id))
+    expect(joined?.personId).toBe(person!.id)
+
+    // Unfixed, the mean *is* the face just filed, to the last bit. Fixed, it is a blend
+    // of three, so it cannot be.
+    const after = new Float32Array((await personRow(person!.id))!.centroid as number[])
+    const filed = new Float32Array(joined!.embedding as number[])
+    expect(cosine(after, filed) / Math.sqrt(cosine(filed, filed))).toBeLessThan(0.999)
+  })
+
   test('groups the same person photographed differently', async () => {
     const a = await addPhoto('person-a.png')
     const b = await addPhoto('person-a.png', (i) => i.modulate({ brightness: 1.3 }))
