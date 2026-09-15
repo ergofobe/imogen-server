@@ -116,7 +116,13 @@ export async function sweepTrash(deps: MaintenanceDeps): Promise<number> {
   // photograph itself is gone there is nothing left to restore, so here they really do
   // stop being a person. Once per owner, not per photograph — the sweep takes 500 at a
   // time and each recount takes that owner's exclusive lock.
-  for (const ownerId of sweptOwners) await deps.faces.refreshFor(ownerId)
+  //
+  // Swallowed per owner, because by now every deletion has committed. That lock is the
+  // one this codebase has watched time out under an import, and letting it fail the job
+  // would strand the owners behind it, skip `removeEmptyTombstones`, and report a sweep
+  // that in fact succeeded. The work is pure bookkeeping and self-healing: the next
+  // sweep, or any trash or restore, recounts the same owner.
+  for (const ownerId of sweptOwners) await deps.faces.refreshFor(ownerId).catch(() => {})
 
   await removeEmptyTombstones(deps)
 

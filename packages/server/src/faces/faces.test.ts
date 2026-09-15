@@ -10,7 +10,7 @@ import type { Database } from '../db/index.ts'
 import { assets, faces, people, users } from '../db/schema.ts'
 import { COVER_SAMPLE } from '../lib/batch.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
-import { CLUSTER } from './cluster.ts'
+import { CLUSTER, cosine } from './cluster.ts'
 import { FaceService } from './faces.ts'
 import { ModelStore } from './models.ts'
 
@@ -1277,6 +1277,37 @@ describe.skipIf(!canRun)('repairing a photograph that lost its faces', () => {
 })
 
 describe.skipIf(!canRun)('grouping faces into people', () => {
+  /**
+   * A person whose photographs are all in the trash is kept, but their *visible* count
+   * is zero — and the running mean is not a function of what is visible. Read as the
+   * size of the mean, a count of nothing says "brand new person", and `updateCentroid`
+   * then throws away an identity built from every earlier photograph and replaces it
+   * with the single face being filed. The count the arithmetic needs is how many faces
+   * the person actually has.
+   */
+  test('a person out of sight keeps their mean when a new face joins them', async () => {
+    const first = await addPhoto('person-a.png')
+    const second = await addPhoto('person-a.png', (i) => i.modulate({ brightness: 1.3 }))
+    for (const asset of [first, second]) await service.processAsset(asset.id)
+    const [person] = await service.listPeople(ownerId)
+
+    await db.update(assets).set({ deletedAt: new Date() }).where(eq(assets.ownerId, ownerId))
+    await service.refreshFor(ownerId)
+    expect((await personRow(person!.id))?.faceCount).toBe(0)
+
+    const third = await addPhoto('person-a.png', (i) => i.rotate(8, { background: '#fff' }))
+    await service.processAsset(third.id)
+
+    const [joined] = await db.select().from(faces).where(eq(faces.assetId, third.id))
+    expect(joined?.personId).toBe(person!.id)
+
+    // Unfixed, the mean *is* the face just filed, to the last bit. Fixed, it is a blend
+    // of three, so it cannot be.
+    const after = new Float32Array((await personRow(person!.id))!.centroid as number[])
+    const filed = new Float32Array(joined!.embedding as number[])
+    expect(cosine(after, filed) / Math.sqrt(cosine(filed, filed))).toBeLessThan(0.999)
+  })
+
   test('groups the same person photographed differently', async () => {
     const a = await addPhoto('person-a.png')
     const b = await addPhoto('person-a.png', (i) => i.modulate({ brightness: 1.3 }))

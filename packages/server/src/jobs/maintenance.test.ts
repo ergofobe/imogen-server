@@ -181,6 +181,37 @@ describe('sweepTrash', () => {
     expect(deps.recounted.toSorted()).toEqual([owner.id, other.id].toSorted())
   })
 
+  /**
+   * The deletions have already committed by the time the recount runs, and it takes the
+   * owner's advisory lock — the one this codebase has watched time out under an import.
+   * A failure there must not strand the owners behind it or report a sweep that worked
+   * as a failure.
+   */
+  test('finishes the sweep when an owner’s recount fails', async () => {
+    const owner = await makeUser(1000)
+    const other = await makeUser(1000)
+    const deps = makeDeps()
+    for (const asset of [
+      await makeTrashedAsset(owner.id, 33, 100),
+      await makeTrashedAsset(other.id, 31, 100),
+    ]) {
+      await deps.library.write(asset.originalPath, 'bytes')
+    }
+    const failing = {
+      ...deps,
+      faces: {
+        refreshFor: async (ownerId: string) => {
+          deps.recounted.push(ownerId)
+          if (ownerId === owner.id) throw new Error('canceling statement due to lock timeout')
+        },
+      },
+    }
+
+    expect(await sweepTrash(failing)).toBe(2)
+
+    expect(deps.recounted.toSorted()).toEqual([owner.id, other.id].toSorted())
+  })
+
   test('recounts nobody when it destroyed nothing', async () => {
     const owner = await makeUser(1000)
     const recent = await makeTrashedAsset(owner.id, 3, 400)

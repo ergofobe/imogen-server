@@ -231,7 +231,7 @@ export class FaceService {
     if (!row.personId) return
 
     const [person] = await tx
-      .select({ centroid: people.centroid, faceCount: people.faceCount })
+      .select({ centroid: people.centroid })
       .from(people)
       .where(eq(people.id, row.personId))
       .limit(1)
@@ -239,7 +239,7 @@ export class FaceService {
 
     const centroid = replaceInCentroid(
       person.centroid ? new Float32Array(person.centroid as number[]) : null,
-      person.faceCount,
+      await this.centroidSize(tx, row.personId),
       new Float32Array(row.embedding as number[]),
       embedding,
     )
@@ -455,6 +455,9 @@ export class FaceService {
     const centroid = new Float32Array(person.centroid as number[])
     if (!bestMatch(filing.embedding, [{ id: personId, centroid }])) return null
 
+    // Counted before the new face goes in, so it is the size of the mean being moved.
+    const size = await this.centroidSize(tx, personId)
+
     // Clustering agrees with the human: this is their face, found somewhere new. Each
     // orphaned row is taken once, so a second detection of the same person moves the
     // next one rather than the same one twice.
@@ -464,7 +467,7 @@ export class FaceService {
       return personId
     }
 
-    const moved = updateCentroid(centroid, person.faceCount, filing.embedding)
+    const moved = updateCentroid(centroid, size, filing.embedding)
     await tx
       .update(people)
       .set({
@@ -475,6 +478,25 @@ export class FaceService {
       .where(eq(people.id, personId))
     await this.insertFace(tx, filing, personId)
     return personId
+  }
+
+  /**
+   * How many faces a person's mean is built from.
+   *
+   * Counted rather than read from `people.face_count`, which is the figure the library
+   * *shows* and counts only photographs the owner can see. The mean is built from every
+   * face they have, vaulted and trashed included — a person whose photographs are all
+   * out of sight keeps both — so the shown figure drifts from it, and at zero it does
+   * worse than drift: `updateCentroid` reads a count of nothing as a brand new person and
+   * replaces a mean built from fifty faces with the single face being filed. The count
+   * is one index lookup against work already dominated by detection and embedding.
+   */
+  private async centroidSize(tx: Tx, personId: string): Promise<number> {
+    const [row] = await tx
+      .select({ total: sql<number>`count(*)::int` })
+      .from(faces)
+      .where(eq(faces.personId, personId))
+    return row?.total ?? 0
   }
 
   private insertFace(tx: Tx, filing: Filing, personId: string): Promise<unknown> {
@@ -670,7 +692,7 @@ export class FaceService {
         .returning({ id: faces.id })
 
       await tx.delete(people).where(inArray(people.id, others))
-      await this.recomputeCentroid(keepId, tx)
+      await this.recomputeCentroids(tx, [keepId])
       return rows.length
     })
 
@@ -717,7 +739,7 @@ export class FaceService {
         .where(and(eq(faces.ownerId, ownerId), inArray(faces.id, faceIds)))
 
       const touched = new Set(personId ? [...sources, personId] : sources)
-      for (const id of touched) await this.recomputeCentroid(id, tx)
+      await this.recomputeCentroids(tx, [...touched])
     })
 
     await this.refreshCounts(ownerId)
@@ -742,34 +764,34 @@ export class FaceService {
     return row !== undefined
   }
 
-  private async recomputeCentroid(personId: string, tx: Tx): Promise<void> {
-    const rows = await tx
-      .select({ embedding: faces.embedding })
-      .from(faces)
-      .where(eq(faces.personId, personId))
-    if (rows.length === 0) return
-
-    const dimensions = 512
-    const mean = new Float32Array(dimensions)
-    for (const row of rows) {
-      const v = row.embedding as number[]
-      for (let i = 0; i < dimensions; i++) mean[i]! += v[i]!
-    }
-    let norm = 0
-    for (let i = 0; i < dimensions; i++) {
-      mean[i]! /= rows.length
-      norm += mean[i]! * mean[i]!
-    }
-    norm = Math.sqrt(norm) || 1
-
-    await tx
-      .update(people)
-      .set({
-        centroid: Array.from(mean, (v) => v / norm),
-        faceCount: rows.length,
-        updatedAt: new Date(),
-      })
-      .where(eq(people.id, personId))
+  /**
+   * Rebuilds people's means from the faces they actually have, exactly rather than by
+   * the running approximation `updateCentroid` maintains.
+   *
+   * One statement for the whole set, computed in the database. Reading the embeddings
+   * back to average them in JavaScript is 512 floats per face over the wire, for every
+   * person named — and this runs inside a lock that a filing is waiting on, so the size
+   * of the hold is the cost. `avg` is pgvector's own aggregate and `l2_normalize` is the
+   * final divide the JavaScript did.
+   *
+   * A person with no faces left is not named by the grouping and so is left alone: their
+   * mean stops meaning anything, but the recount that follows every caller deletes them.
+   */
+  private async recomputeCentroids(tx: Tx, personIds: string[]): Promise<void> {
+    if (personIds.length === 0) return
+    await tx.execute(sql`
+      update ${people} set
+        centroid = l2_normalize(counted.mean),
+        face_count = counted.total,
+        updated_at = now()
+      from (
+        select f.person_id, avg(f.embedding) as mean, count(*)::int as total
+        from ${faces} f
+        where ${inArray(sql`f.person_id`, personIds)}
+        group by f.person_id
+      ) as counted
+      where ${people.id} = counted.person_id
+    `)
   }
 
   /**
