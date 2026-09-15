@@ -1,4 +1,4 @@
-import type { z } from '@hono/zod-openapi'
+import { z } from '@hono/zod-openapi'
 import { ApiError } from '@imogen/shared'
 
 /** The response envelope every failing endpoint shares, described once. */
@@ -35,3 +35,57 @@ export const security = (): Array<Record<string, string[]>> => [
   { sessionCookie: [] },
   { oauth2: [] },
 ]
+
+/**
+ * A boolean as a query string can carry it, which is to say as text.
+ *
+ * `z.coerce.boolean()` reads such a field by JavaScript truthiness, where every string but
+ * the empty one is true. So `"false"` — which is exactly what every SDK port writes, since
+ * each one defaults the flag to false and then *sends* it — came back as `true`, and
+ * `GET /people?includeHidden=false` answered with the hidden people. Somebody who hid a
+ * person had them shown to every client anyway (imogen-server#100).
+ *
+ * The spelling is the contract instead. `1` and `0` are taken as well because they are the
+ * other spelling a hand-written client reaches for; a native checkbox's own `on` is not,
+ * since a form posting one would have to be told what `value` to send in any case. An
+ * unrecognised spelling is refused rather than guessed at — a rejected request is a bug
+ * report, a silently listed hidden person is not.
+ *
+ * This mirrors `WireBoolean` in `@imogen/shared`, which landed on imogen-sdk `main` after
+ * the `v0.5.0` tag this repository is pinned to (imogen-sdk#36). These schemas are declared
+ * server-side, so that fix does not reach them and neither would moving the pin. Kept
+ * identical so it can be swapped for the SDK's export, once pinned, without a behaviour
+ * change — including the JSON-shaped branches a query string cannot itself produce.
+ *
+ * No type is exported alongside it. Every branch that carries no opinion parses to
+ * `undefined`, so the inferred type is `boolean | undefined` — a name a caller would
+ * reasonably read as a plain boolean and be wrong about.
+ */
+export const WireBoolean = z
+  .union([
+    z.boolean(),
+    /*
+     * The two ways a field arrives carrying no opinion: present but empty, which is how
+     * `?covers=` comes from a link built with no query at all, and an explicit null. Both
+     * parse to `undefined` — the same as never having been sent, rather than as `false`,
+     * which for a filter means something of its own. Refusing them instead would turn a
+     * link with an empty parameter into a 400.
+     *
+     * Note what `.default()` then does to that: zod re-applies a default to an `undefined`
+     * *output*, not just to an absent input, so `WireBoolean.default(x)` reads an empty
+     * value as `x`. That is why `includeHidden` defaults to `false` and not to `true` — a
+     * `.default(true)` here would quietly turn `?flag=`, the case that carries no opinion,
+     * into an opinion. Use `.optional()` where undefined has to survive.
+     */
+    z.literal('').transform(() => undefined),
+    z.null().transform(() => undefined),
+    z.enum(['true', 'false', '1', '0']).transform((value) => value === 'true' || value === '1'),
+  ])
+  /*
+   * The document keeps saying `boolean` while the parser stays strict. Without this the
+   * generated `openapi.json` — a published artifact, and what the reference page and any
+   * generated client read — advertises a four-branch `anyOf`, two branches of which a
+   * query string cannot produce at all. A reader should not be told this parameter takes
+   * JSON null.
+   */
+  .openapi({ type: 'boolean' })

@@ -14,7 +14,7 @@ import { FACE_DETECT_JOB } from '../jobs/faces.ts'
 import { badRequest, forbidden } from '../lib/errors.ts'
 import type { Services } from '../services.ts'
 import { asHttpError } from '../vault/vault.ts'
-import { ERROR_RESPONSES, NO_CONTENT, ok, security } from './openapi.ts'
+import { ERROR_RESPONSES, NO_CONTENT, ok, security, WireBoolean } from './openapi.ts'
 
 export const VAULT_COOKIE = 'imogen_vault'
 
@@ -229,7 +229,7 @@ export function createVaultRoutes() {
       tags: ['Vault'],
       summary: 'One row per day in the vault, for sizing the grid before tiles arrive',
       security: security(),
-      request: { query: z.object({ covers: z.coerce.boolean().optional() }) },
+      request: { query: z.object({ covers: WireBoolean.optional() }) },
       responses: {
         ...ok(z.object({ buckets: z.array(TimelineBucket) }), 'Day counts, newest first'),
         ...ERROR_RESPONSES,
