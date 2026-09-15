@@ -141,7 +141,9 @@ export const WireBoolean = z
  */
 export function documentWireBooleans<T extends z.ZodObject<z.ZodRawShape>>(
   schema: T,
-  ...keys: string[]
+  // Constrained to the schema's own keys, so an SDK that renames or drops one of these
+  // fails `bun run verify` rather than booting a server that throws on the first route.
+  ...keys: Array<keyof T['shape'] & string>
 ): T {
   const annotated = Object.fromEntries(
     keys.map((key) => {

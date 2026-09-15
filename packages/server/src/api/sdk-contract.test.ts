@@ -280,27 +280,35 @@ describe('browsing', () => {
    * `trashed=true` and the request for everything *except* the trash answered with the
    * trash alone, the exact inversion of what was asked for. `favorite=false` did the same.
    *
-   * The assertion is deliberately not `toHaveLength(11)` alone: the count the bug produced
-   * was 1, but a filter that was simply ignored would also return 11, and that is a
-   * different server from the one this is meant to pin. Naming the ids distinguishes them
-   * — an ignored filter would let the trashed photograph back into the list.
+   * Every assertion names ids rather than counting. A count alone cannot fail for the
+   * right reason here: eleven is what a working filter returns, and also what a filter
+   * that was ignored altogether returns, since only one of the twelve is trashed. Both
+   * flags therefore mark exactly one photograph and then check that `false` excludes it
+   * and `true` returns it alone — which no amount of ignoring the parameter satisfies.
    */
   test('a false filter on the wire means false, not true', async () => {
     await library()
     const all = await client.assets.list({ limit: 100 })
     const trashedId = all.items[0]!.id
+    const favoriteId = all.items[1]!.id
     await client.assets.trash([trashedId])
+    await client.assets.update(favoriteId, { favorite: true })
 
     const notTrashed = await client.assets.list({ limit: 100, trashed: false })
     const trashed = await client.assets.list({ limit: 100, trashed: true })
     const notFavorite = await client.assets.list({ limit: 100, favorite: false })
+    const favorite = await client.assets.list({ limit: 100, favorite: true })
 
     expect(notTrashed.items.map((a) => a.id)).not.toContain(trashedId)
     expect(notTrashed.items).toHaveLength(11)
     // The true spelling still selects the trash, so this is a filter, not a no-op.
     expect(trashed.items.map((a) => a.id)).toEqual([trashedId])
-    // The same schema, the other half of the defect: no photograph here is a favourite.
-    expect(notFavorite.items).toHaveLength(11)
+
+    // The same schema, the other half of the defect. Under the bug `favorite=false`
+    // returned the favourite alone; ignoring it would return all eleven including it.
+    expect(notFavorite.items.map((a) => a.id)).not.toContain(favoriteId)
+    expect(notFavorite.items).toHaveLength(10)
+    expect(favorite.items.map((a) => a.id)).toEqual([favoriteId])
   })
 
   test('builds a usable image URL', async () => {
