@@ -273,6 +273,36 @@ describe('browsing', () => {
     expect(afterRestore.items).toHaveLength(12)
   })
 
+  /**
+   * imogen-sdk#36, reached through the client that provokes it. `AssetFilter` read these
+   * flags with `z.coerce.boolean()`, which calls every non-empty string true, and the
+   * client writes the filter as `String(false)` — so `trashed=false` arrived as
+   * `trashed=true` and the request for everything *except* the trash answered with the
+   * trash alone, the exact inversion of what was asked for. `favorite=false` did the same.
+   *
+   * The assertion is deliberately not `toHaveLength(11)` alone: the count the bug produced
+   * was 1, but a filter that was simply ignored would also return 11, and that is a
+   * different server from the one this is meant to pin. Naming the ids distinguishes them
+   * — an ignored filter would let the trashed photograph back into the list.
+   */
+  test('a false filter on the wire means false, not true', async () => {
+    await library()
+    const all = await client.assets.list({ limit: 100 })
+    const trashedId = all.items[0]!.id
+    await client.assets.trash([trashedId])
+
+    const notTrashed = await client.assets.list({ limit: 100, trashed: false })
+    const trashed = await client.assets.list({ limit: 100, trashed: true })
+    const notFavorite = await client.assets.list({ limit: 100, favorite: false })
+
+    expect(notTrashed.items.map((a) => a.id)).not.toContain(trashedId)
+    expect(notTrashed.items).toHaveLength(11)
+    // The true spelling still selects the trash, so this is a filter, not a no-op.
+    expect(trashed.items.map((a) => a.id)).toEqual([trashedId])
+    // The same schema, the other half of the defect: no photograph here is a favourite.
+    expect(notFavorite.items).toHaveLength(11)
+  })
+
   test('builds a usable image URL', async () => {
     await library()
     const page = await client.assets.list({ limit: 1 })

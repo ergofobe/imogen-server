@@ -51,21 +51,26 @@ export const security = (): Array<Record<string, string[]>> => [
  * unrecognised spelling is refused rather than guessed at — a rejected request is a bug
  * report, a silently listed hidden person is not.
  *
- * This mirrors `WireBoolean` in `@imogen/shared`, which landed on imogen-sdk `main` after
- * the `v0.5.0` tag this repository is pinned to (imogen-sdk#36). It is a local copy only
- * because the two schemas that use it — `includeHidden` here and the vault's `covers` —
- * are declared in this repository, so the SDK's fix cannot reach them however the pin
- * moves. Kept identical so they can be swapped for the SDK's export once it is pinned,
- * without a behaviour change — including the JSON-shaped branches a query string cannot
- * itself produce.
+ * This mirrors `WireBoolean` in `@imogen/shared` (imogen-sdk#36), which the pin now
+ * carries, so the SDK-declared booleans — `favorite`, `archived` and `trashed` on
+ * `AssetFilter`, `covers` on `TimelineQuery`, `AssetUploadMetadata.favorite` — read by
+ * their spelling too. This copy survives that pin move rather than deferring to the
+ * export, for two reasons, and both would be lost in the swap:
  *
- * It does NOT cover this server's other wire booleans, which come from the pinned SDK and
- * are still `z.coerce.boolean()` at v0.5.0: `favorite`, `archived` and `trashed` on
- * `AssetFilter`, `covers` on `TimelineQuery` (so `GET /timeline` and the share timeline
- * disagree with `/vault/timeline` until the pin moves), and `AssetUploadMetadata.favorite`,
- * where an upload sent `favorite=false` is favourited. Those are fixed on SDK `main`; the
- * fix here is a pin move, which is its own PR. Do not paper over them by redeclaring the
- * SDK's fields locally — the contract lives in `@imogen/shared`, not here.
+ * - The custom union message. The SDK's is a bare `z.union`, so a refusal there reads
+ *   "Invalid input", naming none of the spellings that would have worked. Zod cannot
+ *   retrofit a message onto an already-built union, so keeping it means building the
+ *   union here.
+ * - The `.openapi({ type: 'boolean' })` below. The SDK carries no such annotation — it
+ *   has no OpenAPI document to generate — and without it the published schema advertises
+ *   a four-branch `anyOf`.
+ *
+ * The parse semantics are identical either way, which is the point: the two schemas that
+ * use this — `includeHidden` here and the vault's `covers` — are declared in this
+ * repository, and they must not disagree with the SDK's fields about what `false` means.
+ * If the SDK ever grows the message and an annotation hook, this becomes a re-export. Do
+ * not go the other way and redeclare the SDK's own fields here — the contract lives in
+ * `@imogen/shared`, not here.
  *
  * No type is exported alongside it. Every branch that carries no opinion parses to
  * `undefined`, so the inferred type is `boolean | undefined` — a name a caller would
