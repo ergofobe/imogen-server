@@ -284,6 +284,31 @@ describe('health and docs', () => {
     expect(parameter('/api/v1/assets', 'q')).toEqual({ type: 'string', maxLength: 512 })
   })
 
+  /*
+   * The same fields in a JSON body, which is the worse half: a query string at least has
+   * only text to offer, while a body advertising `""`, null and `"0"` as spellings for a
+   * boolean is telling a client to write one of those instead of `false`. `AssetFilter`
+   * reaches four documented paths through `AssetSelection.query`, and `AssetUploadMetadata`
+   * reaches the upload session body directly.
+   */
+  test('a wire boolean in a request body is published as a boolean too', async () => {
+    type Shape = { type?: string; properties?: Record<string, Shape> }
+    const doc = (await (await request('/api/v1/openapi.json')).json()) as {
+      paths: Record<
+        string,
+        { post?: { requestBody?: { content: { 'application/json': { schema: Shape } } } } }
+      >
+    }
+    const body = (path: string) =>
+      doc.paths[path]?.post?.requestBody?.content['application/json'].schema
+
+    for (const path of ['/api/v1/assets/trash', '/api/v1/assets/restore']) {
+      expect(body(path)?.properties?.query?.properties?.favorite).toEqual({ type: 'boolean' })
+      expect(body(path)?.properties?.query?.properties?.trashed).toEqual({ type: 'boolean' })
+    }
+    expect(body('/api/v1/uploads')?.properties?.favorite).toEqual({ type: 'boolean' })
+  })
+
   /**
    * `AssetSelection` carries a `.refine`, which makes it a `ZodEffects` rather than a
    * plain `ZodObject` — a shape `@hono/zod-openapi` could plausibly flatten to a

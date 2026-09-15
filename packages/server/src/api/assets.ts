@@ -4,7 +4,6 @@ import { createRoute, OpenAPIHono, z } from '@hono/zod-openapi'
 import {
   Asset,
   AssetQuery,
-  AssetSelection,
   AssetUpdate,
   AssetUploadMetadata,
   AssetUploadResult,
@@ -24,6 +23,7 @@ import { assetFiles, assets } from '../db/schema.ts'
 import { badRequest, notFound } from '../lib/errors.ts'
 import {
   created,
+  DocumentedAssetSelection,
   documentWireBooleans,
   ERROR_RESPONSES,
   NO_CONTENT,
@@ -250,7 +250,7 @@ export function createAssetRoutes() {
       description: 'Reversible. Assets are destroyed only after the retention window.',
       security: security(),
       middleware: [requireScope('library:write')] as const,
-      request: { body: { content: { 'application/json': { schema: AssetSelection } } } },
+      request: { body: { content: { 'application/json': { schema: DocumentedAssetSelection } } } },
       responses: { ...ok(CountResult, 'How many moved'), ...ERROR_RESPONSES },
     }),
     async (c) => {
@@ -271,7 +271,7 @@ export function createAssetRoutes() {
       summary: 'Restore assets from the trash',
       security: security(),
       middleware: [requireScope('library:write')] as const,
-      request: { body: { content: { 'application/json': { schema: AssetSelection } } } },
+      request: { body: { content: { 'application/json': { schema: DocumentedAssetSelection } } } },
       responses: { ...ok(CountResult, 'How many restored'), ...ERROR_RESPONSES },
     }),
     async (c) => {

@@ -1,5 +1,5 @@
 import { z } from '@hono/zod-openapi'
-import { ApiError } from '@imogen/shared'
+import { ApiError, AssetFilter, AssetSelection } from '@imogen/shared'
 
 /** The response envelope every failing endpoint shares, described once. */
 const errorContent = { 'application/json': { schema: ApiError } }
@@ -156,3 +156,22 @@ export function documentWireBooleans<T extends z.ZodObject<z.ZodRawShape>>(
   )
   return schema.extend(annotated) as unknown as T
 }
+
+/**
+ * `AssetSelection` with the wire booleans of its nested filter annotated.
+ *
+ * The same three fields as the query routes, reached through `AssetSelection.query`,
+ * which is `AssetFilter` — so without this the bodies of the six bulk-mutation routes
+ * (assets trash and restore, the two album ones, the two vault ones) advertise `""`,
+ * JSON null and `"0"`/`"1"` as spellings for a boolean in a *JSON* body, where a client
+ * has real booleans to hand and should be told to write one.
+ *
+ * `.safeExtend()` and not `.extend()`: zod refuses the latter outright on an object
+ * carrying refinements, and `AssetSelection` carries the one that enforces exactly one of
+ * `assetIds` or `query`. The refinement survives `.safeExtend()` — verified against the
+ * real schema before this was written, message included — which is the only reason this
+ * is a safe thing to do to a contract schema rather than a rewrite of it.
+ */
+export const DocumentedAssetSelection = AssetSelection.safeExtend({
+  query: documentWireBooleans(AssetFilter, 'favorite', 'archived', 'trashed').optional(),
+})

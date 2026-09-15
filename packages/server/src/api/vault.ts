@@ -1,12 +1,5 @@
 import { createRoute, OpenAPIHono, z } from '@hono/zod-openapi'
-import {
-  Asset,
-  AssetSelection,
-  pageOf,
-  TimelineBucket,
-  TimelineBucketQuery,
-  TimelineTile,
-} from '@imogen/shared'
+import { Asset, pageOf, TimelineBucket, TimelineBucketQuery, TimelineTile } from '@imogen/shared'
 import type { Context } from 'hono'
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie'
 import { type AppEnv, requireAuth } from '../auth/middleware.ts'
@@ -14,7 +7,14 @@ import { FACE_DETECT_JOB } from '../jobs/faces.ts'
 import { badRequest, forbidden } from '../lib/errors.ts'
 import type { Services } from '../services.ts'
 import { asHttpError } from '../vault/vault.ts'
-import { ERROR_RESPONSES, NO_CONTENT, ok, security, WireBoolean } from './openapi.ts'
+import {
+  DocumentedAssetSelection,
+  ERROR_RESPONSES,
+  NO_CONTENT,
+  ok,
+  security,
+  WireBoolean,
+} from './openapi.ts'
 
 export const VAULT_COOKIE = 'imogen_vault'
 
@@ -275,7 +275,7 @@ export function createVaultRoutes() {
       summary: 'Move photos into the vault',
       description: 'They leave every album on the way in, since an album can be shared.',
       security: security(),
-      request: { body: { content: { 'application/json': { schema: AssetSelection } } } },
+      request: { body: { content: { 'application/json': { schema: DocumentedAssetSelection } } } },
       responses: {
         ...ok(z.object({ moved: z.number().int().nonnegative() }), 'How many moved'),
         ...ERROR_RESPONSES,
@@ -306,7 +306,7 @@ export function createVaultRoutes() {
       description:
         'Takes an explicit id list only. A filter cannot select photos still in the vault.',
       security: security(),
-      request: { body: { content: { 'application/json': { schema: AssetSelection } } } },
+      request: { body: { content: { 'application/json': { schema: DocumentedAssetSelection } } } },
       responses: {
         ...ok(z.object({ moved: z.number().int().nonnegative() }), 'How many moved back'),
         ...ERROR_RESPONSES,

@@ -5,12 +5,18 @@ import {
   AlbumCreate,
   AlbumUpdate,
   AlbumWithAssets,
-  AssetSelection,
   ShareLink,
   ShareLinkCreate,
 } from '@imogen/shared'
 import { type AppEnv, requireAuth, requireScope } from '../auth/middleware.ts'
-import { created, ERROR_RESPONSES, NO_CONTENT, ok, security } from './openapi.ts'
+import {
+  created,
+  DocumentedAssetSelection,
+  ERROR_RESPONSES,
+  NO_CONTENT,
+  ok,
+  security,
+} from './openapi.ts'
 
 const IdParam = z.object({ id: z.uuid() })
 
@@ -132,7 +138,7 @@ export function createAlbumRoutes() {
       middleware: [requireScope('albums:write')] as const,
       request: {
         params: IdParam,
-        body: { content: { 'application/json': { schema: AssetSelection } } },
+        body: { content: { 'application/json': { schema: DocumentedAssetSelection } } },
       },
       responses: { ...ok(AlbumAssetsResult, 'What changed'), ...ERROR_RESPONSES },
     }),
@@ -155,7 +161,7 @@ export function createAlbumRoutes() {
       middleware: [requireScope('albums:write')] as const,
       request: {
         params: IdParam,
-        body: { content: { 'application/json': { schema: AssetSelection } } },
+        body: { content: { 'application/json': { schema: DocumentedAssetSelection } } },
       },
       responses: {
         ...ok(z.object({ removed: z.number().int().nonnegative() }), 'How many were removed'),
