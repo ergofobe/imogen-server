@@ -239,6 +239,29 @@ describe('health and docs', () => {
     expect(Object.keys(doc.components.securitySchemes)).toContain('oauth2')
   })
 
+  /*
+   * imogen-server#100. `WireBoolean` is a four-branch union so that it can read a boolean
+   * by its spelling, but the document a reader and a generated client see should say
+   * `boolean` — not an `anyOf` two of whose branches a query string cannot produce, and
+   * one of which looks like an offer to send JSON null. That is what the `.openapi()`
+   * override on it buys, and the override is invisible at runtime: nothing but this
+   * notices if a zod or @hono/zod-openapi upgrade stops honouring it.
+   */
+  test('a wire boolean is published as a boolean, with its default intact', async () => {
+    const doc = (await (await request('/api/v1/openapi.json')).json()) as {
+      paths: Record<string, { get?: { parameters?: Array<{ name: string; schema: unknown }> } }>
+    }
+    const parameter = (path: string, name: string) =>
+      doc.paths[path]?.get?.parameters?.find((p) => p.name === name)?.schema
+
+    expect(parameter('/api/v1/people', 'includeHidden')).toEqual({
+      type: 'boolean',
+      default: false,
+    })
+    // The same schema without a default of its own must not acquire one.
+    expect(parameter('/api/v1/vault/timeline', 'covers')).toEqual({ type: 'boolean' })
+  })
+
   /**
    * `AssetSelection` carries a `.refine`, which makes it a `ZodEffects` rather than a
    * plain `ZodObject` — a shape `@hono/zod-openapi` could plausibly flatten to a

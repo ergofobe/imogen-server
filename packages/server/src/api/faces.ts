@@ -84,7 +84,14 @@ export function createFaceRoutes() {
       summary: 'Everyone the library has grouped',
       security: security(),
       middleware: [requireScope('library:read')] as const,
-      request: { query: z.object({ includeHidden: WireBoolean.default(false) }) },
+      request: {
+        query: z.object({
+          // The `.openapi()` on WireBoolean replaces the whole generated schema, taking
+          // the default with it, so the default is restated here — where it belongs
+          // anyway, since `covers` shares the schema and has no default of its own.
+          includeHidden: WireBoolean.default(false).openapi({ type: 'boolean', default: false }),
+        }),
+      },
       responses: {
         ...ok(z.object({ items: z.array(Person) }), 'People, most photographed first'),
         ...ERROR_RESPONSES,
