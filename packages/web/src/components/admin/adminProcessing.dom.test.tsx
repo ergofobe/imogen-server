@@ -72,6 +72,7 @@ mock.module('../../lib/client.ts', () => ({
 afterEach(() => {
   answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
   repairsAnswer = () => Promise.resolve(REPAIRS)
+  started.length = 0
 })
 
 /** The client behind the panel most recently rendered, for a test that drives a refetch. */
@@ -295,6 +296,29 @@ describe('the repairs list when a later poll fails', () => {
 
     const text = container.textContent ?? ''
     expect(text).toMatch(/repairs could not be read/i)
+    expect(text).toMatch(/21,802 to examine/)
+  })
+})
+
+/**
+ * The queue failing must not take the repairs with it.
+ *
+ * `<Repairs>` used to be rendered only inside the queue query's success branch, so one
+ * failed `GET /api/v1/admin/queue` unmounted it — the #89 symptom reached through the
+ * other door, and worse during a pass than at rest: a queued repair job puts the queue's
+ * own interval down to three seconds, so any one of twenty polls a minute took the
+ * Repairs controls off the screen until the next one succeeded. A banner cannot report
+ * anything from a component that is not mounted.
+ */
+describe('the repairs list when the queue above it cannot be read', () => {
+  test('stays on screen while the queue reports its own failure', async () => {
+    answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+    repairsAnswer = () => Promise.resolve(REPAIRS)
+
+    const container = await panelShowing(/21,802 to examine/)
+
+    const text = container.textContent ?? ''
+    expect(text).toMatch(/queue could not be read/i)
     expect(text).toMatch(/21,802 to examine/)
   })
 })

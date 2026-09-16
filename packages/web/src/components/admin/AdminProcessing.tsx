@@ -36,26 +36,36 @@ export function AdminProcessing() {
 
   // A skeleton here would be a lie: this panel is the only place a stalled pipeline shows
   // up, so when it cannot be read it has to say so rather than go on pulsing. See #71.
+  //
+  // Returned as a sibling of the repairs below rather than in place of them. The queue
+  // and the repairs are read by separate queries that fail separately, and while a pass
+  // is walking this one polls every three seconds — so letting its failure return early
+  // took the repair controls off the screen twenty times a minute, which is #89 again
+  // through the other door.
   if (isError || !data) {
     return (
-      <section className="rounded-xl border border-red-500/40 p-4">
-        <h2 className="heading-display text-xl">Processing</h2>
-        <p className="mt-1 text-sm text-red-500">
-          The queue could not be read, so there is no telling whether photographs are being worked
-          through.
-        </p>
-        <pre className="mt-3 overflow-x-auto rounded-lg bg-sunken p-3 font-mono text-[12px] leading-relaxed text-muted">
-          {errorText(error)}
-        </pre>
-        <button
-          type="button"
-          onClick={() => void refetch()}
-          disabled={isFetching}
-          className="mt-3 rounded-lg border border-line px-3 py-1.5 text-sm transition hover:bg-sunken disabled:opacity-50"
-        >
-          {isFetching ? 'Asking' : 'Try again'}
-        </button>
-      </section>
+      <div className="space-y-8">
+        <section className="rounded-xl border border-red-500/40 p-4">
+          <h2 className="heading-display text-xl">Processing</h2>
+          <p className="mt-1 text-sm text-red-500">
+            The queue could not be read, so there is no telling whether photographs are being worked
+            through.
+          </p>
+          <pre className="mt-3 overflow-x-auto rounded-lg bg-sunken p-3 font-mono text-[12px] leading-relaxed text-muted">
+            {errorText(error)}
+          </pre>
+          <button
+            type="button"
+            onClick={() => void refetch()}
+            disabled={isFetching}
+            className="mt-3 rounded-lg border border-line px-3 py-1.5 text-sm transition hover:bg-sunken disabled:opacity-50"
+          >
+            {isFetching ? 'Asking' : 'Try again'}
+          </button>
+        </section>
+
+        <Repairs onStarted={refresh} />
+      </div>
     )
   }
 
@@ -263,8 +273,10 @@ function Repairs({ onStarted }: { onStarted: () => void }) {
  * Exported because this function *is* #89. It used to read `data` alone: after a failed
  * poll `data` is undefined, so it returned `false`, and with `retry: false` above nothing
  * ever asked again — one transient 500 left the query errored for the life of the page.
- * A failure therefore gets the same cadence a running pass gets, so the panel heals on
- * its own for an administrator who has walked away from the tab.
+ * A failure therefore gets the same cadence a running pass gets, and the panel heals on
+ * its own rather than waiting to be remounted. Only while the tab is in front, mind:
+ * `refetchIntervalInBackground` is false by default, so an administrator who has walked
+ * away is brought up to date by `refetchOnWindowFocus` when they come back, not by this.
  *
  * A quiet list is still not polled. What the interval waits for is a pass finishing — the
  * state going back to `done` and the button returning — not the count, which for the
