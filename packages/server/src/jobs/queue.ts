@@ -1,4 +1,4 @@
-import { and, eq, lte, sql } from 'drizzle-orm'
+import { and, eq, inArray, lte, sql } from 'drizzle-orm'
 import type { Database } from '../db/index.ts'
 import { jobs } from '../db/schema.ts'
 
@@ -90,6 +90,51 @@ export class JobQueue {
       })
       .returning({ id: jobs.id })
     return row!.id
+  }
+
+  /**
+   * Enqueues unless a job of the same name is already waiting or in flight. Answers with
+   * the new job's id, or null when one was already there.
+   *
+   * For the walks that schedule themselves at boot. A restart during one leaves its
+   * `{after: X}` job `queued` -- `reclaimStale` only ever looks at `running` rows -- and
+   * an unconditional boot-time enqueue put a fresh `{}` beside it. Both then ran, and the
+   * fresh one re-ran the whole library from the start: hours of ONNX detection on every
+   * restart that landed mid-walk (#92).
+   *
+   * The name is the whole of the identity, so a chain's own re-enqueue must not come
+   * through here -- it runs while its own row is `running` and would refuse to continue.
+   *
+   * Under an advisory lock rather than a bare check-then-insert: the rows being counted
+   * are ones that do not exist yet, so there is nothing to take a row lock on, and two
+   * servers booting together would both read an empty queue.
+   */
+  async enqueueUnique(
+    name: string,
+    payload: Record<string, unknown>,
+    options: { runAt?: Date; maxAttempts?: number } = {},
+  ): Promise<string | null> {
+    return this.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`jobs:enqueue:${name}`}))`)
+
+      const [pending] = await tx
+        .select({ id: jobs.id })
+        .from(jobs)
+        .where(and(eq(jobs.name, name), inArray(jobs.status, ['queued', 'running'])))
+        .limit(1)
+      if (pending) return null
+
+      const [row] = await tx
+        .insert(jobs)
+        .values({
+          name,
+          payload,
+          runAt: options.runAt ?? sql`now()`,
+          maxAttempts: options.maxAttempts ?? 5,
+        })
+        .returning({ id: jobs.id })
+      return row!.id
+    })
   }
 
   start(): void {

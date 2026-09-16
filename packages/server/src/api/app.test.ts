@@ -4,7 +4,7 @@ import { eq, sql } from 'drizzle-orm'
 import sharp from 'sharp'
 import manifest from '../../package.json'
 import { createApp } from '../app.ts'
-import { createDatabase } from '../db/index.ts'
+import { createDatabase, type Database } from '../db/index.ts'
 import { albumAssets, assets, users } from '../db/schema.ts'
 import { COVER_SAMPLE } from '../lib/batch.ts'
 import { CONTENT_HASH_SCHEME } from '../media/content-hash.ts'
@@ -192,6 +192,49 @@ async function siblingOf(
     })
     .returning({ id: assets.id })
   return inserted!.id
+}
+
+/** What drizzle hands a transaction body, so a test can take row locks inside one. */
+type Transaction = Parameters<Parameters<Database['transaction']>[0]>[0]
+
+/**
+ * Applies `change` in its own transaction and leaves it open, so the row locks it took
+ * are still held when this returns. Awaiting the result commits.
+ *
+ * This is what makes a lost race reproducible rather than a matter of timing: a claim
+ * that reaches the same row blocks on the lock instead of racing for it, and the test
+ * says when the other side commits.
+ */
+async function heldOpen(change: (tx: Transaction) => Promise<unknown>) {
+  let commit!: () => void
+  const held = new Promise<void>((resolve) => {
+    commit = resolve
+  })
+  let applied!: () => void
+  const isApplied = new Promise<void>((resolve) => {
+    applied = resolve
+  })
+
+  let failure: unknown
+  const transaction = harness.db.transaction(async (tx) => {
+    try {
+      await change(tx)
+    } catch (error) {
+      // Held rather than thrown here: a rejection would leave the caller waiting on a
+      // transaction that is never going to apply anything, and the test would hang
+      // instead of reporting the failure. It is re-thrown from the commit below.
+      failure = error
+    }
+    applied()
+    await held
+  })
+  await isApplied
+
+  return async () => {
+    commit()
+    await transaction
+    if (failure !== undefined) throw failure
+  }
 }
 
 describe('health and docs', () => {
@@ -689,6 +732,82 @@ describe('uploading', () => {
     expect(second.asset.id).toBe(first.asset.id)
     expect(second.asset.deletedAt).toBeNull()
     expect(await deletedAtOf(first.asset.id)).toBeNull()
+  })
+
+  test('a restore that lands mid-claim answers duplicate rather than a unique violation', async () => {
+    // The claim selects the trashed row, then brings it back. A row somebody else had
+    // restored in between used to read exactly like a row the sweep had destroyed, so
+    // the claim answered "no match", the ingest fell through to an INSERT, and the owner
+    // got a 500 off `assets_owner_checksum_key` where the answer was a tidy
+    // `duplicate: true` (#93).
+    const { cookie } = await signUp()
+    const photo = await makePhoto()
+    const first = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
+    await jsonRequest('/api/v1/assets/trash', 'POST', { assetIds: [first.asset.id] }, cookie)
+
+    // Somebody else's restore, holding the row and not yet committed.
+    const commitRestore = await heldOpen((tx) =>
+      tx.update(assets).set({ deletedAt: null }).where(eq(assets.id, first.asset.id)),
+    )
+
+    let settled = false
+    const reupload = upload(cookie, photo).then((response) => {
+      settled = true
+      return response
+    })
+    try {
+      await Bun.sleep(250)
+      // The claim has selected the trashed row and is now waiting on that same row.
+      expect(settled).toBe(false)
+    } finally {
+      // Always commit: a failed assertion would otherwise leave the transaction open and
+      // wedge the truncate in `beforeEach`.
+      await commitRestore()
+    }
+
+    const response = await reupload
+    const second = (await response.json()) as { asset: { id: string }; duplicate: boolean }
+
+    expect(response.status).toBe(200)
+    expect(second.duplicate).toBe(true)
+    expect(second.asset.id).toBe(first.asset.id)
+    expect(await deletedAtOf(first.asset.id)).toBeNull()
+    expect((await harness.db.select({ id: assets.id }).from(assets)).length).toBe(1)
+  })
+
+  test('a sweep that destroys the row mid-claim stores the photograph afresh', async () => {
+    // The other half of the same window, and the one the claim's guard was there for: a
+    // row the retention sweep has destroyed cannot be answered as a duplicate, because
+    // there is nothing left to point at. The row's absence is what says so -- the sweep
+    // deletes rather than marks -- so the claim reads it without the guard that could not
+    // tell this case from the one above.
+    const { cookie } = await signUp()
+    const photo = await makePhoto()
+    const first = (await (await upload(cookie, photo)).json()) as { asset: { id: string } }
+    await jsonRequest('/api/v1/assets/trash', 'POST', { assetIds: [first.asset.id] }, cookie)
+
+    const commitSweep = await heldOpen((tx) =>
+      tx.delete(assets).where(eq(assets.id, first.asset.id)),
+    )
+
+    let settled = false
+    const reupload = upload(cookie, photo).then((response) => {
+      settled = true
+      return response
+    })
+    try {
+      await Bun.sleep(250)
+      expect(settled).toBe(false)
+    } finally {
+      await commitSweep()
+    }
+
+    const response = await reupload
+    const second = (await response.json()) as { asset: { id: string }; duplicate: boolean }
+
+    expect(response.status).toBe(201)
+    expect(second.duplicate).toBe(false)
+    expect(second.asset.id).not.toBe(first.asset.id)
   })
 
   test('a metadata-rewritten twin of a trashed photograph restores it too', async () => {

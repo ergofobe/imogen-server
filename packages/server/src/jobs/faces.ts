@@ -147,6 +147,10 @@ export function assetsWithFaces(db: Database, limit: number, after: string | nul
  * faces before the fix keeps them until something goes looking. There is no point looking
  * before face grouping is on and the models have arrived — a server that enables it later
  * picks the pass up at its next boot.
+ *
+ * `enqueueUnique`, because the walk that a restart interrupted is still in the queue and
+ * will carry on from where it stopped. A second one beside it would re-run detection over
+ * the whole library from the start, which is the expensive half of #92.
  */
 export async function scheduleFaceRepair(
   queue: JobQueue,
@@ -158,8 +162,7 @@ export async function scheduleFaceRepair(
 
   if (await isDone(db, REPAIR_DONE_KEY)) return false
 
-  await queue.enqueue(FACE_REPAIR_JOB, {})
-  return true
+  return (await queue.enqueueUnique(FACE_REPAIR_JOB, {})) !== null
 }
 
 /**

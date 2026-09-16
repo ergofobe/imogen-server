@@ -70,6 +70,54 @@ describe('running jobs', () => {
   })
 })
 
+/**
+ * The primitive the boot-time walks schedule themselves with. A walk that a restart
+ * interrupted is still in the queue and resumes on its own; a second one enqueued beside
+ * it walks the same library again from the start (#92).
+ */
+describe('enqueueing one job of a name at a time', () => {
+  test('enqueues when nothing of that name is pending', async () => {
+    const queue = makeQueue()
+
+    const id = await queue.enqueueUnique('walk', {})
+
+    expect(id).not.toBeNull()
+    expect(await db.select().from(jobs).where(eq(jobs.name, 'walk'))).toHaveLength(1)
+  })
+
+  test('refuses while one is queued or running, whatever payload it carries', async () => {
+    const queue = makeQueue()
+    await queue.enqueue('walk', { after: 'asset-40' })
+
+    expect(await queue.enqueueUnique('walk', {})).toBeNull()
+
+    await db
+      .update(jobs)
+      .set({ status: 'running', startedAt: new Date() })
+      .where(eq(jobs.name, 'walk'))
+    expect(await queue.enqueueUnique('walk', {})).toBeNull()
+    expect(await db.select().from(jobs).where(eq(jobs.name, 'walk'))).toHaveLength(1)
+  })
+
+  test('enqueues again once the last one has finished', async () => {
+    const queue = makeQueue()
+    queue.register('walk', async () => {})
+    await queue.enqueueUnique('walk', {})
+    await queue.drain()
+
+    // A walk that ran to the end must not block the next rule change from starting one.
+    expect(await queue.enqueueUnique('walk', {})).not.toBeNull()
+    expect(await db.select().from(jobs).where(eq(jobs.name, 'walk'))).toHaveLength(2)
+  })
+
+  test('ignores a pending job of another name', async () => {
+    const queue = makeQueue()
+    await queue.enqueue('other', {})
+
+    expect(await queue.enqueueUnique('walk', {})).not.toBeNull()
+  })
+})
+
 describe('failure handling', () => {
   test('requeues a failed job with a backoff instead of losing it', async () => {
     const queue = makeQueue()

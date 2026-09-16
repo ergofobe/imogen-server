@@ -12,7 +12,11 @@ export type AssetRow = typeof assets.$inferSelect
 
 export type ExistingAsset = {
   row: AssetRow
-  /** The match was in the trash and has just been brought back. */
+  /**
+   * The match was in the trash when this claim looked at it, and is live now. True as
+   * well when a concurrent caller was the one that brought it back: it drives a face
+   * recount, and that is owed either way.
+   */
   restored: boolean
   /**
    * The caller holds the photograph's own bytes -- the checksum or the content hash --
@@ -84,15 +88,27 @@ export async function claimExistingAsset(
     (keys.contentHash != null && row.contentHash === keys.contentHash)
   if (!row.deletedAt) return { row, restored: false, matchedBytes }
 
-  // Guarded on `deletedAt` so a sweep that destroyed the row in the meantime reads as
-  // no match, and the upload stores the photograph afresh rather than pointing at a
-  // row that is gone.
+  // Keyed on the id alone. This used to carry `and(isNotNull(assets.deletedAt))` as well,
+  // so that a sweep which destroyed the row in the meantime read as no match and the
+  // upload stored the photograph afresh — but the sweep *deletes* the row, so its absence
+  // already says that, and the guard could not tell it from a row somebody else had
+  // restored while this claim was selecting. That second case came back `undefined`, the
+  // caller fell through to an INSERT, and the owner got a 500 off the checksum's unique
+  // index where the answer was `duplicate: true` (#93).
+  //
+  // The row lock is what settles it either way: the sweep's own delete is guarded on
+  // `deletedAt`, so whichever of the two commits first, the other re-evaluates and finds
+  // the row restored or gone rather than both proceeding.
   const [restored] = await db
     .update(assets)
     .set({ deletedAt: null, updatedAt: new Date() })
-    .where(and(eq(assets.id, row.id), isNotNull(assets.deletedAt)))
+    .where(eq(assets.id, row.id))
     .returning()
-  return restored ? { row: restored, restored: true, matchedBytes } : undefined
+  if (!restored) return undefined
+
+  // True on the reading this claim took, which is what `restored` is for: it drives a
+  // face recount, and one owed by a restore somebody else made is owed just the same.
+  return { row: restored, restored: true, matchedBytes }
 }
 
 /**

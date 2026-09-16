@@ -176,6 +176,37 @@ describe('repairing photographs that kept faces they no longer have', () => {
     expect(await db.select().from(jobs).where(eq(jobs.name, FACE_REPAIR_JOB))).toHaveLength(1)
   })
 
+  /**
+   * A restart during the walk leaves the chain's `{after}` job queued -- nothing
+   * reclaims a queued row -- and boot used to enqueue a fresh `{}` beside it. Both then
+   * ran, and the fresh one re-ran ONNX detection over the whole library from the start,
+   * on every restart that happened to land mid-walk (#92).
+   */
+  test('does not schedule a second repair while a walk is still queued', async () => {
+    const { queue } = setup(true)
+    const faces = { isEnabled: async () => true, modelsReady: async () => true } as FaceService
+    await queue.enqueue(FACE_REPAIR_JOB, { after: 'some-asset-id' })
+
+    expect(await scheduleFaceRepair(queue, db, faces)).toBe(false)
+
+    const queued = await db.select().from(jobs).where(eq(jobs.name, FACE_REPAIR_JOB))
+    expect(queued).toHaveLength(1)
+    expect(queued[0]!.payload).toMatchObject({ after: 'some-asset-id' })
+  })
+
+  test('does not schedule a second repair while a walk is running', async () => {
+    const { queue } = setup(true)
+    const faces = { isEnabled: async () => true, modelsReady: async () => true } as FaceService
+    await queue.enqueue(FACE_REPAIR_JOB, { after: 'some-asset-id' })
+    await db
+      .update(jobs)
+      .set({ status: 'running', startedAt: new Date() })
+      .where(eq(jobs.name, FACE_REPAIR_JOB))
+
+    expect(await scheduleFaceRepair(queue, db, faces)).toBe(false)
+    expect(await db.select().from(jobs).where(eq(jobs.name, FACE_REPAIR_JOB))).toHaveLength(1)
+  })
+
   test('does not schedule the repair while face grouping is off', async () => {
     const { queue } = setup(true)
     const faces = { isEnabled: async () => false, modelsReady: async () => true } as FaceService
