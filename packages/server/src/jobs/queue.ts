@@ -276,6 +276,11 @@ export class JobQueue {
         (error: unknown) => ({ threw: true, error }) as const,
       )
       const outcome = await Promise.race([settled, vigil.abandoned])
+      // Before any of the writes below, not in the `finally` after them: a beat that
+      // lands while one is in flight finds the row already `done` or `failed`, matches
+      // nothing, and reports a job that was taken away when in fact it simply finished.
+      // The signal is only worth having if it is never raised by an ordinary success.
+      vigil.stop()
 
       if ('reason' in outcome) {
         // Abandonment is this worker leaving, and nothing more. A promise cannot be
@@ -291,15 +296,24 @@ export class JobQueue {
         // copies of its memory, arrived at one every six hours. A job that has hung past
         // its whole lifetime is not a retry candidate: it is something for a person to
         // look at, which `last_error` now says plainly and the admin retry can restart.
+        //
+        // The queue not retrying it is not quite the same as it never running again: a
+        // name that schedules itself -- the maintenance chores, the walks -- is pending
+        // no longer once the row is `failed`, so the next tick asks for it and a fresh
+        // copy does run beside the hung one. That is the trade `enqueueUnique` is for,
+        // and the alternative is a chore that stops happening, which was #107.
         console.error(`job ${job.name} ${job.id}: ${outcome.reason}`)
-        // Before the write below rather than in the `finally`: a beat landing in the
-        // middle of it would find the row already failed and say so a second time.
-        vigil.stop()
         if (outcome.ours) {
+          // Outside the handler's `catch`, which routes a failure into `fail` and would
+          // requeue the very job this branch has just decided must not be retried. A row
+          // that cannot be marked failed is left `running` with its beat stopped, which
+          // is what a worker that died looks like, and the hourly reclaim knows that one.
           await this.writeAttempt('abandonment', job.id, job.attempts, {
             status: 'failed',
             finishedAt: new Date(),
             lastError: outcome.reason,
+          }).catch((error: unknown) => {
+            console.error('job abandonment could not be recorded:', describeError(error))
           })
         }
         return

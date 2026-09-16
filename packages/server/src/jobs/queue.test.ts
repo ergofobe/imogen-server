@@ -372,9 +372,12 @@ describe('failure handling', () => {
     }
 
     expect(returned).toBe(false)
-    // The beat is the one write that reports the row gone; nothing after it tries again
-    // on a row that cannot match.
-    expect(said.filter((line) => line.includes('matched no row'))).toHaveLength(1)
+    // The beat is what reports the row gone -- more than once if two were in flight --
+    // and nothing after it tries again on a row that cannot match.
+    expect(said.filter((line) => line.includes('heartbeat matched no row')).length).toBeGreaterThan(
+      0,
+    )
+    expect(said.filter((line) => !line.includes('heartbeat matched no row'))).toBeEmpty()
     expect(Date.now() - startedAt).toBeLessThan(2000)
     // The run that replaced it is untouched: nothing this worker writes matches any more.
     const [row] = await db.select().from(jobs)
