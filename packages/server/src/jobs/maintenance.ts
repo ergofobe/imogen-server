@@ -175,7 +175,10 @@ const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000
 /** Long enough after boot that the chores do not compete with the work a restart brings. */
 const FIRST_TICK_DELAY_MS = 60_000
 
-export type MaintenanceSchedule = { stop: () => void }
+export type MaintenanceSchedule = {
+  /** Resolves once the cadence has stopped and any tick already running has finished. */
+  stop: () => Promise<void>
+}
 
 /**
  * One turn of the maintenance cadence: recover, then ask for each chore.
@@ -205,6 +208,11 @@ export async function runMaintenanceTick(queue: JobQueue): Promise<void> {
  * the period delays the next one instead of overlapping it. A tick that throws is logged
  * and the next one is scheduled regardless: the whole of #107 was chores that stopped
  * happening, and a cadence that a single bad hour can end is the same bug again.
+ *
+ * `stop` waits for a tick already under way, because cancelling the timer only prevents
+ * the next one. A shutdown that did not wait would close the pool under a tick's open
+ * transaction, and every restart unlucky enough to land on one would report a database
+ * error that means nothing.
  */
 export function startMaintenance(
   queue: JobQueue,
@@ -213,22 +221,29 @@ export function startMaintenance(
   const intervalMs = options.intervalMs ?? MAINTENANCE_INTERVAL_MS
   let stopped = false
   let timer: ReturnType<typeof setTimeout>
+  let inFlight: Promise<void> = Promise.resolve()
 
-  const tick = async () => {
+  async function tick(): Promise<void> {
     try {
       await runMaintenanceTick(queue)
     } catch (error) {
       console.error('maintenance tick failed', error)
     }
-    if (!stopped) timer = setTimeout(tick, intervalMs)
+    if (!stopped) timer = setTimeout(run, intervalMs)
   }
 
-  timer = setTimeout(tick, options.firstDelayMs ?? FIRST_TICK_DELAY_MS)
+  // Every scheduled tick goes through here, so `inFlight` always names the current one.
+  function run(): void {
+    inFlight = tick()
+  }
+
+  timer = setTimeout(run, options.firstDelayMs ?? FIRST_TICK_DELAY_MS)
 
   return {
-    stop: () => {
+    stop: async () => {
       stopped = true
       clearTimeout(timer)
+      await inFlight
     },
   }
 }

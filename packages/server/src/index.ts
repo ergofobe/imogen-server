@@ -59,7 +59,8 @@ if (!existsSync(webRoot)) console.log('  (web bundle not built; run bun run dev:
 async function shutdown(signal: string) {
   console.log(`\n${signal} received, shutting down`)
   await server.stop()
-  maintenance.stop()
+  // Before the pool closes: a tick has an open transaction and nothing to say about it.
+  await maintenance.stop()
   await services.shutdown()
   process.exit(0)
 }

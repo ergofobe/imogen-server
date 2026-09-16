@@ -421,7 +421,8 @@ describe('the maintenance cadence', () => {
       await queue.drain()
       expect(await waitFor(async () => (await chores('queued')).length === 3)).toBe(true)
     } finally {
-      schedule.stop()
+      // Awaited: a tick still in flight would commit its chores after the drain below.
+      await schedule.stop()
     }
 
     await queue.drain()
