@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from 'bun:test'
 import { render, startDom, stopDom } from '../../test/dom.ts'
 
 beforeAll(() => startDom())
@@ -62,6 +62,20 @@ mock.module('../../lib/client.ts', () => ({
     http: { request: httpRequest },
   },
 }))
+/**
+ * Both stubs go back to their defaults between tests.
+ *
+ * They were restored on each test's last line, which is the line that does not run when
+ * an assertion above it throws — so one failure used to leak into every test after it and
+ * arrive as a different, more confusing failure.
+ */
+afterEach(() => {
+  answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+  repairsAnswer = () => Promise.resolve(REPAIRS)
+})
+
+/** The client behind the panel most recently rendered, for a test that drives a refetch. */
+let panelClient: import('@tanstack/react-query').QueryClient | undefined
 
 async function renderPanel() {
   const { act } = await import('react')
@@ -69,6 +83,7 @@ async function renderPanel() {
   const { AdminProcessing } = await import('./AdminProcessing.tsx')
 
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+  panelClient = client
   const container = await render(
     <QueryClientProvider client={client}>
       <AdminProcessing />
@@ -123,8 +138,6 @@ describe('the processing panel once the queue can be read again', () => {
     const text = container.textContent ?? ''
     expect(text).toMatch(/nothing is waiting/i)
     expect(text).not.toMatch(/could not be read/i)
-
-    answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
   })
 })
 
@@ -178,7 +191,6 @@ describe('the repairs offered in the processing panel', () => {
     })
 
     expect(started).toEqual(['/api/v1/admin/repairs/captureTime'])
-    answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
   })
 })
 
@@ -202,9 +214,6 @@ describe('the repairs list when it cannot be read', () => {
 
     expect(container.textContent ?? '').toMatch(/repairs could not be read/i)
     expect(container.textContent ?? '').toMatch(/timed out/i)
-
-    repairsAnswer = () => Promise.resolve(REPAIRS)
-    answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
   })
 
   test('offers a way to ask again, and comes back when it works', async () => {
@@ -227,8 +236,6 @@ describe('the repairs list when it cannot be read', () => {
     const text = container.textContent ?? ''
     expect(text).toMatch(/21,802 to examine/)
     expect(text).not.toMatch(/repairs could not be read/i)
-
-    answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
   })
 
   /**
@@ -272,8 +279,33 @@ describe('the repairs list when it cannot be read', () => {
 
     expect(container.textContent ?? '').not.toMatch(/repairs could not be read/i)
     expect(container.textContent ?? '').not.toMatch(/Repairs/)
+  })
+})
 
+/**
+ * A failed poll must not take away what the panel already knows.
+ *
+ * React Query keeps the last good `data` through an error, and this only polls while a
+ * pass is walking — so treating any error as "nothing to show" would swap the live list,
+ * the "Walking the library" row and the Start buttons for a red box every time one poll
+ * in the fifteen-second cadence blipped, and swap them back on the next. The failure is
+ * news; the list is not stale enough to be worth hiding.
+ */
+describe('the repairs list when a later poll fails', () => {
+  test('keeps the list it already has, and says the reading failed above it', async () => {
+    const { act } = await import('react')
+    answer = () => Promise.resolve(HEALTHY)
     repairsAnswer = () => Promise.resolve(REPAIRS)
-    answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+    const container = await panelShowing(/to examine/)
+
+    repairsAnswer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+    await act(async () => {
+      await panelClient?.refetchQueries({ queryKey: ['admin', 'repairs'] })
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    })
+
+    const text = container.textContent ?? ''
+    expect(text).toMatch(/repairs could not be read/i)
+    expect(text).toMatch(/21,802 to examine/)
   })
 })

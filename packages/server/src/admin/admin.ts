@@ -296,11 +296,15 @@ export class AdminService {
   async repairs(): Promise<AdminRepair[]> {
     const names = Object.keys(REPAIRS) as RepairName[]
 
-    // Bounded by the two names it asks about, and grouped so Postgres answers with one
-    // row each rather than one per queued job. The panel polls this every fifteen
-    // seconds while a pass walks, which is when the queue is at its largest — an
-    // unfiltered read dragged every `asset.ingest` row of a bulk import into memory to
-    // test two names. Same shape as `queueHealth` above. See #94.
+    // Named and grouped, so Postgres answers with one row per repair rather than one per
+    // queued job. The panel polls this every fifteen seconds while a pass walks, which is
+    // when the queue is at its largest: unfiltered, it pulled every `asset.ingest` row of
+    // a bulk import across the wire and built objects for all of them to test two names.
+    // Same shape as `queueHealth` above. See #94.
+    //
+    // This bounds what comes back, not what is read: nothing indexes `jobs.name`, so the
+    // scan itself remains. Indexing a write-hot table to save a read made four times a
+    // minute is its own trade-off, and it is #114.
     const active = await this.db
       .select({ name: jobs.name })
       .from(jobs)

@@ -174,33 +174,13 @@ function Repairs({ onStarted }: { onStarted: () => void }) {
 
   if (isPending) return null
 
-  // Silent only for a server that has never heard of repairs, and for one with none to
-  // offer. Any other failure is reported: this section can be the only sign that a pass
-  // is walking the library, and #89 had it disappear on a single transient 500 with
-  // nothing said and nothing asking again.
-  if (isError && !routeIsAbsent(error)) {
-    return (
-      <section className="rounded-xl border border-red-500/40 p-4">
-        <h3 className="heading-display text-lg">Repairs</h3>
-        <p className="mt-1 text-sm text-red-500">
-          The repairs could not be read, so there is no telling whether one is walking the library.
-        </p>
-        <pre className="mt-3 overflow-x-auto rounded-lg bg-sunken p-3 font-mono text-[12px] leading-relaxed text-muted">
-          {errorText(error)}
-        </pre>
-        <button
-          type="button"
-          onClick={() => void refetch()}
-          disabled={isFetching}
-          className="mt-3 rounded-lg border border-line px-3 py-1.5 text-sm transition hover:bg-sunken disabled:opacity-50"
-        >
-          {isFetching ? 'Asking' : 'Try again'}
-        </button>
-      </section>
-    )
-  }
-
-  if (isError || !data || data.items.length === 0) return null
+  // Silent only for a server that has never heard of repairs. Any other failure is
+  // reported: this section can be the only sign that a pass is walking the library, and
+  // #89 had it disappear on a single transient 500 with nothing said and nothing asking
+  // again.
+  const failure = isError && !routeIsAbsent(error) ? errorText(error) : null
+  const items = data?.items ?? []
+  if (!failure && items.length === 0) return null
 
   return (
     <section>
@@ -212,8 +192,35 @@ function Repairs({ onStarted }: { onStarted: () => void }) {
         </p>
       </header>
 
+      {/*
+        A banner over the list rather than instead of it. React Query keeps the last good
+        answer through an error, and this only polls while a pass is walking — so replacing
+        the list would blank the running row and the buttons on every blip in the
+        fifteen-second cadence and restore them on the next. The failure is the news; what
+        was already known is still worth showing.
+      */}
+      {failure && (
+        <div className="mb-4 rounded-xl border border-red-500/40 p-4">
+          <p className="text-sm text-red-500">
+            The repairs could not be read, so there is no telling whether one is walking the
+            library.
+          </p>
+          <pre className="mt-3 overflow-x-auto rounded-lg bg-sunken p-3 font-mono text-[12px] leading-relaxed text-muted">
+            {failure}
+          </pre>
+          <button
+            type="button"
+            onClick={() => void refetch()}
+            disabled={isFetching}
+            className="mt-3 rounded-lg border border-line px-3 py-1.5 text-sm transition hover:bg-sunken disabled:opacity-50"
+          >
+            {isFetching ? 'Asking' : 'Try again'}
+          </button>
+        </div>
+      )}
+
       <ul className="space-y-2">
-        {data.items.map((repair) => (
+        {items.map((repair) => (
           <li key={repair.name} className="rounded-xl border border-line p-4">
             <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
               <p className="text-sm">{repair.title}</p>
