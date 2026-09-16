@@ -246,39 +246,28 @@ describe('the repairs list when it cannot be read', () => {
   test('keeps asking after a failure instead of giving up', async () => {
     const { repairsPollInterval } = await import('./AdminProcessing.tsx')
 
-    expect(
-      repairsPollInterval({ status: 'error', data: undefined, error: new Error('a 500') }),
-    ).toBeGreaterThan(0)
+    expect(repairsPollInterval({ status: 'error', data: undefined })).toBeGreaterThan(0)
   })
 
-  /** A server too old to know the route is not a failure, and asking again cannot help. */
-  test('stays quiet about a server that has no repairs route', async () => {
+  /**
+   * A 404 gets no special treatment, tempting as it is.
+   *
+   * It reads like "this server is too old to have the route", and silence would be the
+   * right answer to that. But the admin API refuses *everything* with a plain 404 on
+   * purpose — it is meant to be undiscoverable, not merely closed — so a session that
+   * expires while the tab is open produces exactly the same status. Treating it as an
+   * absent route would leave a stale list on screen with "Walking the library" still
+   * showing and nothing asking again: #89, arrived at by another road.
+   */
+  test('reports a 404 like any other failure, because this API refuses with one', async () => {
     const { ImogenError } = await import('@imogen/sdk')
-    const { repairsPollInterval } = await import('./AdminProcessing.tsx')
-    const absent = new ImogenError(404, 'not_found', 'Not Found')
+    const refusal = new ImogenError(404, 'not_found', 'Not Found')
 
-    expect(repairsPollInterval({ status: 'error', data: undefined, error: absent })).toBe(false)
-
-    const { act } = await import('react')
     answer = () => Promise.resolve(HEALTHY)
-    let refused = 0
-    repairsAnswer = () => {
-      refused += 1
-      return Promise.reject(absent)
-    }
-    const container = await panelShowing(/nothing is waiting/i)
-    // The queue settles first, so wait for the 404 to have actually been answered before
-    // asserting on its absence — otherwise this passes whatever the panel does with it.
-    const deadline = Date.now() + 2000
-    while (refused === 0 && Date.now() < deadline) {
-      await act(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 10))
-      })
-    }
-    expect(refused).toBeGreaterThan(0)
+    repairsAnswer = () => Promise.reject(refusal)
+    const container = await panelShowing(/repairs could not be read/i)
 
-    expect(container.textContent ?? '').not.toMatch(/repairs could not be read/i)
-    expect(container.textContent ?? '').not.toMatch(/Repairs/)
+    expect(container.textContent ?? '').toMatch(/repairs could not be read/i)
   })
 })
 

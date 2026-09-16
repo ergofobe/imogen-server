@@ -1,4 +1,3 @@
-import { ImogenError } from '@imogen/sdk'
 import type { AdminJob } from '@imogen/shared'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { imogen } from '../../lib/client.ts'
@@ -174,11 +173,16 @@ function Repairs({ onStarted }: { onStarted: () => void }) {
 
   if (isPending) return null
 
-  // Silent only for a server that has never heard of repairs. Any other failure is
-  // reported: this section can be the only sign that a pass is walking the library, and
-  // #89 had it disappear on a single transient 500 with nothing said and nothing asking
-  // again.
-  const failure = isError && !routeIsAbsent(error) ? errorText(error) : null
+  // Every failure is reported: this section can be the only sign that a pass is walking
+  // the library, and #89 had it disappear on a single transient 500 with nothing said and
+  // nothing asking again. The one silence left is having no repairs to offer.
+  //
+  // Not even a 404 is excused, tempting as it is to read one as "this server is too old
+  // to have the route". The admin API refuses everything with a plain 404 on purpose — it
+  // is meant to be undiscoverable rather than merely closed — so an expired session
+  // arrives as the same status, and excusing it would leave a stale list on screen with
+  // "Walking the library" still showing and nothing asking again.
+  const failure = isError ? errorText(error) : null
   const items = data?.items ?? []
   if (!failure && items.length === 0) return null
 
@@ -273,24 +277,12 @@ function Repairs({ onStarted }: { onStarted: () => void }) {
 export function repairsPollInterval(state: {
   status: 'pending' | 'error' | 'success'
   data: { items: Repair[] } | undefined
-  error?: unknown
 }): number | false {
-  if (state.status === 'error') return routeIsAbsent(state.error) ? false : REPAIRS_POLL_MS
+  if (state.status === 'error') return REPAIRS_POLL_MS
   return state.data?.items.some((repair) => repair.state === 'running') ? REPAIRS_POLL_MS : false
 }
 
 const REPAIRS_POLL_MS = 15_000
-
-/**
- * A server that has never heard of repairs, as against one that could not answer.
- *
- * The route arrived after the panel around it, so an older server 404s it. That is not a
- * failure worth a red box and no amount of asking again will change it — which is the
- * part of the old silence worth keeping.
- */
-function routeIsAbsent(error: unknown): boolean {
-  return error instanceof ImogenError && error.status === 404
-}
 
 function FailureRow({ job, onChanged }: { job: AdminJob; onChanged: () => void }) {
   const retry = useMutation({
