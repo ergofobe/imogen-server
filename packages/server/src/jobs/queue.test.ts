@@ -279,6 +279,28 @@ describe('failure handling', () => {
     expect(reclaimedMidJob).toBe(1)
   })
 
+  /**
+   * The other end of giving up on a job: once the reclaim has handed the row to somebody
+   * else, the worker that eventually returns must not write over what replaced it.
+   */
+  test('a worker that returns late leaves the run that replaced it alone', async () => {
+    const queue = makeQueue()
+    queue.register('slow', async () => {
+      // Stand in for the reclaim requeueing this row and a second worker claiming it.
+      await db
+        .update(jobs)
+        .set({ status: 'running', attempts: 2, startedAt: new Date() })
+        .where(eq(jobs.name, 'slow'))
+    })
+    await queue.enqueue('slow', {})
+
+    await queue.drain()
+
+    const [row] = await db.select().from(jobs)
+    expect(row!.status).toBe('running')
+    expect(row!.attempts).toBe(2)
+  })
+
   test('leaves a job that is still genuinely running alone', async () => {
     const queue = makeQueue()
     await db.insert(jobs).values({

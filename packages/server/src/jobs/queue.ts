@@ -249,10 +249,12 @@ export class JobQueue {
     const heartbeat = this.beat(job.id, job.attempts)
     try {
       await handler(job.payload)
+      // Only this attempt's row: a job the reclaim gave up on and handed to somebody else
+      // is theirs now, and a late `done` from here would erase a run still in flight.
       await this.db
         .update(jobs)
         .set({ status: 'done', finishedAt: new Date(), lastError: null })
-        .where(eq(jobs.id, job.id))
+        .where(and(eq(jobs.id, job.id), eq(jobs.attempts, job.attempts)))
     } catch (error) {
       await this.fail(job.id, describeError(error), job.attempts, job.max_attempts)
     } finally {
@@ -283,7 +285,8 @@ export class JobQueue {
       }
       void this.db
         .update(jobs)
-        .set({ startedAt: new Date() })
+        // Postgres's clock, for the same reason the cutoff it is compared against is.
+        .set({ startedAt: sql`now()` })
         .where(and(eq(jobs.id, id), eq(jobs.status, 'running'), eq(jobs.attempts, attempt)))
         // Swallowed: a missed beat costs nothing until the window runs out, and failing
         // the job because its liveness note did not land would be the worse answer.
@@ -295,11 +298,13 @@ export class JobQueue {
   }
 
   private async fail(id: string, message: string, attempts: number, maxAttempts: number) {
+    // Scoped to the attempt that failed, for the same reason the `done` write above is.
+    const thisAttempt = and(eq(jobs.id, id), eq(jobs.attempts, attempts))
     if (attempts >= maxAttempts) {
       await this.db
         .update(jobs)
         .set({ status: 'failed', finishedAt: new Date(), lastError: message })
-        .where(eq(jobs.id, id))
+        .where(thisAttempt)
       return
     }
     // Exponential backoff, capped so a stuck job still retries within the hour.
@@ -311,7 +316,7 @@ export class JobQueue {
         lastError: message,
         runAt: new Date(Date.now() + delaySeconds * 1000),
       })
-      .where(eq(jobs.id, id))
+      .where(thisAttempt)
   }
 
   /**
