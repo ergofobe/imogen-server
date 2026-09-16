@@ -21,6 +21,8 @@ export type QueueOptions = {
   idlePollMs?: number
   /** How often a running job touches `started_at` to show it is still alive. */
   heartbeatMs?: number
+  /** The longest a job may go on saying so. */
+  maxJobLifetimeMs?: number
 }
 
 /**
@@ -60,6 +62,17 @@ const STALE_AFTER_MINUTES = 15
 
 /** Comfortably inside the window above, so one missed beat is not a death. */
 const HEARTBEAT_MS = 60_000
+
+/**
+ * The longest a job may claim to be alive.
+ *
+ * A heartbeat says the process is running, not that the job is getting anywhere: a fetch
+ * with no timeout, or an ffmpeg that never exits, would defend its row for ever and no
+ * reclaim could reach it -- #107 again, moved inside the heartbeat. Past this it stops
+ * being believed and the stale window frees it a quarter of an hour later. Generous,
+ * because the cost of being wrong here is running a job twice.
+ */
+const MAX_JOB_LIFETIME_MS = 6 * 60 * 60 * 1000
 
 const RECLAIMED = 'Reclaimed: the worker stopped without finishing this job'
 
@@ -233,7 +246,7 @@ export class JobQueue {
       )
       return
     }
-    const heartbeat = this.beat(job.id)
+    const heartbeat = this.beat(job.id, job.attempts)
     try {
       await handler(job.payload)
       await this.db
@@ -256,22 +269,29 @@ export class JobQueue {
    * model download, a 4K transcode) would be handed to a second worker while the first is
    * still inside it, which is exactly what the reclaim promises never to do.
    *
-   * Guarded on `running`: a row this worker no longer owns — reclaimed, or failed and
-   * requeued — must not be dragged back to life by a beat still in flight.
+   * Matched on the attempt this worker claimed, not the row alone: `claim` counts up, so
+   * a row that was reclaimed and taken by somebody else no longer answers to this beat.
+   * Bounded, too, so a job that has hung rather than finished is eventually let go of.
    */
-  private beat(id: string): ReturnType<typeof setInterval> {
+  private beat(id: string, attempt: number): ReturnType<typeof setInterval> {
     const every = this.options.heartbeatMs ?? HEARTBEAT_MS
-    return setInterval(() => {
+    const believedUntil = Date.now() + (this.options.maxJobLifetimeMs ?? MAX_JOB_LIFETIME_MS)
+    const timer: ReturnType<typeof setInterval> = setInterval(() => {
+      if (Date.now() >= believedUntil) {
+        clearInterval(timer)
+        return
+      }
       void this.db
         .update(jobs)
         .set({ startedAt: new Date() })
-        .where(and(eq(jobs.id, id), eq(jobs.status, 'running')))
+        .where(and(eq(jobs.id, id), eq(jobs.status, 'running'), eq(jobs.attempts, attempt)))
         // Swallowed: a missed beat costs nothing until the window runs out, and failing
         // the job because its liveness note did not land would be the worse answer.
         .catch((error: unknown) => {
           console.warn('job heartbeat failed:', describeError(error))
         })
     }, every)
+    return timer
   }
 
   private async fail(id: string, message: string, attempts: number, maxAttempts: number) {
@@ -306,12 +326,16 @@ export class JobQueue {
    * and `claim` does not check the attempt limit, so requeuing forever would be a crash
    * loop wearing the costume of a recovery.
    *
-   * The window has to outlast the longest job rather than the shortest crash: a job still
-   * legitimately running must never be handed to a second worker, which also keeps this
-   * honest if the server is ever run as more than one replica.
+   * The window is silence, not age: a running job says so every minute, so it measures
+   * how long since the last sign of life. A job still legitimately working must never be
+   * handed to a second worker, which also keeps this honest if the server is ever run as
+   * more than one replica.
+   *
+   * The cutoff is Postgres's, because `started_at` is: `claim` stamps it with `now()`, and
+   * an app clock running ahead of the database's would make a job that has just started
+   * look like one that stopped.
    */
   async reclaimStale(olderThanMinutes = STALE_AFTER_MINUTES): Promise<number> {
-    const cutoff = new Date(Date.now() - olderThanMinutes * 60_000)
     const spent = sql`${jobs.attempts} >= ${jobs.maxAttempts}`
     const reclaimed = await this.db.execute(sql`
       update ${jobs}
@@ -320,7 +344,8 @@ export class JobQueue {
           last_error = ${RECLAIMED},
           started_at = null,
           run_at = now()
-      where ${jobs.status} = 'running' and ${jobs.startedAt} < ${cutoff}
+      where ${jobs.status} = 'running'
+        and ${jobs.startedAt} < now() - ${olderThanMinutes} * interval '1 minute'
       returning ${jobs.id}
     `)
     const rows = Array.isArray(reclaimed) ? reclaimed : (reclaimed as { rows?: unknown[] }).rows

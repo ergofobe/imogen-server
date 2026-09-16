@@ -246,10 +246,37 @@ describe('failure handling', () => {
     await queue.drain()
 
     // The row is `done`; were the heartbeat still beating it would keep touching it.
-    await db.update(jobs).set({ status: 'running', startedAt: new Date(Date.now() - 60_000) })
+    await db
+      .update(jobs)
+      .set({ status: 'running', startedAt: new Date(Date.now() - 60_000) })
+      .where(eq(jobs.name, 'quick'))
     await Bun.sleep(30)
 
     expect(await queue.reclaimStale(1)).toBe(1)
+  })
+
+  /**
+   * A heartbeat says the process is alive, not that the job is. A handler that hangs --
+   * a fetch with no timeout, an ffmpeg that never exits -- would otherwise defend its row
+   * for ever, and nothing could ever free it or the name behind it.
+   */
+  test('stops believing a job that has run past its lifetime', async () => {
+    const queue = new JobQueue(db, {
+      concurrency: 1,
+      idlePollMs: 5,
+      heartbeatMs: 5,
+      maxJobLifetimeMs: 20,
+    })
+    let reclaimedMidJob = -1
+    queue.register('hung', async () => {
+      await Bun.sleep(200)
+      reclaimedMidJob = await queue.reclaimStale(50 / 60_000)
+    })
+    await queue.enqueue('hung', {})
+
+    await queue.drain()
+
+    expect(reclaimedMidJob).toBe(1)
   })
 
   test('leaves a job that is still genuinely running alone', async () => {

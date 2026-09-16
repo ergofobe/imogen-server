@@ -195,7 +195,12 @@ export type MaintenanceSchedule = {
  * again, and a chore that has given up entirely is simply not pending any more.
  */
 export async function runMaintenanceTick(queue: JobQueue): Promise<void> {
-  await queue.reclaimStale()
+  // Caught here rather than at the end of the tick: the recovery and the chores are
+  // separate work, and a database blip in the first must not cost the hour's worth of
+  // the second as well.
+  await queue.reclaimStale().catch((error: unknown) => {
+    console.error('maintenance: reclaiming stranded jobs failed', error)
+  })
   await queue.enqueueUnique(SWEEP_TRASH_JOB, {})
   await queue.enqueueUnique(PRUNE_UPLOADS_JOB, {})
   await queue.enqueueUnique(PRUNE_JOBS_JOB, {})
