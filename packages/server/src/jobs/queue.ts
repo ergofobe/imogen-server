@@ -1,4 +1,5 @@
-import { and, eq, inArray, lte, sql } from 'drizzle-orm'
+import { and, eq, inArray, lte, type SQL, sql } from 'drizzle-orm'
+import type { PgUpdateSetSource } from 'drizzle-orm/pg-core'
 import type { Database } from '../db/index.ts'
 import { jobs } from '../db/schema.ts'
 
@@ -55,6 +56,13 @@ function describeError(error: unknown): string {
   if (current != null && !(current instanceof Error)) chain.push(String(current))
 
   return chain.join(': ')
+}
+
+/** For the message an operator reads in `last_error`, where milliseconds say nothing. */
+function describeDuration(ms: number): string {
+  if (ms < 60_000) return `${ms}ms`
+  const minutes = Math.round(ms / 60_000)
+  return minutes < 120 ? `${minutes} minutes` : `${Math.round(minutes / 60)} hours`
 }
 
 /** How long a job may go without a heartbeat before it is taken for a corpse. */
@@ -246,77 +254,150 @@ export class JobQueue {
       )
       return
     }
-    const heartbeat = this.beat(job.id, job.attempts)
+    const vigil = this.watch(job.id, job.attempts)
     try {
-      await handler(job.payload)
-      // Only this attempt's row: a job the reclaim gave up on and handed to somebody else
-      // is theirs now, and a late `done` from here would erase a run still in flight.
-      await this.db
-        .update(jobs)
-        .set({ status: 'done', finishedAt: new Date(), lastError: null })
-        .where(and(eq(jobs.id, job.id), eq(jobs.attempts, job.attempts)))
+      // Settled rather than awaited: when the vigil wins the race below this promise
+      // outlives the worker, and an orphan that rejects into nobody's `catch` reaches
+      // `unhandledRejection`, which this server exits on.
+      const settled = handler(job.payload).then(
+        () => ({ threw: false }) as const,
+        (error: unknown) => ({ threw: true, error }) as const,
+      )
+      const outcome = await Promise.race([settled, vigil.abandoned])
+
+      if (typeof outcome === 'string') {
+        // Abandonment is this worker leaving, and nothing more. A promise cannot be
+        // cancelled, so the handler goes on until it returns or the process ends: it
+        // still holds its memory, its file handles and any child it spawned, and if the
+        // job is retried the two run side by side. What is recovered is the worker, which
+        // is the part that was never coming back on its own (#112).
+        console.error(`job ${job.name} ${job.id}: ${outcome}`)
+        await this.fail(job.id, outcome, job.attempts, job.max_attempts)
+        return
+      }
+      if (outcome.threw) throw outcome.error
+
+      await this.writeAttempt('completion', job.id, job.attempts, {
+        status: 'done',
+        finishedAt: new Date(),
+        lastError: null,
+      })
     } catch (error) {
       await this.fail(job.id, describeError(error), job.attempts, job.max_attempts)
     } finally {
-      clearInterval(heartbeat)
+      vigil.stop()
     }
   }
 
   /**
-   * Keeps saying a job is alive for as long as it runs.
+   * A write that belongs to one attempt of one job, and says whether it landed.
+   *
+   * Three things have to agree: the row, the attempt this worker claimed, and that the
+   * row is still `running`. The attempt alone is not enough, because `reclaimStale`
+   * requeues a row without touching its attempt count — so a worker returning after the
+   * reclaim had let go of its job found the number it claimed under still sitting there,
+   * and marked a queued job `done`. A row belongs to this worker only while it is still
+   * running under the attempt it was claimed at.
+   *
+   * Zero rows is therefore not a nothing. It is the one clean signal that a job was taken
+   * away while a worker was still inside it, and the scoping #108 added exists precisely
+   * to handle that case — so discarding the signal made the case invisible.
+   */
+  private async writeAttempt(
+    what: string,
+    id: string,
+    attempt: number,
+    values: PgUpdateSetSource<typeof jobs>,
+  ): Promise<boolean> {
+    const matched = await this.db
+      .update(jobs)
+      .set(values)
+      .where(and(eq(jobs.id, id), eq(jobs.attempts, attempt), eq(jobs.status, 'running')))
+      .returning({ id: jobs.id })
+    if (matched.length > 0) return true
+
+    console.warn(`job ${what} matched no row: ${id} attempt ${attempt} is no longer this worker's`)
+    return false
+  }
+
+  /**
+   * Keeps saying a job is alive for as long as it runs, and says when to stop waiting.
    *
    * `started_at` is stamped once, at claim, so on its own it dates the job rather than
    * its last sign of life — and `reclaimStale` recurs hourly now (#107), where it used to
-   * run about once per boot. Without this, anything slower than the window (the 190 MB
+   * run about once per boot. Without a beat, anything slower than the window (the 190 MB
    * model download, a 4K transcode) would be handed to a second worker while the first is
    * still inside it, which is exactly what the reclaim promises never to do.
    *
-   * Matched on the attempt this worker claimed, not the row alone: `claim` counts up, so
-   * a row that was reclaimed and taken by somebody else no longer answers to this beat.
-   * Bounded, too, so a job that has hung rather than finished is eventually let go of.
+   * Two things end the vigil, and both hand the worker back rather than only the row:
+   *
+   * - the lifetime runs out, which says the handler has hung rather than finished;
+   * - a beat matches no row, which says the job is somebody else's now.
+   *
+   * A `setTimeout` rather than a deadline compared against `Date.now()` on each beat: the
+   * timer counts elapsed time, where the wall clock can step under an NTP correction or a
+   * suspended VM and cut a perfectly healthy job short.
    */
-  private beat(id: string, attempt: number): ReturnType<typeof setInterval> {
+  private watch(id: string, attempt: number): { abandoned: Promise<string>; stop: () => void } {
     const every = this.options.heartbeatMs ?? HEARTBEAT_MS
-    const believedUntil = Date.now() + (this.options.maxJobLifetimeMs ?? MAX_JOB_LIFETIME_MS)
-    const timer: ReturnType<typeof setInterval> = setInterval(() => {
-      if (Date.now() >= believedUntil) {
-        clearInterval(timer)
-        return
-      }
-      void this.db
-        .update(jobs)
-        // Postgres's clock, for the same reason the cutoff it is compared against is.
-        .set({ startedAt: sql`now()` })
-        .where(and(eq(jobs.id, id), eq(jobs.status, 'running'), eq(jobs.attempts, attempt)))
+    const lifetime = this.options.maxJobLifetimeMs ?? MAX_JOB_LIFETIME_MS
+
+    let abandon: (reason: string) => void = () => {}
+    // Resolves, never rejects: it is raced against the handler, and a rejection here
+    // would be reported as the job's own failure.
+    const abandoned = new Promise<string>((resolve) => {
+      abandon = resolve
+    })
+
+    const beat = setInterval(() => {
+      // Postgres's clock, for the same reason the cutoff it is compared against is.
+      void this.writeAttempt('heartbeat', id, attempt, { startedAt: sql`now()` }).then(
+        (landed) => {
+          if (!landed) abandon('Abandoned: this job was given to another worker')
+        },
         // Swallowed: a missed beat costs nothing until the window runs out, and failing
-        // the job because its liveness note did not land would be the worse answer.
-        .catch((error: unknown) => {
+        // the job because its liveness note did not land would be the worse answer. A
+        // database that cannot be reached is not the same thing as a job that was taken
+        // away, and only the second is worth giving up on.
+        (error: unknown) => {
           console.warn('job heartbeat failed:', describeError(error))
-        })
+        },
+      )
     }, every)
-    return timer
+
+    const deadline = setTimeout(() => {
+      abandon(`Abandoned: the handler was still running after ${describeDuration(lifetime)}`)
+    }, lifetime)
+
+    return {
+      abandoned,
+      stop: () => {
+        clearInterval(beat)
+        clearTimeout(deadline)
+      },
+    }
   }
 
   private async fail(id: string, message: string, attempts: number, maxAttempts: number) {
-    // Scoped to the attempt that failed, for the same reason the `done` write above is.
-    const thisAttempt = and(eq(jobs.id, id), eq(jobs.attempts, attempts))
     if (attempts >= maxAttempts) {
-      await this.db
-        .update(jobs)
-        .set({ status: 'failed', finishedAt: new Date(), lastError: message })
-        .where(thisAttempt)
+      await this.writeAttempt('failure', id, attempts, {
+        status: 'failed',
+        finishedAt: new Date(),
+        lastError: message,
+      })
       return
     }
     // Exponential backoff, capped so a stuck job still retries within the hour.
     const delaySeconds = Math.min(2 ** attempts * 5, 3600)
-    await this.db
-      .update(jobs)
-      .set({
-        status: 'queued',
-        lastError: message,
-        runAt: new Date(Date.now() + delaySeconds * 1000),
-      })
-      .where(thisAttempt)
+    await this.writeAttempt('retry', id, attempts, {
+      status: 'queued',
+      lastError: message,
+      // Postgres's clock: `claim` compares `run_at` against it, so an app clock running
+      // behind the database's would make a job eligible before its backoff had elapsed —
+      // the skew the comment on `enqueue` exists to prevent, arrived at from the retry
+      // side instead of the insert side.
+      runAt: sql`now() + ${delaySeconds} * interval '1 second'`,
+    })
   }
 
   /**
@@ -341,6 +422,31 @@ export class JobQueue {
    * look like one that stopped.
    */
   async reclaimStale(olderThanMinutes = STALE_AFTER_MINUTES): Promise<number> {
+    return this.reclaim(
+      sql`and ${jobs.startedAt} < now() - ${olderThanMinutes} * interval '1 minute'`,
+    )
+  }
+
+  /**
+   * Everything the last process left running. For boot, and only for boot.
+   *
+   * `reclaimStale` measures silence, and since the heartbeat a crash leaves rows whose
+   * last sign of life is under a minute old — so at boot, when every `running` row is by
+   * definition a corpse, the fifteen-minute window matches none of them and recovery
+   * waits for the first hourly tick to land fifteen minutes after the silence began
+   * (#111). There is no silence to measure here: `start()` has not been called, so no
+   * worker of this process can be inside any of these rows, and the premise is not that
+   * they have been quiet but that they are dead.
+   *
+   * So no clock appears in this one at all, rather than a zero window: `started_at` is
+   * compared against nothing, and a row cannot be missed for having been beaten on a
+   * moment ago.
+   */
+  async reclaimAllRunning(): Promise<number> {
+    return this.reclaim(sql.empty())
+  }
+
+  private async reclaim(silence: SQL): Promise<number> {
     const spent = sql`${jobs.attempts} >= ${jobs.maxAttempts}`
     const reclaimed = await this.db.execute(sql`
       update ${jobs}
@@ -349,8 +455,7 @@ export class JobQueue {
           last_error = ${RECLAIMED},
           started_at = null,
           run_at = now()
-      where ${jobs.status} = 'running'
-        and ${jobs.startedAt} < now() - ${olderThanMinutes} * interval '1 minute'
+      where ${jobs.status} = 'running' ${silence}
       returning ${jobs.id}
     `)
     const rows = Array.isArray(reclaimed) ? reclaimed : (reclaimed as { rows?: unknown[] }).rows

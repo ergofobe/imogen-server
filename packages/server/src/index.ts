@@ -18,8 +18,11 @@ const webRoot = join(here, '../../web/dist')
 const app = createApp({ services, ...(existsSync(webRoot) ? { webRoot } : {}) })
 
 // A restart is the one moment we know for certain that nothing this process claimed is
-// still running, so it is the natural place to recover what the last one left behind.
-await services.queue.reclaimStale()
+// still running, so it is the natural place to recover what the last one left behind --
+// all of it, and not only the rows that had already been quiet for a quarter of an hour
+// when the last process died. `start()` is below, so there is no worker of ours to
+// interrupt.
+await services.queue.reclaimAllRunning()
 
 services.queue.start()
 

@@ -259,29 +259,40 @@ describe('failure handling', () => {
    * A heartbeat says the process is alive, not that the job is. A handler that hangs --
    * a fetch with no timeout, an ffmpeg that never exits -- would otherwise defend its row
    * for ever, and nothing could ever free it or the name behind it.
+   *
+   * The lifetime bounds the worker, not only the row (#112). Letting go of the row while
+   * the worker stayed parked inside the handler freed the job for a second worker to hang
+   * on as well, one slot per cycle until the pool was gone.
    */
-  test('stops believing a job that has run past its lifetime', async () => {
+  test('stops waiting for a job that has run past its lifetime', async () => {
     const queue = new JobQueue(db, {
       concurrency: 1,
       idlePollMs: 5,
       heartbeatMs: 5,
       maxJobLifetimeMs: 20,
     })
-    let reclaimedMidJob = -1
+    let returned = false
     queue.register('hung', async () => {
-      await Bun.sleep(200)
-      reclaimedMidJob = await queue.reclaimStale(50 / 60_000)
+      // Never settles, which is the whole of the problem: nothing can cancel it.
+      await new Promise<void>(() => {})
+      returned = true
     })
-    await queue.enqueue('hung', {})
+    await queue.enqueue('hung', {}, { maxAttempts: 3 })
 
-    await queue.drain()
+    await queue.drain(1)
 
-    expect(reclaimedMidJob).toBe(1)
+    // The worker is back without the handler having finished, which is all abandonment
+    // can mean in JavaScript.
+    expect(returned).toBe(false)
+    const [row] = await db.select().from(jobs)
+    expect(row!.status).toBe('queued')
+    expect(row!.lastError).toContain('Abandoned')
+    expect(row!.runAt.getTime()).toBeGreaterThan(Date.now())
   })
 
   /**
-   * The other end of giving up on a job: once the reclaim has handed the row to somebody
-   * else, the worker that eventually returns must not write over what replaced it.
+   * The other end of giving up on a job: once the row has been let go of, the worker that
+   * eventually returns must not write over what replaced it.
    */
   test('a worker that returns late leaves the run that replaced it alone', async () => {
     const queue = makeQueue()
@@ -296,6 +307,63 @@ describe('failure handling', () => {
 
     await queue.drain()
 
+    const [row] = await db.select().from(jobs)
+    expect(row!.status).toBe('running')
+    expect(row!.attempts).toBe(2)
+  })
+
+  /**
+   * And the same thing one moment earlier, before anybody has claimed it back.
+   *
+   * `reclaimStale` requeues a row without touching its attempt count, so the attempt this
+   * worker claimed under is still sitting there when it returns. Scoping the write to the
+   * attempt alone is not enough to tell the two apart: it marked a queued job done, and
+   * the work was silently dropped.
+   */
+  test('a worker that returns after the reclaim leaves the requeued row alone', async () => {
+    const queue = makeQueue()
+    queue.register('slow', async () => {
+      await db
+        .update(jobs)
+        .set({ status: 'queued', startedAt: null, runAt: new Date() })
+        .where(eq(jobs.name, 'slow'))
+    })
+    await queue.enqueue('slow', {})
+
+    // One job only: the row is queued again by the time the handler returns, and a full
+    // drain would simply claim it a second time.
+    await queue.drain(1)
+
+    const [row] = await db.select().from(jobs)
+    expect(row!.status).toBe('queued')
+    expect(row!.attempts).toBe(1)
+    expect(row!.finishedAt).toBeNull()
+  })
+
+  /**
+   * A beat that matches no row is the one clean signal that a job was taken away while a
+   * worker was still inside it. #108 discarded it; there is nothing left for this worker
+   * to do but stop waiting, since whatever it writes from here lands nowhere.
+   */
+  test('stops waiting for a job that has been given to somebody else', async () => {
+    const queue = new JobQueue(db, { concurrency: 1, idlePollMs: 5, heartbeatMs: 10 })
+    let returned = false
+    queue.register('slow', async () => {
+      await db
+        .update(jobs)
+        .set({ status: 'running', attempts: 2, startedAt: new Date() })
+        .where(eq(jobs.name, 'slow'))
+      await new Promise<void>(() => {})
+      returned = true
+    })
+    await queue.enqueue('slow', {})
+
+    const startedAt = Date.now()
+    await queue.drain(1)
+
+    expect(returned).toBe(false)
+    expect(Date.now() - startedAt).toBeLessThan(2000)
+    // The run that replaced it is untouched: nothing this worker writes matches any more.
     const [row] = await db.select().from(jobs)
     expect(row!.status).toBe('running')
     expect(row!.attempts).toBe(2)
@@ -355,6 +423,101 @@ describe('failure handling', () => {
     await queue.drain()
 
     expect(done).toEqual(['good'])
+  })
+})
+
+/**
+ * Recovery at boot, which is a different question from recovery on the hour.
+ *
+ * The heartbeat rewrites `started_at` every minute, so a crash leaves rows whose last
+ * sign of life is under a minute old and the fifteen-minute window matches none of them.
+ * Boot-time recovery quietly stopped recovering anything, and the wait went from instant
+ * to the first hourly tick fifteen minutes after the silence began (#111).
+ */
+describe('recovering at boot', () => {
+  test('frees a row the last process left running, however recent its final beat', async () => {
+    const queue = makeQueue()
+    await db.insert(jobs).values({
+      name: 'stranded',
+      payload: {},
+      status: 'running',
+      attempts: 1,
+      maxAttempts: 5,
+      // A heartbeat that landed half a minute before the process died.
+      startedAt: new Date(Date.now() - 30_000),
+    })
+
+    // What the hourly reclaim sees: a job that still looks alive, because it said so
+    // right up until the moment it stopped.
+    expect(await queue.reclaimStale()).toBe(0)
+
+    expect(await queue.reclaimAllRunning()).toBe(1)
+    const [row] = await db.select().from(jobs)
+    expect(row!.status).toBe('queued')
+    expect(row!.startedAt).toBeNull()
+  })
+
+  test('fails a job out of attempts rather than handing it back', async () => {
+    const queue = makeQueue()
+    await db.insert(jobs).values({
+      name: 'poison',
+      payload: {},
+      status: 'running',
+      attempts: 5,
+      maxAttempts: 5,
+      startedAt: new Date(),
+    })
+
+    expect(await queue.reclaimAllRunning()).toBe(1)
+    const [row] = await db.select().from(jobs)
+    expect(row!.status).toBe('failed')
+  })
+})
+
+/**
+ * The pool death of #112, at scaled timings.
+ *
+ * `MAX_JOB_LIFETIME_MS` bounded the row and not the worker: the row was let go of, a
+ * second worker claimed it and hung inside the same handler, and one slot per cycle went
+ * that way until every worker was wedged and an ordinary job never ran again. The row
+ * ended up `queued`, so what an operator saw was a backlog beside four idle workers.
+ */
+describe('a pool whose handlers hang', () => {
+  test('keeps working through a job that never returns', async () => {
+    const queue = new JobQueue(db, {
+      concurrency: 2,
+      idlePollMs: 5,
+      heartbeatMs: 10,
+      maxJobLifetimeMs: 60,
+    })
+    queue.register('hang', () => new Promise<void>(() => {}))
+    const ran: string[] = []
+    queue.register('ordinary', async () => {
+      ran.push('ordinary')
+    })
+    // Both hung jobs are claimed first, so the whole pool is inside them.
+    await queue.enqueue('hang', {}, { maxAttempts: 1, runAt: new Date(Date.now() - 10_000) })
+    await queue.enqueue('hang', {}, { maxAttempts: 1, runAt: new Date(Date.now() - 10_000) })
+    await queue.enqueue('ordinary', {}, { runAt: new Date(Date.now() - 1000) })
+
+    const said: string[] = []
+    const wasError = console.error
+    console.error = (...parts: unknown[]) => said.push(parts.join(' '))
+    try {
+      queue.start()
+      const deadline = Date.now() + 3000
+      while (ran.length === 0 && Date.now() < deadline) await Bun.sleep(10)
+    } finally {
+      console.error = wasError
+      await queue.stop()
+    }
+
+    expect(ran).toEqual(['ordinary'])
+    expect(said.join('\n')).toContain('Abandoned')
+    const hung = await db.select().from(jobs).where(eq(jobs.name, 'hang'))
+    // Out of attempts, so they are visibly `failed` rather than queued for another
+    // worker to hang on.
+    expect(hung.map((row) => row.status)).toEqual(['failed', 'failed'])
   })
 })
 
