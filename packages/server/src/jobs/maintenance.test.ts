@@ -414,7 +414,9 @@ describe('the maintenance cadence', () => {
   test('goes on ticking until it is stopped', async () => {
     const queue = makeQueue()
     registerMaintenanceJobs(queue, makeDeps())
-    const schedule = startMaintenance(queue, { firstDelayMs: 1, intervalMs: 1 })
+    // Fast enough to watch, slow enough that the ticker and the drain below are not
+    // fighting for the same advisory lock every millisecond.
+    const schedule = startMaintenance(queue, { firstDelayMs: 5, intervalMs: 20 })
 
     try {
       expect(await waitFor(async () => (await chores('queued')).length === 3)).toBe(true)

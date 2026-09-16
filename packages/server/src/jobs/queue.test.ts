@@ -215,6 +215,43 @@ describe('failure handling', () => {
     expect(row!.startedAt).toBeNull()
   })
 
+  /**
+   * The reclaim now runs every hour rather than once per boot (#107), so for the first
+   * time it can meet a job that is legitimately still working. `started_at` is stamped
+   * once at claim, so without a heartbeat any job slower than the window — a 190 MB model
+   * download, a 4K transcode — is handed to a second worker while the first is still
+   * inside it, and the two write over each other.
+   */
+  test('leaves a slow job alone while it is still making progress', async () => {
+    const queue = new JobQueue(db, { concurrency: 1, idlePollMs: 5, heartbeatMs: 5 })
+    let reclaimedMidJob = -1
+    queue.register('slow', async () => {
+      await Bun.sleep(200)
+      // A window far shorter than the job, which only a heartbeat can keep it inside of.
+      reclaimedMidJob = await queue.reclaimStale(50 / 60_000)
+    })
+    await queue.enqueue('slow', {})
+
+    await queue.drain()
+
+    expect(reclaimedMidJob).toBe(0)
+    const [row] = await db.select().from(jobs)
+    expect(row!.status).toBe('done')
+  })
+
+  test('stops the heartbeat when the job ends, so a dead worker is still reclaimed', async () => {
+    const queue = new JobQueue(db, { concurrency: 1, idlePollMs: 5, heartbeatMs: 5 })
+    queue.register('quick', async () => {})
+    await queue.enqueue('quick', {})
+    await queue.drain()
+
+    // The row is `done`; were the heartbeat still beating it would keep touching it.
+    await db.update(jobs).set({ status: 'running', startedAt: new Date(Date.now() - 60_000) })
+    await Bun.sleep(30)
+
+    expect(await queue.reclaimStale(1)).toBe(1)
+  })
+
   test('leaves a job that is still genuinely running alone', async () => {
     const queue = makeQueue()
     await db.insert(jobs).values({

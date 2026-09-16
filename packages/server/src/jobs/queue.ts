@@ -19,6 +19,8 @@ export type QueueOptions = {
   concurrency: number
   /** How long to wait before asking for work again when the queue was empty. */
   idlePollMs?: number
+  /** How often a running job touches `started_at` to show it is still alive. */
+  heartbeatMs?: number
 }
 
 /**
@@ -53,8 +55,11 @@ function describeError(error: unknown): string {
   return chain.join(': ')
 }
 
-/** Long enough to outlast the slowest job, so a live one is never reclaimed under it. */
+/** How long a job may go without a heartbeat before it is taken for a corpse. */
 const STALE_AFTER_MINUTES = 15
+
+/** Comfortably inside the window above, so one missed beat is not a death. */
+const HEARTBEAT_MS = 60_000
 
 const RECLAIMED = 'Reclaimed: the worker stopped without finishing this job'
 
@@ -228,6 +233,7 @@ export class JobQueue {
       )
       return
     }
+    const heartbeat = this.beat(job.id)
     try {
       await handler(job.payload)
       await this.db
@@ -236,7 +242,36 @@ export class JobQueue {
         .where(eq(jobs.id, job.id))
     } catch (error) {
       await this.fail(job.id, describeError(error), job.attempts, job.max_attempts)
+    } finally {
+      clearInterval(heartbeat)
     }
+  }
+
+  /**
+   * Keeps saying a job is alive for as long as it runs.
+   *
+   * `started_at` is stamped once, at claim, so on its own it dates the job rather than
+   * its last sign of life — and `reclaimStale` recurs hourly now (#107), where it used to
+   * run about once per boot. Without this, anything slower than the window (the 190 MB
+   * model download, a 4K transcode) would be handed to a second worker while the first is
+   * still inside it, which is exactly what the reclaim promises never to do.
+   *
+   * Guarded on `running`: a row this worker no longer owns — reclaimed, or failed and
+   * requeued — must not be dragged back to life by a beat still in flight.
+   */
+  private beat(id: string): ReturnType<typeof setInterval> {
+    const every = this.options.heartbeatMs ?? HEARTBEAT_MS
+    return setInterval(() => {
+      void this.db
+        .update(jobs)
+        .set({ startedAt: new Date() })
+        .where(and(eq(jobs.id, id), eq(jobs.status, 'running')))
+        // Swallowed: a missed beat costs nothing until the window runs out, and failing
+        // the job because its liveness note did not land would be the worse answer.
+        .catch((error: unknown) => {
+          console.warn('job heartbeat failed:', describeError(error))
+        })
+    }, every)
   }
 
   private async fail(id: string, message: string, attempts: number, maxAttempts: number) {
