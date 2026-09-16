@@ -39,8 +39,13 @@ export function registerContentHashJobs(queue: JobQueue, deps: ContentHashJobDep
     // one event that changes the rule is the one that restarts the server, so a chain
     // left `{after: X}` by an upgrade is the ordinary case: resuming it would cover the
     // tail of the library and then record the new scheme as walked over a head it never
-    // read. Start again from the beginning instead. A payload with no scheme is one this
-    // build inherited from an older one, which is the same situation.
+    // read. Start again from the beginning instead.
+    //
+    // A payload with no scheme was written by a build that did not stamp one, so it
+    // cannot say which rule it started under. It is treated as a chain that may have
+    // changed rule: re-reading a library that was in fact mid-walk under this same rule
+    // costs one pass, and resuming one that was not leaves part of the library on a
+    // superseded hash until the rule changes again.
     const walking = typeof payload.scheme === 'number' ? payload.scheme : null
     const resumable = walking === CONTENT_HASH_SCHEME
     const after = resumable && typeof payload.after === 'string' ? payload.after : null

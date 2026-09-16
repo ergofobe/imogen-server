@@ -91,7 +91,10 @@ describe('enqueueing one job of a name at a time', () => {
 
     expect(await queue.enqueueUnique('walk', {})).toBeNull()
 
-    await db.update(jobs).set({ status: 'running', startedAt: new Date() })
+    await db
+      .update(jobs)
+      .set({ status: 'running', startedAt: new Date() })
+      .where(eq(jobs.name, 'walk'))
     expect(await queue.enqueueUnique('walk', {})).toBeNull()
     expect(await db.select().from(jobs).where(eq(jobs.name, 'walk'))).toHaveLength(1)
   })

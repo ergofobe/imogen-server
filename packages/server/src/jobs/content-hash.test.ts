@@ -172,7 +172,10 @@ describe('backfilling content_hash for assets uploaded before it existed', () =>
   test('does not schedule a second walk while one is running', async () => {
     const queue = setup()
     await queue.enqueue(CONTENT_HASH_BACKFILL_JOB, { after: 'some-asset-id' })
-    await db.update(jobs).set({ status: 'running', startedAt: new Date() })
+    await db
+      .update(jobs)
+      .set({ status: 'running', startedAt: new Date() })
+      .where(eq(jobs.name, CONTENT_HASH_BACKFILL_JOB))
 
     expect(await scheduleContentHashBackfill(queue, db)).toBe(false)
     expect(

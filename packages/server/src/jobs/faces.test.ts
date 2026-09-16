@@ -198,7 +198,10 @@ describe('repairing photographs that kept faces they no longer have', () => {
     const { queue } = setup(true)
     const faces = { isEnabled: async () => true, modelsReady: async () => true } as FaceService
     await queue.enqueue(FACE_REPAIR_JOB, { after: 'some-asset-id' })
-    await db.update(jobs).set({ status: 'running', startedAt: new Date() })
+    await db
+      .update(jobs)
+      .set({ status: 'running', startedAt: new Date() })
+      .where(eq(jobs.name, FACE_REPAIR_JOB))
 
     expect(await scheduleFaceRepair(queue, db, faces)).toBe(false)
     expect(await db.select().from(jobs).where(eq(jobs.name, FACE_REPAIR_JOB))).toHaveLength(1)
