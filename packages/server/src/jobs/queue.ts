@@ -84,6 +84,12 @@ const MAX_JOB_LIFETIME_MS = 6 * 60 * 60 * 1000
 
 const RECLAIMED = 'Reclaimed: the worker stopped without finishing this job'
 
+/**
+ * Why a worker stopped waiting for its handler, and whether the row is still its to say
+ * so in. A job given away mid-flight is the second worker's business now.
+ */
+type Abandonment = { reason: string; ours: boolean }
+
 export class JobQueue {
   private readonly handlers = new Map<string, JobHandler>()
   private workers: Promise<void>[] = []
@@ -265,14 +271,28 @@ export class JobQueue {
       )
       const outcome = await Promise.race([settled, vigil.abandoned])
 
-      if (typeof outcome === 'string') {
+      if ('reason' in outcome) {
         // Abandonment is this worker leaving, and nothing more. A promise cannot be
-        // cancelled, so the handler goes on until it returns or the process ends: it
-        // still holds its memory, its file handles and any child it spawned, and if the
-        // job is retried the two run side by side. What is recovered is the worker, which
-        // is the part that was never coming back on its own (#112).
-        console.error(`job ${job.name} ${job.id}: ${outcome}`)
-        await this.fail(job.id, outcome, job.attempts, job.max_attempts)
+        // cancelled, so the handler goes on until it returns or the process ends, still
+        // holding its memory, its file handles and any child it spawned. What is
+        // recovered is the worker, which is the part that was never coming back on its
+        // own (#112).
+        //
+        // Failed rather than requeued, and this is the one place the queue gives up on a
+        // job it could retry. Everywhere else a retry costs another run; here the run it
+        // replaces is still going, because nothing could stop it -- five attempts at a
+        // handler that hangs is five live copies of it, five ffmpeg children and five
+        // copies of its memory, arrived at one every six hours. A job that has hung past
+        // its whole lifetime is not a retry candidate: it is something for a person to
+        // look at, which `last_error` now says plainly and the admin retry can restart.
+        console.error(`job ${job.name} ${job.id}: ${outcome.reason}`)
+        if (outcome.ours) {
+          await this.writeAttempt('abandonment', job.id, job.attempts, {
+            status: 'failed',
+            finishedAt: new Date(),
+            lastError: outcome.reason,
+          })
+        }
         return
       }
       if (outcome.threw) throw outcome.error
@@ -296,12 +316,16 @@ export class JobQueue {
    * row is still `running`. The attempt alone is not enough, because `reclaimStale`
    * requeues a row without touching its attempt count — so a worker returning after the
    * reclaim had let go of its job found the number it claimed under still sitting there,
-   * and marked a queued job `done`. A row belongs to this worker only while it is still
-   * running under the attempt it was claimed at.
+   * and marked a queued job `done`.
    *
    * Zero rows is therefore not a nothing. It is the one clean signal that a job was taken
    * away while a worker was still inside it, and the scoping #108 added exists precisely
    * to handle that case — so discarding the signal made the case invisible.
+   *
+   * The three together are evidence of ownership rather than proof of it: the attempt
+   * count only ever counts up in the queue itself, but an administrator retrying a job
+   * rewinds it to zero, and a row that comes back round to the same number is
+   * indistinguishable from the one this worker claimed (#115).
    */
   private async writeAttempt(
     what: string,
@@ -338,14 +362,17 @@ export class JobQueue {
    * timer counts elapsed time, where the wall clock can step under an NTP correction or a
    * suspended VM and cut a perfectly healthy job short.
    */
-  private watch(id: string, attempt: number): { abandoned: Promise<string>; stop: () => void } {
+  private watch(
+    id: string,
+    attempt: number,
+  ): { abandoned: Promise<Abandonment>; stop: () => void } {
     const every = this.options.heartbeatMs ?? HEARTBEAT_MS
     const lifetime = this.options.maxJobLifetimeMs ?? MAX_JOB_LIFETIME_MS
 
-    let abandon: (reason: string) => void = () => {}
+    let abandon: (abandonment: Abandonment) => void = () => {}
     // Resolves, never rejects: it is raced against the handler, and a rejection here
     // would be reported as the job's own failure.
-    const abandoned = new Promise<string>((resolve) => {
+    const abandoned = new Promise<Abandonment>((resolve) => {
       abandon = resolve
     })
 
@@ -353,7 +380,11 @@ export class JobQueue {
       // Postgres's clock, for the same reason the cutoff it is compared against is.
       void this.writeAttempt('heartbeat', id, attempt, { startedAt: sql`now()` }).then(
         (landed) => {
-          if (!landed) abandon('Abandoned: this job was given to another worker')
+          // Nothing to write on this one: the row answers to somebody else now, and an
+          // update that cannot match is not worth the warning it would print.
+          if (!landed) {
+            abandon({ reason: 'Abandoned: this job was given to another worker', ours: false })
+          }
         },
         // Swallowed: a missed beat costs nothing until the window runs out, and failing
         // the job because its liveness note did not land would be the worse answer. A
@@ -366,7 +397,10 @@ export class JobQueue {
     }, every)
 
     const deadline = setTimeout(() => {
-      abandon(`Abandoned: the handler was still running after ${describeDuration(lifetime)}`)
+      abandon({
+        reason: `Abandoned: the handler was still running after ${describeDuration(lifetime)}`,
+        ours: true,
+      })
     }, lifetime)
 
     return {
@@ -441,6 +475,12 @@ export class JobQueue {
    * So no clock appears in this one at all, rather than a zero window: `started_at` is
    * compared against nothing, and a row cannot be missed for having been beaten on a
    * moment ago.
+   *
+   * That premise is one process, and it is the only thing here that assumes it — the
+   * hourly `reclaimStale` measures silence precisely so that it does not. A second
+   * instance booting would hand itself the first's live work, so this call belongs at
+   * boot in a single-instance deployment and nowhere else. Which is what imogen is: one
+   * container, one library directory on a local volume.
    */
   async reclaimAllRunning(): Promise<number> {
     return this.reclaim(sql.empty())

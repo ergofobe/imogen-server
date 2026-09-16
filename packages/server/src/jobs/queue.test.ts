@@ -285,9 +285,12 @@ describe('failure handling', () => {
     // can mean in JavaScript.
     expect(returned).toBe(false)
     const [row] = await db.select().from(jobs)
-    expect(row!.status).toBe('queued')
+    // Failed, with attempts to spare: a retry would run beside the copy that is still
+    // going, because nothing could stop it.
+    expect(row!.status).toBe('failed')
+    expect(row!.attempts).toBe(1)
     expect(row!.lastError).toContain('Abandoned')
-    expect(row!.runAt.getTime()).toBeGreaterThan(Date.now())
+    expect(row!.finishedAt).not.toBeNull()
   })
 
   /**
@@ -358,10 +361,20 @@ describe('failure handling', () => {
     })
     await queue.enqueue('slow', {})
 
+    const said: string[] = []
+    const wasWarn = console.warn
+    console.warn = (...parts: unknown[]) => said.push(parts.join(' '))
     const startedAt = Date.now()
-    await queue.drain(1)
+    try {
+      await queue.drain(1)
+    } finally {
+      console.warn = wasWarn
+    }
 
     expect(returned).toBe(false)
+    // The beat is the one write that reports the row gone; nothing after it tries again
+    // on a row that cannot match.
+    expect(said.filter((line) => line.includes('matched no row'))).toHaveLength(1)
     expect(Date.now() - startedAt).toBeLessThan(2000)
     // The run that replaced it is untouched: nothing this worker writes matches any more.
     const [row] = await db.select().from(jobs)
@@ -496,8 +509,8 @@ describe('a pool whose handlers hang', () => {
       ran.push('ordinary')
     })
     // Both hung jobs are claimed first, so the whole pool is inside them.
-    await queue.enqueue('hang', {}, { maxAttempts: 1, runAt: new Date(Date.now() - 10_000) })
-    await queue.enqueue('hang', {}, { maxAttempts: 1, runAt: new Date(Date.now() - 10_000) })
+    await queue.enqueue('hang', {}, { runAt: new Date(Date.now() - 10_000) })
+    await queue.enqueue('hang', {}, { runAt: new Date(Date.now() - 10_000) })
     await queue.enqueue('ordinary', {}, { runAt: new Date(Date.now() - 1000) })
 
     const said: string[] = []
@@ -515,9 +528,10 @@ describe('a pool whose handlers hang', () => {
     expect(ran).toEqual(['ordinary'])
     expect(said.join('\n')).toContain('Abandoned')
     const hung = await db.select().from(jobs).where(eq(jobs.name, 'hang'))
-    // Out of attempts, so they are visibly `failed` rather than queued for another
-    // worker to hang on.
+    // Visibly `failed` rather than queued for another worker to hang on beside the copy
+    // still running, even with four attempts left each.
     expect(hung.map((row) => row.status)).toEqual(['failed', 'failed'])
+    expect(hung.map((row) => row.attempts)).toEqual([1, 1])
   })
 })
 
