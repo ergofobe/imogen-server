@@ -43,8 +43,10 @@ const REPAIRS = {
   ],
 }
 const started: string[] = []
+/** What `GET /api/v1/admin/repairs` does next. Swapped per test, like `answer` above. */
+let repairsAnswer: () => Promise<unknown> = () => Promise.resolve(REPAIRS)
 const httpRequest = mock((method: string, path: string) => {
-  if (method === 'GET') return Promise.resolve(REPAIRS)
+  if (method === 'GET') return repairsAnswer()
   started.push(path)
   return Promise.resolve(undefined)
 })
@@ -176,6 +178,102 @@ describe('the repairs offered in the processing panel', () => {
     })
 
     expect(started).toEqual(['/api/v1/admin/repairs/captureTime'])
+    answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+  })
+})
+
+/**
+ * One failed poll must not take the section away.
+ *
+ * `retry: false` is right here for the same reason it is right above — a pool that cannot
+ * give a connection takes the full backstop to fail, and three of those in series would
+ * keep the panel silent for minutes. What made it a dead end was the refetch interval,
+ * which read `data` to decide whether to keep asking: after an error `data` is undefined,
+ * so the interval was `false`, nothing ever asked again, and the section rendered nothing
+ * at all — no error, no button, no repairs (#89). An administrator saw the controls
+ * simply vanish while a pass might still have been walking the library.
+ */
+describe('the repairs list when it cannot be read', () => {
+  test('says so rather than taking the section away', async () => {
+    answer = () => Promise.resolve(HEALTHY)
+    repairsAnswer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+
+    const container = await panelShowing(/repairs could not be read/i)
+
+    expect(container.textContent ?? '').toMatch(/repairs could not be read/i)
+    expect(container.textContent ?? '').toMatch(/timed out/i)
+
+    repairsAnswer = () => Promise.resolve(REPAIRS)
+    answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+  })
+
+  test('offers a way to ask again, and comes back when it works', async () => {
+    const { act } = await import('react')
+    answer = () => Promise.resolve(HEALTHY)
+    repairsAnswer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+
+    const container = await panelShowing(/repairs could not be read/i)
+    const button = [...container.querySelectorAll('button')].find((b) =>
+      /try again/i.test(b.textContent ?? ''),
+    )
+    expect(button).toBeDefined()
+
+    repairsAnswer = () => Promise.resolve(REPAIRS)
+    await act(async () => {
+      button?.click()
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    })
+
+    const text = container.textContent ?? ''
+    expect(text).toMatch(/21,802 to examine/)
+    expect(text).not.toMatch(/repairs could not be read/i)
+
+    answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+  })
+
+  /**
+   * The interval is the half of #89 no rendering assertion can see: the panel could show
+   * an error and still never ask again. It has to go on asking on its own, because the
+   * administrator who has walked away from the tab is exactly the one this panel is for.
+   */
+  test('keeps asking after a failure instead of giving up', async () => {
+    const { repairsPollInterval } = await import('./AdminProcessing.tsx')
+
+    expect(
+      repairsPollInterval({ status: 'error', data: undefined, error: new Error('a 500') }),
+    ).toBeGreaterThan(0)
+  })
+
+  /** A server too old to know the route is not a failure, and asking again cannot help. */
+  test('stays quiet about a server that has no repairs route', async () => {
+    const { ImogenError } = await import('@imogen/sdk')
+    const { repairsPollInterval } = await import('./AdminProcessing.tsx')
+    const absent = new ImogenError(404, 'not_found', 'Not Found')
+
+    expect(repairsPollInterval({ status: 'error', data: undefined, error: absent })).toBe(false)
+
+    const { act } = await import('react')
+    answer = () => Promise.resolve(HEALTHY)
+    let refused = 0
+    repairsAnswer = () => {
+      refused += 1
+      return Promise.reject(absent)
+    }
+    const container = await panelShowing(/nothing is waiting/i)
+    // The queue settles first, so wait for the 404 to have actually been answered before
+    // asserting on its absence — otherwise this passes whatever the panel does with it.
+    const deadline = Date.now() + 2000
+    while (refused === 0 && Date.now() < deadline) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      })
+    }
+    expect(refused).toBeGreaterThan(0)
+
+    expect(container.textContent ?? '').not.toMatch(/repairs could not be read/i)
+    expect(container.textContent ?? '').not.toMatch(/Repairs/)
+
+    repairsAnswer = () => Promise.resolve(REPAIRS)
     answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
   })
 })
