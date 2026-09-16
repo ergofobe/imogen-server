@@ -3,17 +3,10 @@ import { eq, sql } from 'drizzle-orm'
 import { SettingsService } from '../admin/settings.ts'
 import { SessionService } from '../auth/sessions.ts'
 import type { Database } from '../db/index.ts'
-import { assetFiles, assets, jobs, users } from '../db/schema.ts'
+import { assetFiles, assets, users } from '../db/schema.ts'
 import { LocalStorage } from '../media/storage.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
-import {
-  type MaintenanceDeps,
-  PRUNE_JOBS_JOB,
-  registerMaintenanceJobs,
-  scheduleMaintenance,
-  sweepTrash,
-} from './maintenance.ts'
-import { JobQueue } from './queue.ts'
+import { type MaintenanceDeps, sweepTrash } from './maintenance.ts'
 
 const harness = await createTestDatabase()
 const db: Database = harness.db
@@ -25,7 +18,7 @@ afterAll(async () => {
 })
 
 beforeEach(async () => {
-  await db.execute(sql`truncate users, jobs cascade`)
+  await db.execute(sql`truncate users cascade`)
 })
 
 /** Lets a test act in the window the sweep opens between selecting a batch and reaching a row. */
@@ -149,40 +142,6 @@ function restoringBeforeDelete(id: string): Database {
 const assetById = async (id: string) => (await db.select().from(assets).where(eq(assets.id, id)))[0]
 const usedBytesOf = async (id: string) =>
   (await db.select().from(users).where(eq(users.id, id)))[0]!.usedBytes
-
-/**
- * `reclaimStale` is how a job a dead worker left `running` gets back into the queue, and
- * the boot-time walks now refuse to start a second chain beside one that is already there
- * (#92). So recovery has to keep happening: a walk stranded mid-batch by a crash is
- * otherwise waiting on a restart that lands more than the stale window after it.
- */
-describe('the chore that recovers stranded jobs', () => {
-  function chores() {
-    const queue = new JobQueue(db, { concurrency: 1, idlePollMs: 5 })
-    registerMaintenanceJobs(queue, makeDeps())
-    return queue
-  }
-
-  test('queues its own next run', async () => {
-    const queue = chores()
-    await queue.enqueue(PRUNE_JOBS_JOB, {})
-
-    await queue.drain()
-
-    const [next] = await db.select().from(jobs).where(eq(jobs.status, 'queued'))
-    expect(next?.name).toBe(PRUNE_JOBS_JOB)
-    expect(next!.runAt.getTime()).toBeGreaterThan(Date.now())
-  })
-
-  test('a boot does not add a second chain to the one already waiting', async () => {
-    const queue = chores()
-    await scheduleMaintenance(queue)
-
-    await scheduleMaintenance(queue)
-
-    expect(await db.select().from(jobs).where(eq(jobs.name, PRUNE_JOBS_JOB))).toHaveLength(1)
-  })
-})
 
 describe('sweepTrash', () => {
   test('destroys an asset past the retention window', async () => {

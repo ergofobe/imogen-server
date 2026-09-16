@@ -34,13 +34,6 @@ export function registerMaintenanceJobs(queue: JobQueue, deps: MaintenanceDeps):
     await queue.reclaimStale()
     await queue.pruneCompleted(7)
     await deps.sessions.pruneExpired()
-
-    // Self-rescheduling, because `reclaimStale` above is the only thing that returns a
-    // stranded job to the queue and the boot-time walks now leave a chain that is already
-    // there to finish rather than starting a second one (#92). Recovery that happened
-    // once a minute after boot would leave a walk its worker died mid-batch waiting for a
-    // restart that lands more than the stale window later.
-    await queue.enqueue(PRUNE_JOBS_JOB, {}, { runAt: nextHour() })
   })
 }
 
@@ -175,21 +168,10 @@ export async function pruneUploads(deps: MaintenanceDeps): Promise<number> {
   return stale.length
 }
 
-/** An hour from now, which is how often the chore above asks to run again. */
-function nextHour(): Date {
-  return new Date(Date.now() + 3_600_000)
-}
-
-/**
- * Queues the recurring chores. Called once at boot.
- *
- * `PRUNE_JOBS_JOB` goes in uniquely because it queues its own next run: a restart would
- * otherwise leave a second chain of it beside the one already waiting, and every restart
- * after that another.
- */
+/** Queues the recurring chores. Called once at boot. */
 export async function scheduleMaintenance(queue: JobQueue): Promise<void> {
-  const soon = new Date(Date.now() + 60_000)
-  await queue.enqueue(SWEEP_TRASH_JOB, {}, { runAt: soon })
-  await queue.enqueue(PRUNE_UPLOADS_JOB, {}, { runAt: soon })
-  await queue.enqueueUnique(PRUNE_JOBS_JOB, {}, { runAt: soon })
+  const hourly = new Date(Date.now() + 60_000)
+  await queue.enqueue(SWEEP_TRASH_JOB, {}, { runAt: hourly })
+  await queue.enqueue(PRUNE_UPLOADS_JOB, {}, { runAt: hourly })
+  await queue.enqueue(PRUNE_JOBS_JOB, {}, { runAt: hourly })
 }
