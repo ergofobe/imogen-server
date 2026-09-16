@@ -72,13 +72,19 @@ const STALE_AFTER_MINUTES = 15
 const HEARTBEAT_MS = 60_000
 
 /**
- * The longest a job may claim to be alive.
+ * The longest a worker will wait for one job.
  *
  * A heartbeat says the process is running, not that the job is getting anywhere: a fetch
  * with no timeout, or an ffmpeg that never exits, would defend its row for ever and no
- * reclaim could reach it -- #107 again, moved inside the heartbeat. Past this it stops
- * being believed and the stale window frees it a quarter of an hour later. Generous,
- * because the cost of being wrong here is running a job twice.
+ * reclaim could reach it -- #107 again, moved inside the heartbeat. Past this the worker
+ * stops waiting and the row is failed.
+ *
+ * Generous, because being wrong here is expensive in both directions and neither is
+ * recoverable by the queue: too short and a slow job is killed off while it was working,
+ * too long and a wedged one sits there for hours. Nothing retries it afterwards, so the
+ * cost of being wrong is a job that waits for a person rather than one that runs twice --
+ * which is the better failure now that the run it would be retried beside cannot be
+ * stopped (#112).
  */
 const MAX_JOB_LIFETIME_MS = 6 * 60 * 60 * 1000
 
@@ -286,6 +292,9 @@ export class JobQueue {
         // its whole lifetime is not a retry candidate: it is something for a person to
         // look at, which `last_error` now says plainly and the admin retry can restart.
         console.error(`job ${job.name} ${job.id}: ${outcome.reason}`)
+        // Before the write below rather than in the `finally`: a beat landing in the
+        // middle of it would find the row already failed and say so a second time.
+        vigil.stop()
         if (outcome.ours) {
           await this.writeAttempt('abandonment', job.id, job.attempts, {
             status: 'failed',
@@ -380,8 +389,9 @@ export class JobQueue {
       // Postgres's clock, for the same reason the cutoff it is compared against is.
       void this.writeAttempt('heartbeat', id, attempt, { startedAt: sql`now()` }).then(
         (landed) => {
-          // Nothing to write on this one: the row answers to somebody else now, and an
-          // update that cannot match is not worth the warning it would print.
+          // The row answers to somebody else now, so the worker has nothing left to say
+          // about it: the beat above has already reported it gone, and a second write
+          // that cannot match would only report it again.
           if (!landed) {
             abandon({ reason: 'Abandoned: this job was given to another worker', ours: false })
           }
