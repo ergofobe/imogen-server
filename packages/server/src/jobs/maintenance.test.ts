@@ -3,10 +3,20 @@ import { eq, sql } from 'drizzle-orm'
 import { SettingsService } from '../admin/settings.ts'
 import { SessionService } from '../auth/sessions.ts'
 import type { Database } from '../db/index.ts'
-import { assetFiles, assets, users } from '../db/schema.ts'
+import { assetFiles, assets, jobs, users } from '../db/schema.ts'
 import { LocalStorage } from '../media/storage.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
-import { type MaintenanceDeps, sweepTrash } from './maintenance.ts'
+import {
+  type MaintenanceDeps,
+  PRUNE_JOBS_JOB,
+  PRUNE_UPLOADS_JOB,
+  registerMaintenanceJobs,
+  runMaintenanceTick,
+  SWEEP_TRASH_JOB,
+  startMaintenance,
+  sweepTrash,
+} from './maintenance.ts'
+import { JobQueue } from './queue.ts'
 
 const harness = await createTestDatabase()
 const db: Database = harness.db
@@ -280,5 +290,142 @@ describe('sweepTrash', () => {
     expect(survivor!.deletedAt).toBeNull()
     expect(await exists(deps, rescued.originalPath)).toBe(true)
     expect(await usedBytesOf(owner.id)).toBe(1000)
+  })
+})
+
+/**
+ * The cadence itself: #107 was that all three chores ran once, sixty seconds after boot,
+ * and never again. What is asserted here is always what the queue holds — a timer that
+ * fires proves nothing if no chore comes of it.
+ */
+describe('the maintenance cadence', () => {
+  beforeEach(async () => {
+    await db.execute(sql`truncate jobs`)
+  })
+
+  const makeQueue = () => new JobQueue(db, { concurrency: 1, idlePollMs: 5 })
+
+  const chores = async (status?: 'queued' | 'running' | 'done' | 'failed') => {
+    const rows = await db.select({ name: jobs.name, status: jobs.status }).from(jobs)
+    return rows.filter((row) => !status || row.status === status).map((row) => row.name)
+  }
+
+  /** Re-runs the queue past the backoff a failed job earns, which a test cannot wait out. */
+  async function drainIgnoringBackoff(queue: JobQueue, rounds: number) {
+    for (let i = 0; i < rounds; i++) {
+      await db
+        .update(jobs)
+        .set({ runAt: new Date(Date.now() - 1000) })
+        .where(eq(jobs.status, 'queued'))
+      await queue.drain()
+    }
+  }
+
+  async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 2000) {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if (await predicate()) return true
+      await Bun.sleep(5)
+    }
+    return false
+  }
+
+  test('queues all three chores on a tick', async () => {
+    const queue = makeQueue()
+
+    await runMaintenanceTick(queue)
+
+    expect((await chores('queued')).sort()).toEqual(
+      [PRUNE_JOBS_JOB, PRUNE_UPLOADS_JOB, SWEEP_TRASH_JOB].sort(),
+    )
+  })
+
+  // The defect itself. One sweep is not a sweep schedule.
+  test('queues each chore again once the last one has finished', async () => {
+    const queue = makeQueue()
+    registerMaintenanceJobs(queue, makeDeps())
+
+    await runMaintenanceTick(queue)
+    await queue.drain()
+    await runMaintenanceTick(queue)
+
+    expect((await chores('queued')).sort()).toEqual(
+      [PRUNE_JOBS_JOB, PRUNE_UPLOADS_JOB, SWEEP_TRASH_JOB].sort(),
+    )
+    expect(await chores('done')).toHaveLength(3)
+  })
+
+  // A sweep that fails once must not stop sweeping for ever, which is #107 in miniature.
+  test('keeps sweeping after a sweep throws', async () => {
+    const queue = makeQueue()
+    queue.register(SWEEP_TRASH_JOB, async () => {
+      throw new Error('the library went away')
+    })
+
+    await runMaintenanceTick(queue)
+    await drainIgnoringBackoff(queue, 1)
+
+    // Still owed: the queue's own retry is the next run, so the tick must not add a second.
+    expect(await chores('queued')).toContain(SWEEP_TRASH_JOB)
+    await runMaintenanceTick(queue)
+    expect((await chores('queued')).filter((name) => name === SWEEP_TRASH_JOB)).toHaveLength(1)
+
+    // And once it has spent every attempt and been given up on, the next tick starts over.
+    await drainIgnoringBackoff(queue, 5)
+    expect(await chores('failed')).toContain(SWEEP_TRASH_JOB)
+
+    await runMaintenanceTick(queue)
+
+    expect(await chores('queued')).toContain(SWEEP_TRASH_JOB)
+  })
+
+  test('adds nothing beside a chore that is still queued or in flight', async () => {
+    const queue = makeQueue()
+    await runMaintenanceTick(queue)
+    await db
+      .update(jobs)
+      .set({ status: 'running', startedAt: new Date() })
+      .where(eq(jobs.name, SWEEP_TRASH_JOB))
+
+    await runMaintenanceTick(queue)
+
+    expect(await chores()).toHaveLength(3)
+  })
+
+  /**
+   * What rescues the rescuer. `reclaimStale` used to be reachable only from inside
+   * `PRUNE_JOBS_JOB`, so a worker that died running that job stranded the one row able
+   * to free it. The tick reclaims before it enqueues, and a timer cannot be stranded.
+   */
+  test('frees a chore a dead worker left running, without the queue’s help', async () => {
+    const queue = makeQueue()
+    await queue.enqueue(PRUNE_JOBS_JOB, {})
+    await db
+      .update(jobs)
+      .set({ status: 'running', startedAt: new Date(Date.now() - 20 * 60_000) })
+      .where(eq(jobs.name, PRUNE_JOBS_JOB))
+
+    await runMaintenanceTick(queue)
+
+    expect(await chores('running')).toHaveLength(0)
+    expect((await chores('queued')).filter((name) => name === PRUNE_JOBS_JOB)).toHaveLength(1)
+  })
+
+  test('goes on ticking until it is stopped', async () => {
+    const queue = makeQueue()
+    registerMaintenanceJobs(queue, makeDeps())
+    const schedule = startMaintenance(queue, { firstDelayMs: 1, intervalMs: 1 })
+
+    try {
+      expect(await waitFor(async () => (await chores('queued')).length === 3)).toBe(true)
+      await queue.drain()
+      expect(await waitFor(async () => (await chores('queued')).length === 3)).toBe(true)
+    } finally {
+      schedule.stop()
+    }
+
+    await queue.drain()
+    await Bun.sleep(30)
+    expect(await chores('queued')).toHaveLength(0)
   })
 })

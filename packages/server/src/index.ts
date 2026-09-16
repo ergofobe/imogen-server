@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { createApp } from './app.ts'
 import { scheduleContentHashBackfill } from './jobs/content-hash.ts'
 import { scheduleFaceRepair } from './jobs/faces.ts'
-import { scheduleMaintenance } from './jobs/maintenance.ts'
+import { startMaintenance } from './jobs/maintenance.ts'
 import { loadConfig } from './lib/config.ts'
 import { createServices } from './services.ts'
 
@@ -22,7 +22,13 @@ const app = createApp({ services, ...(existsSync(webRoot) ? { webRoot } : {}) })
 await services.queue.reclaimStale()
 
 services.queue.start()
-await scheduleMaintenance(services.queue)
+
+// The chores recur on a timer of their own rather than by re-enqueueing themselves. A
+// chain lives in the queue and so can be broken by the queue -- a worker that dies
+// between a chore's successor and its `done` write ends it for the life of the process
+// (#107). A timer is outside the queue: nothing in the queue can stop it, and it is also
+// what calls `reclaimStale` from now on, so the recovery has no chore to depend on.
+const maintenance = startMaintenance(services.queue)
 
 // A library that lost faces before the server learned to clear them still carries them,
 // and nothing re-scans a photograph already marked scanned. Runs once, then records that
@@ -53,6 +59,7 @@ if (!existsSync(webRoot)) console.log('  (web bundle not built; run bun run dev:
 async function shutdown(signal: string) {
   console.log(`\n${signal} received, shutting down`)
   await server.stop()
+  maintenance.stop()
   await services.shutdown()
   process.exit(0)
 }

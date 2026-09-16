@@ -30,8 +30,9 @@ export function registerMaintenanceJobs(queue: JobQueue, deps: MaintenanceDeps):
     await pruneUploads(deps)
   })
   queue.register(PRUNE_JOBS_JOB, async () => {
-    // Before pruning, not after: a job a dead worker stranded is work to recover.
-    await queue.reclaimStale()
+    // Recovering stranded jobs used to happen here and now happens in the tick that
+    // enqueues this one: a rescuer that runs inside the queue is a rescuer the queue can
+    // strand. What is left is housekeeping, and losing an hour of it costs nothing.
     await queue.pruneCompleted(7)
     await deps.sessions.pruneExpired()
   })
@@ -168,10 +169,66 @@ export async function pruneUploads(deps: MaintenanceDeps): Promise<number> {
   return stale.length
 }
 
-/** Queues the recurring chores. Called once at boot. */
-export async function scheduleMaintenance(queue: JobQueue): Promise<void> {
-  const hourly = new Date(Date.now() + 60_000)
-  await queue.enqueue(SWEEP_TRASH_JOB, {}, { runAt: hourly })
-  await queue.enqueue(PRUNE_UPLOADS_JOB, {}, { runAt: hourly })
-  await queue.enqueue(PRUNE_JOBS_JOB, {}, { runAt: hourly })
+/** How often the chores come round. */
+const MAINTENANCE_INTERVAL_MS = 60 * 60 * 1000
+
+/** Long enough after boot that the chores do not compete with the work a restart brings. */
+const FIRST_TICK_DELAY_MS = 60_000
+
+export type MaintenanceSchedule = { stop: () => void }
+
+/**
+ * One turn of the maintenance cadence: recover, then ask for each chore.
+ *
+ * `reclaimStale` is called from here rather than from inside a job because a job that
+ * rescues stranded jobs can itself be stranded — a worker dying inside it leaves the one
+ * row able to free it `running` for ever, and nothing else ever calls it (#107). Out here
+ * it is driven by a timer, and a timer cannot be stranded: whatever kills the process
+ * that owns it is also what starts the process that replaces it.
+ *
+ * `enqueueUnique`, because a chore still queued or running is this chore — a slow sweep,
+ * or one backing off after a failure, must not collect a copy for every hour it takes.
+ * Nothing is lost when a tick declines: the tick is not a chain, so the next one asks
+ * again, and a chore that has given up entirely is simply not pending any more.
+ */
+export async function runMaintenanceTick(queue: JobQueue): Promise<void> {
+  await queue.reclaimStale()
+  await queue.enqueueUnique(SWEEP_TRASH_JOB, {})
+  await queue.enqueueUnique(PRUNE_UPLOADS_JOB, {})
+  await queue.enqueueUnique(PRUNE_JOBS_JOB, {})
+}
+
+/**
+ * Starts the cadence. Called once at boot; `stop` belongs to shutdown.
+ *
+ * A self-rescheduling timeout rather than an interval, so a tick that takes longer than
+ * the period delays the next one instead of overlapping it. A tick that throws is logged
+ * and the next one is scheduled regardless: the whole of #107 was chores that stopped
+ * happening, and a cadence that a single bad hour can end is the same bug again.
+ */
+export function startMaintenance(
+  queue: JobQueue,
+  options: { firstDelayMs?: number; intervalMs?: number } = {},
+): MaintenanceSchedule {
+  const intervalMs = options.intervalMs ?? MAINTENANCE_INTERVAL_MS
+  let stopped = false
+  let timer: ReturnType<typeof setTimeout>
+
+  const tick = async () => {
+    try {
+      await runMaintenanceTick(queue)
+    } catch (error) {
+      console.error('maintenance tick failed', error)
+    }
+    if (!stopped) timer = setTimeout(tick, intervalMs)
+  }
+
+  timer = setTimeout(tick, options.firstDelayMs ?? FIRST_TICK_DELAY_MS)
+
+  return {
+    stop: () => {
+      stopped = true
+      clearTimeout(timer)
+    },
+  }
 }
