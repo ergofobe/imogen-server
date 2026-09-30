@@ -9,5 +9,5 @@ data/
 coverage/
 *.log
 
-# Copied in at build time from the @scalar/api-reference devDependency.
-packages/web/public/scalar.js
+# Supplied already-built UI for the server image. Not the app source.
+web-dist/

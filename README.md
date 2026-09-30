@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="packages/web/public/icons/icon.svg" width="72" height="72" alt="">
+  <img src="brand/imogen-mark.svg" width="72" height="72" alt="">
   <h1>imogen</h1>
   <p><strong>Your photo library, on your own server.</strong></p>
 </div>
@@ -283,7 +283,6 @@ export DATABASE_URL='postgres://imogen:imogen@localhost:5432/imogen'
 bun run db:migrate
 
 bun run dev        # API on :3000
-bun run dev:web    # web on :5173, proxying to the API
 ```
 
 ```bash
@@ -301,7 +300,7 @@ exactly the parts a mock would let you get wrong.
 | Package | What it is |
 |---|---|
 | `packages/server` | Hono app: routes, auth, media pipeline, job workers. |
-| `packages/web` | The React PWA. It consumes `@imogen/sdk` like any third-party client, which keeps the SDK honest. |
+| PWA | The React app lives in [imogen-pwa](https://github.com/ergofobe/imogen-pwa). This server only serves a prebuilt `web-dist/`. |
 | `packages/mcp` | The stdio bridge for local agents. |
 
 The client libraries live in their own repository,

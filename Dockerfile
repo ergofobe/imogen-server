@@ -1,12 +1,13 @@
 # syntax=docker/dockerfile:1
 
-# The web bundle is an input. Build it, then the image:
+# The web bundle is an input. Put the already-built files in web-dist/ (index.html
+# at the top), then the image:
 #
-#     bun run --filter '@imogen/web' build
 #     docker build -t imogen .
 #
-# packages/web stays in this repository and still builds on its own. This image only
-# copies packages/web/dist. The client packages are a submodule at ./imogen-sdk, so they
+# This image does not compile a UI. It copies web-dist to packages/web/dist, which is
+# where the server reads the bundle. web-dist is not the app source. The client
+# packages are a submodule at ./imogen-sdk, so they
 # are inside the context;
 # build from a clone made with --recurse-submodules or the two COPY lines below fail the
 # build outright. Once the packages are on npm those lines go away with the overrides
@@ -25,12 +26,14 @@ COPY imogen-sdk/typescript/packages/sdk imogen-sdk/typescript/packages/sdk
 COPY package.json bun.lock ./
 COPY packages/server/package.json packages/server/
 COPY packages/mcp/package.json packages/mcp/
-COPY packages/web/package.json packages/web/
 RUN bun install --frozen-lockfile --production
 
 COPY . .
 # Fail here, before the runtime stage, when the context has no bundle.
-RUN test -s packages/web/dist/index.html
+# web-dist is the supplied bundle. The server still reads packages/web/dist.
+RUN test -s web-dist/index.html \
+ && mkdir -p packages/web/dist \
+ && cp -a web-dist/. packages/web/dist/
 
 # ---- Runtime --------------------------------------------------------------
 FROM oven/bun:1.3-debian AS runtime
