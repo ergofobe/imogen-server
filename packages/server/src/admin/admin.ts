@@ -294,13 +294,32 @@ export class AdminService {
    * description says what makes a row unrepairable.
    */
   async repairs(): Promise<AdminRepair[]> {
+    const names = Object.keys(REPAIRS) as RepairName[]
+
+    // Named and grouped, so Postgres answers with one row per repair rather than one per
+    // queued job. The panel polls this every fifteen seconds while a pass walks, which is
+    // when the queue is at its largest: unfiltered, it pulled every `asset.ingest` row of
+    // a bulk import across the wire and built objects for all of them to test two names.
+    // Same shape as `queueHealth` above. See #94.
+    //
+    // This bounds what comes back, not what is read: nothing indexes `jobs.name`, so the
+    // scan itself remains. Indexing a write-hot table to save a read made four times a
+    // minute is its own trade-off, and it is #114.
     const active = await this.db
       .select({ name: jobs.name })
       .from(jobs)
-      .where(inArray(jobs.status, ['queued', 'running']))
+      .where(
+        and(
+          inArray(
+            jobs.name,
+            names.map((name) => REPAIRS[name].job),
+          ),
+          inArray(jobs.status, ['queued', 'running']),
+        ),
+      )
+      .groupBy(jobs.name)
     const running = new Set(active.map((row) => row.name))
 
-    const names = Object.keys(REPAIRS) as RepairName[]
     return Promise.all(
       names.map(async (name) => {
         const repair = REPAIRS[name]

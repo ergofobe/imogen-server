@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from 'bun:test'
 import { render, startDom, stopDom } from '../../test/dom.ts'
 
 beforeAll(() => startDom())
@@ -43,8 +43,10 @@ const REPAIRS = {
   ],
 }
 const started: string[] = []
+/** What `GET /api/v1/admin/repairs` does next. Swapped per test, like `answer` above. */
+let repairsAnswer: () => Promise<unknown> = () => Promise.resolve(REPAIRS)
 const httpRequest = mock((method: string, path: string) => {
-  if (method === 'GET') return Promise.resolve(REPAIRS)
+  if (method === 'GET') return repairsAnswer()
   started.push(path)
   return Promise.resolve(undefined)
 })
@@ -60,6 +62,21 @@ mock.module('../../lib/client.ts', () => ({
     http: { request: httpRequest },
   },
 }))
+/**
+ * Both stubs go back to their defaults between tests.
+ *
+ * They were restored on each test's last line, which is the line that does not run when
+ * an assertion above it throws — so one failure used to leak into every test after it and
+ * arrive as a different, more confusing failure.
+ */
+afterEach(() => {
+  answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+  repairsAnswer = () => Promise.resolve(REPAIRS)
+  started.length = 0
+})
+
+/** The client behind the panel most recently rendered, for a test that drives a refetch. */
+let panelClient: import('@tanstack/react-query').QueryClient | undefined
 
 async function renderPanel() {
   const { act } = await import('react')
@@ -67,6 +84,7 @@ async function renderPanel() {
   const { AdminProcessing } = await import('./AdminProcessing.tsx')
 
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+  panelClient = client
   const container = await render(
     <QueryClientProvider client={client}>
       <AdminProcessing />
@@ -121,8 +139,6 @@ describe('the processing panel once the queue can be read again', () => {
     const text = container.textContent ?? ''
     expect(text).toMatch(/nothing is waiting/i)
     expect(text).not.toMatch(/could not be read/i)
-
-    answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
   })
 })
 
@@ -176,6 +192,133 @@ describe('the repairs offered in the processing panel', () => {
     })
 
     expect(started).toEqual(['/api/v1/admin/repairs/captureTime'])
+  })
+})
+
+/**
+ * One failed poll must not take the section away.
+ *
+ * `retry: false` is right here for the same reason it is right above — a pool that cannot
+ * give a connection takes the full backstop to fail, and three of those in series would
+ * keep the panel silent for minutes. What made it a dead end was the refetch interval,
+ * which read `data` to decide whether to keep asking: after an error `data` is undefined,
+ * so the interval was `false`, nothing ever asked again, and the section rendered nothing
+ * at all — no error, no button, no repairs (#89). An administrator saw the controls
+ * simply vanish while a pass might still have been walking the library.
+ */
+describe('the repairs list when it cannot be read', () => {
+  test('says so rather than taking the section away', async () => {
+    answer = () => Promise.resolve(HEALTHY)
+    repairsAnswer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+
+    const container = await panelShowing(/repairs could not be read/i)
+
+    expect(container.textContent ?? '').toMatch(/repairs could not be read/i)
+    expect(container.textContent ?? '').toMatch(/timed out/i)
+  })
+
+  test('offers a way to ask again, and comes back when it works', async () => {
+    const { act } = await import('react')
+    answer = () => Promise.resolve(HEALTHY)
+    repairsAnswer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+
+    const container = await panelShowing(/repairs could not be read/i)
+    const button = [...container.querySelectorAll('button')].find((b) =>
+      /try again/i.test(b.textContent ?? ''),
+    )
+    expect(button).toBeDefined()
+
+    repairsAnswer = () => Promise.resolve(REPAIRS)
+    await act(async () => {
+      button?.click()
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    })
+
+    const text = container.textContent ?? ''
+    expect(text).toMatch(/21,802 to examine/)
+    expect(text).not.toMatch(/repairs could not be read/i)
+  })
+
+  /**
+   * The interval is the half of #89 no rendering assertion can see: the panel could show
+   * an error and still never ask again. It has to go on asking on its own, because the
+   * administrator who has walked away from the tab is exactly the one this panel is for.
+   */
+  test('keeps asking after a failure instead of giving up', async () => {
+    const { repairsPollInterval } = await import('./AdminProcessing.tsx')
+
+    expect(repairsPollInterval({ status: 'error', data: undefined })).toBeGreaterThan(0)
+  })
+
+  /**
+   * A 404 gets no special treatment, tempting as it is.
+   *
+   * It reads like "this server is too old to have the route", and silence would be the
+   * right answer to that. But the admin API refuses *everything* with a plain 404 on
+   * purpose — it is meant to be undiscoverable, not merely closed — so a session that
+   * expires while the tab is open produces exactly the same status. Treating it as an
+   * absent route would leave a stale list on screen with "Walking the library" still
+   * showing and nothing asking again: #89, arrived at by another road.
+   */
+  test('reports a 404 like any other failure, because this API refuses with one', async () => {
+    const { ImogenError } = await import('@imogen/sdk')
+    const refusal = new ImogenError(404, 'not_found', 'Not Found')
+
+    answer = () => Promise.resolve(HEALTHY)
+    repairsAnswer = () => Promise.reject(refusal)
+    const container = await panelShowing(/repairs could not be read/i)
+
+    expect(container.textContent ?? '').toMatch(/repairs could not be read/i)
+  })
+})
+
+/**
+ * A failed poll must not take away what the panel already knows.
+ *
+ * React Query keeps the last good `data` through an error, and this only polls while a
+ * pass is walking — so treating any error as "nothing to show" would swap the live list,
+ * the "Walking the library" row and the Start buttons for a red box every time one poll
+ * in the fifteen-second cadence blipped, and swap them back on the next. The failure is
+ * news; the list is not stale enough to be worth hiding.
+ */
+describe('the repairs list when a later poll fails', () => {
+  test('keeps the list it already has, and says the reading failed above it', async () => {
+    const { act } = await import('react')
+    answer = () => Promise.resolve(HEALTHY)
+    repairsAnswer = () => Promise.resolve(REPAIRS)
+    const container = await panelShowing(/to examine/)
+
+    repairsAnswer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+    await act(async () => {
+      await panelClient?.refetchQueries({ queryKey: ['admin', 'repairs'] })
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    })
+
+    const text = container.textContent ?? ''
+    expect(text).toMatch(/repairs could not be read/i)
+    expect(text).toMatch(/21,802 to examine/)
+  })
+})
+
+/**
+ * The queue failing must not take the repairs with it.
+ *
+ * `<Repairs>` used to be rendered only inside the queue query's success branch, so one
+ * failed `GET /api/v1/admin/queue` unmounted it — the #89 symptom reached through the
+ * other door, and worse during a pass than at rest: a queued repair job puts the queue's
+ * own interval down to three seconds, so any one of twenty polls a minute took the
+ * Repairs controls off the screen until the next one succeeded. A banner cannot report
+ * anything from a component that is not mounted.
+ */
+describe('the repairs list when the queue above it cannot be read', () => {
+  test('stays on screen while the queue reports its own failure', async () => {
     answer = () => Promise.reject(new Error('Database query timed out after 45000ms'))
+    repairsAnswer = () => Promise.resolve(REPAIRS)
+
+    const container = await panelShowing(/21,802 to examine/)
+
+    const text = container.textContent ?? ''
+    expect(text).toMatch(/queue could not be read/i)
+    expect(text).toMatch(/21,802 to examine/)
   })
 })

@@ -1,8 +1,13 @@
 import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
+import { SQL } from 'bun'
 import { sql } from 'drizzle-orm'
+import { drizzle } from 'drizzle-orm/bun-sql'
+import { AdminService } from '../admin/admin.ts'
 import { createApp } from '../app.ts'
+import { schema } from '../db/index.ts'
 import { jobs } from '../db/schema.ts'
 import { FACE_MODELS_JOB } from '../jobs/faces.ts'
+import { CAPTURE_TIME_REPAIR_JOB, ORIENTATION_REPAIR_JOB } from '../jobs/repair.ts'
 import { createServices } from '../services.ts'
 import { createTestConfig, createTestDatabase, removeTestConfig } from '../test/harness.ts'
 
@@ -497,6 +502,56 @@ describe('one-off repairs', () => {
       expect(response.status).toBe(404)
     }
     expect(await harness.db.select().from(jobs)).toEqual([])
+  })
+
+  /**
+   * The panel polls this every fifteen seconds while a pass walks, which is exactly when
+   * the queue is at its largest: a bulk import leaves tens of thousands of `asset.ingest`
+   * rows queued. Reading all of them to answer a two-name question made the cost scale
+   * with the very thing the panel is most often watched during (#94).
+   *
+   * So what is asserted here is the question put to Postgres, not only the answer that
+   * came back. A right answer bought by dragging the whole queue into memory is the
+   * defect, and no assertion about `state` can see it.
+   */
+  test('asks about the two repair jobs rather than reading every queued row', async () => {
+    const asked: Array<{ statement: string; params: unknown[] }> = []
+    const logged = drizzle({
+      client: new SQL(harness.url),
+      schema,
+      casing: 'snake_case',
+      logger: { logQuery: (statement, params) => asked.push({ statement, params }) },
+    })
+    const admin = new AdminService(logged, services.settings, () =>
+      Promise.reject(new Error('this test starts nothing')),
+    )
+
+    await harness.db.insert(jobs).values(
+      Array.from({ length: 200 }, () => ({
+        name: 'asset.ingest',
+        payload: {},
+        status: 'queued' as const,
+      })),
+    )
+    await harness.db
+      .insert(jobs)
+      .values({ name: CAPTURE_TIME_REPAIR_JOB, payload: {}, status: 'running' as const })
+
+    let items: Awaited<ReturnType<AdminService['repairs']>>
+    try {
+      items = await admin.repairs()
+    } finally {
+      await logged.$client.end()
+    }
+
+    expect(items.find((r) => r.name === 'captureTime')?.state).toBe('running')
+    expect(items.find((r) => r.name === 'exifOrientation')?.state).toBe('idle')
+
+    const aboutJobs = asked.filter((q) => q.statement.includes('"jobs"'))
+    expect(aboutJobs).toHaveLength(1)
+    expect(aboutJobs[0]?.params).toEqual(
+      expect.arrayContaining([CAPTURE_TIME_REPAIR_JOB, ORIENTATION_REPAIR_JOB]),
+    )
   })
 
   test('an ordinary account cannot see them, let alone run one', async () => {

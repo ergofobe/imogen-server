@@ -36,26 +36,36 @@ export function AdminProcessing() {
 
   // A skeleton here would be a lie: this panel is the only place a stalled pipeline shows
   // up, so when it cannot be read it has to say so rather than go on pulsing. See #71.
+  //
+  // Returned as a sibling of the repairs below rather than in place of them. The queue
+  // and the repairs are read by separate queries that fail separately, and while a pass
+  // is walking this one polls every three seconds — so letting its failure return early
+  // took the repair controls off the screen twenty times a minute, which is #89 again
+  // through the other door.
   if (isError || !data) {
     return (
-      <section className="rounded-xl border border-red-500/40 p-4">
-        <h2 className="heading-display text-xl">Processing</h2>
-        <p className="mt-1 text-sm text-red-500">
-          The queue could not be read, so there is no telling whether photographs are being worked
-          through.
-        </p>
-        <pre className="mt-3 overflow-x-auto rounded-lg bg-sunken p-3 font-mono text-[12px] leading-relaxed text-muted">
-          {errorText(error)}
-        </pre>
-        <button
-          type="button"
-          onClick={() => void refetch()}
-          disabled={isFetching}
-          className="mt-3 rounded-lg border border-line px-3 py-1.5 text-sm transition hover:bg-sunken disabled:opacity-50"
-        >
-          {isFetching ? 'Asking' : 'Try again'}
-        </button>
-      </section>
+      <div className="space-y-8">
+        <section className="rounded-xl border border-red-500/40 p-4">
+          <h2 className="heading-display text-xl">Processing</h2>
+          <p className="mt-1 text-sm text-red-500">
+            The queue could not be read, so there is no telling whether photographs are being worked
+            through.
+          </p>
+          <pre className="mt-3 overflow-x-auto rounded-lg bg-sunken p-3 font-mono text-[12px] leading-relaxed text-muted">
+            {errorText(error)}
+          </pre>
+          <button
+            type="button"
+            onClick={() => void refetch()}
+            disabled={isFetching}
+            className="mt-3 rounded-lg border border-line px-3 py-1.5 text-sm transition hover:bg-sunken disabled:opacity-50"
+          >
+            {isFetching ? 'Asking' : 'Try again'}
+          </button>
+        </section>
+
+        <Repairs onStarted={refresh} />
+      </div>
     )
   }
 
@@ -149,18 +159,12 @@ type Repair = {
 function Repairs({ onStarted }: { onStarted: () => void }) {
   const queryClient = useQueryClient()
 
-  const { data, isPending, isError } = useQuery({
+  const { data, isPending, isError, error, refetch, isFetching } = useQuery({
     queryKey: ['admin', 'repairs'],
     queryFn: () => imogen.http.request<{ items: Repair[] }>('GET', '/api/v1/admin/repairs'),
-    // Polled only while a pass is walking, and slowly. What it is waiting for is the pass
-    // finishing — the state going back to `done` and the button returning — not the count,
-    // which for the capture-time pass never falls: a repaired row still matches its own
-    // predicate, which is exactly what makes the pass safe to run twice. Progress belongs
-    // to the queue panel above. Each answer costs a count over every asset, and the
-    // orientation one reads a JSON field no index can serve, so asking every three seconds
-    // for the hours a large library takes would only contend with the walk's own reads.
-    refetchInterval: (query) =>
-      query.state.data?.items.some((repair) => repair.state === 'running') ? 15_000 : false,
+    refetchInterval: (query) => repairsPollInterval(query.state),
+    // No retry, for the reason the queue above gives. What made that a dead end here was
+    // the interval, not this: see `repairsPollInterval`.
     retry: false,
   })
 
@@ -177,9 +181,20 @@ function Repairs({ onStarted }: { onStarted: () => void }) {
     },
   })
 
-  // Silent when it cannot be read, unlike the queue above: nothing is wrong with a server
-  // that has no repairs to offer, and an older one has no such route at all.
-  if (isPending || isError || !data || data.items.length === 0) return null
+  if (isPending) return null
+
+  // Every failure is reported: this section can be the only sign that a pass is walking
+  // the library, and #89 had it disappear on a single transient 500 with nothing said and
+  // nothing asking again. The one silence left is having no repairs to offer.
+  //
+  // Not even a 404 is excused, tempting as it is to read one as "this server is too old
+  // to have the route". The admin API refuses everything with a plain 404 on purpose — it
+  // is meant to be undiscoverable rather than merely closed — so an expired session
+  // arrives as the same status, and excusing it would leave a stale list on screen with
+  // "Walking the library" still showing and nothing asking again.
+  const failure = isError ? errorText(error) : null
+  const items = data?.items ?? []
+  if (!failure && items.length === 0) return null
 
   return (
     <section>
@@ -191,8 +206,35 @@ function Repairs({ onStarted }: { onStarted: () => void }) {
         </p>
       </header>
 
+      {/*
+        A banner over the list rather than instead of it. React Query keeps the last good
+        answer through an error, and this only polls while a pass is walking — so replacing
+        the list would blank the running row and the buttons on every blip in the
+        fifteen-second cadence and restore them on the next. The failure is the news; what
+        was already known is still worth showing.
+      */}
+      {failure && (
+        <div className="mb-4 rounded-xl border border-red-500/40 p-4">
+          <p className="text-sm text-red-500">
+            The repairs could not be read, so there is no telling whether one is walking the
+            library.
+          </p>
+          <pre className="mt-3 overflow-x-auto rounded-lg bg-sunken p-3 font-mono text-[12px] leading-relaxed text-muted">
+            {failure}
+          </pre>
+          <button
+            type="button"
+            onClick={() => void refetch()}
+            disabled={isFetching}
+            className="mt-3 rounded-lg border border-line px-3 py-1.5 text-sm transition hover:bg-sunken disabled:opacity-50"
+          >
+            {isFetching ? 'Asking' : 'Try again'}
+          </button>
+        </div>
+      )}
+
       <ul className="space-y-2">
-        {data.items.map((repair) => (
+        {items.map((repair) => (
           <li key={repair.name} className="rounded-xl border border-line p-4">
             <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
               <p className="text-sm">{repair.title}</p>
@@ -224,6 +266,35 @@ function Repairs({ onStarted }: { onStarted: () => void }) {
     </section>
   )
 }
+
+/**
+ * How long until the repairs list is asked again, or `false` to stop asking.
+ *
+ * Exported because this function *is* #89. It used to read `data` alone: after a failed
+ * poll `data` is undefined, so it returned `false`, and with `retry: false` above nothing
+ * ever asked again — one transient 500 left the query errored for the life of the page.
+ * A failure therefore gets the same cadence a running pass gets, and the panel heals on
+ * its own rather than waiting to be remounted. Only while the tab is in front, mind:
+ * `refetchIntervalInBackground` is false by default, so an administrator who has walked
+ * away is brought up to date by `refetchOnWindowFocus` when they come back, not by this.
+ *
+ * A quiet list is still not polled. What the interval waits for is a pass finishing — the
+ * state going back to `done` and the button returning — not the count, which for the
+ * capture-time pass never falls: a repaired row still matches its own predicate, which is
+ * exactly what makes the pass safe to run twice. Progress belongs to the queue panel
+ * above. Each answer costs a count over every asset, and the orientation one reads a JSON
+ * field no index can serve, so asking every three seconds for the hours a large library
+ * takes would only contend with the walk's own reads.
+ */
+export function repairsPollInterval(state: {
+  status: 'pending' | 'error' | 'success'
+  data: { items: Repair[] } | undefined
+}): number | false {
+  if (state.status === 'error') return REPAIRS_POLL_MS
+  return state.data?.items.some((repair) => repair.state === 'running') ? REPAIRS_POLL_MS : false
+}
+
+const REPAIRS_POLL_MS = 15_000
 
 function FailureRow({ job, onChanged }: { job: AdminJob; onChanged: () => void }) {
   const retry = useMutation({
