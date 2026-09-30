@@ -1,5 +1,6 @@
 services:
   imogen:
+    # packages/web/dist must already exist. The image copies it and does not compile the UI.
     build:
       context: .
     # A released minor, not :latest — CI moves :latest on every push to main, so

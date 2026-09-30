@@ -5,6 +5,9 @@ node_modules
 **/.gradle
 **/.venv
 **/dist
+# The server image consumes this bundle. It does not compile packages/web.
+!packages/web/dist
+!packages/web/dist/**
 **/dev-dist
 data
 .git
