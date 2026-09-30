@@ -305,15 +305,18 @@ export class JobQueue {
         console.error(`job ${job.name} ${job.id}: ${outcome.reason}`)
         if (outcome.ours) {
           // Outside the handler's `catch`, which routes a failure into `fail` and would
-          // requeue the very job this branch has just decided must not be retried. A row
-          // that cannot be marked failed is left `running` with its beat stopped, which
-          // is what a worker that died looks like, and the hourly reclaim knows that one.
+          // requeue the very job this branch has just decided must not be retried.
           await this.writeAttempt('abandonment', job.id, job.attempts, {
             status: 'failed',
             finishedAt: new Date(),
             lastError: outcome.reason,
           }).catch((error: unknown) => {
             console.error('job abandonment could not be recorded:', describeError(error))
+            // The handler is still running in this process. A stopped beat leaves the
+            // row looking like a dead worker, so the hourly reclaim would start a second
+            // copy beside it. Keep beating until the handler settles.
+            const resumed = this.watch(job.id, job.attempts)
+            void settled.finally(() => resumed.stop())
           })
         }
         return

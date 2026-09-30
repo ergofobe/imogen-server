@@ -294,6 +294,82 @@ describe('failure handling', () => {
   })
 
   /**
+   * The write that records the abandonment is the only thing standing between a hung
+   * handler and a second one. It has its own catch so a dropped connection cannot fall
+   * through into `fail` and requeue it — but swallowing the error left the row `running`
+   * with its beat stopped, which is what a dead worker looks like. The hourly reclaim
+   * would then start another copy beside the handler this process is still running.
+   */
+  test('keeps beating when the abandonment write throws, so reclaim cannot start a second worker', async () => {
+    let dropped = false
+    const flaky = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop !== 'update') return Reflect.get(target, prop, receiver)
+        const update = Reflect.get(target, prop, receiver) as (table: unknown) => {
+          set: (values: Record<string, unknown>) => { execute: () => Promise<unknown> }
+        }
+        return (table: unknown) => {
+          const builder = update.call(target, table)
+          const set = builder.set.bind(builder)
+          builder.set = (values: Record<string, unknown>) => {
+            const next = set(values)
+            const abandoning =
+              values.status === 'failed' &&
+              typeof values.lastError === 'string' &&
+              values.lastError.includes('Abandoned')
+            // `await` runs the query through `execute`. Reject that, once.
+            if (abandoning && !dropped) {
+              dropped = true
+              next.execute = () => Promise.reject(new Error('connection dropped'))
+            }
+            return next
+          }
+          return builder
+        }
+      },
+    }) as Database
+
+    const queue = new JobQueue(flaky, {
+      concurrency: 1,
+      idlePollMs: 5,
+      // Lifetime before the first beat, so a stopped vigil leaves `started_at` at claim.
+      heartbeatMs: 40,
+      maxJobLifetimeMs: 25,
+    })
+    let calls = 0
+    let release: () => void = () => {}
+    const hanging = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    queue.register('hung', async () => {
+      calls++
+      await hanging
+    })
+    await queue.enqueue('hung', {}, { maxAttempts: 3 })
+
+    const wasError = console.error
+    console.error = () => {}
+    try {
+      expect(await queue.drain(1)).toBe(1)
+      // Long enough that a stopped beat is silence, and that a resumed one has landed.
+      await Bun.sleep(200)
+      expect(await queue.reclaimStale(100 / 60_000)).toBe(0)
+      expect(await queue.drain(1)).toBe(0)
+    } finally {
+      console.error = wasError
+      release()
+      await Bun.sleep(30)
+    }
+
+    expect(dropped).toBe(true)
+    expect(calls).toBe(1)
+    const [row] = await db.select().from(jobs)
+    expect(row!.status).toBe('running')
+    expect(row!.attempts).toBe(1)
+    expect(row!.finishedAt).toBeNull()
+  })
+
+  /**
    * The other end of giving up on a job: once the row has been let go of, the worker that
    * eventually returns must not write over what replaced it.
    */
