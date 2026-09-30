@@ -299,6 +299,10 @@ describe('failure handling', () => {
    * through into `fail` and requeue it — but swallowing the error left the row `running`
    * with its beat stopped, which is what a dead worker looks like. The hourly reclaim
    * would then start another copy beside the handler this process is still running.
+   *
+   * Keeping the beat only covers the hang. Once the handler settles, stopping it leaves
+   * the same corpse: `running`, quiet, until the hourly reclaim runs the job again.
+   * The settlement has to be written onto the row.
    */
   test('keeps beating when the abandonment write throws, so reclaim cannot start a second worker', async () => {
     let dropped = false
@@ -355,18 +359,31 @@ describe('failure handling', () => {
       await Bun.sleep(200)
       expect(await queue.reclaimStale(100 / 60_000)).toBe(0)
       expect(await queue.drain(1)).toBe(0)
+      const [hung] = await db.select().from(jobs)
+      expect(hung!.status).toBe('running')
+      expect(hung!.finishedAt).toBeNull()
     } finally {
       console.error = wasError
       release()
-      await Bun.sleep(30)
+    }
+
+    // The handler has settled. A row still `running` here has no beat and no terminal
+    // write, which is the corpse the hourly reclaim picks up.
+    const deadline = Date.now() + 1000
+    let row = (await db.select().from(jobs))[0]
+    while (row?.status === 'running' && Date.now() < deadline) {
+      await Bun.sleep(10)
+      row = (await db.select().from(jobs))[0]
     }
 
     expect(dropped).toBe(true)
     expect(calls).toBe(1)
-    const [row] = await db.select().from(jobs)
-    expect(row!.status).toBe('running')
+    expect(row!.status).toBe('done')
     expect(row!.attempts).toBe(1)
-    expect(row!.finishedAt).toBeNull()
+    expect(row!.finishedAt).not.toBeNull()
+    expect(row!.lastError).toBeNull()
+    expect(await queue.drain(1)).toBe(0)
+    expect(calls).toBe(1)
   })
 
   /**

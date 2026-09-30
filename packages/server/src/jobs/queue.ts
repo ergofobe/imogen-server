@@ -316,7 +316,10 @@ export class JobQueue {
             // row looking like a dead worker, so the hourly reclaim would start a second
             // copy beside it. Keep beating until the handler settles.
             const resumed = this.watch(job.id, job.attempts)
-            void settled.finally(() => resumed.stop())
+            void settled.then((result) => {
+              resumed.stop()
+              return this.finishAfterAbandonment(job, result)
+            })
           })
         }
         return
@@ -436,6 +439,58 @@ export class JobQueue {
         clearInterval(beat)
         clearTimeout(deadline)
       },
+    }
+  }
+
+  /**
+   * The abandonment write did not land, and the handler has since settled. The beat is
+   * stopped, so a row left `running` is a dead worker and the hourly reclaim runs the
+   * job again. Record how it ended. If that write cannot land either, hand this attempt
+   * back the way a dead worker's row is handed back.
+   */
+  private async finishAfterAbandonment(
+    job: { id: string; attempts: number; max_attempts: number },
+    result: { threw: false } | { threw: true; error: unknown },
+  ): Promise<void> {
+    try {
+      if (result.threw) {
+        await this.writeAttempt('failure', job.id, job.attempts, {
+          status: 'failed',
+          finishedAt: new Date(),
+          lastError: describeError(result.error),
+        })
+        return
+      }
+      await this.writeAttempt('completion', job.id, job.attempts, {
+        status: 'done',
+        finishedAt: new Date(),
+        lastError: null,
+      })
+    } catch (error) {
+      console.error('job abandonment could not be recorded:', describeError(error))
+      const spent = job.attempts >= job.max_attempts
+      await this.writeAttempt(
+        'reclaim',
+        job.id,
+        job.attempts,
+        spent
+          ? {
+              status: 'failed',
+              finishedAt: new Date(),
+              lastError: RECLAIMED,
+              startedAt: null,
+              runAt: sql`now()`,
+            }
+          : {
+              status: 'queued',
+              finishedAt: null,
+              lastError: RECLAIMED,
+              startedAt: null,
+              runAt: sql`now()`,
+            },
+      ).catch((again: unknown) => {
+        console.error('job abandonment could not be recorded:', describeError(again))
+      })
     }
   }
 
