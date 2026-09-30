@@ -30,7 +30,7 @@
     "onnxruntime-node"
   ],
   "overrides": {
-    "@imogen/shared": "file:imogen-sdk/typescript/packages/shared",
+    "@imogen/shared": "git+https://github.com/ergofobe/imogen-common.git#v0.5.1",
     "@imogen/sdk": "file:imogen-sdk/typescript/packages/sdk"
   }
 }
