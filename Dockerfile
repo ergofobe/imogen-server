@@ -1,10 +1,13 @@
 # syntax=docker/dockerfile:1
 
-# An ordinary context of this repository:
+# The web bundle is an input. Build it, then the image:
 #
+#     bun run --filter '@imogen/web' build
 #     docker build -t imogen .
 #
-# The client packages are a submodule at ./imogen-sdk, so they are inside the context;
+# packages/web stays in this repository and still builds on its own. This image only
+# copies packages/web/dist. The client packages are a submodule at ./imogen-sdk, so they
+# are inside the context;
 # build from a clone made with --recurse-submodules or the two COPY lines below fail the
 # build outright. Once the packages are on npm those lines go away with the overrides
 # block.
@@ -23,15 +26,11 @@ COPY package.json bun.lock ./
 COPY packages/server/package.json packages/server/
 COPY packages/mcp/package.json packages/mcp/
 COPY packages/web/package.json packages/web/
-RUN bun install --frozen-lockfile
+RUN bun install --frozen-lockfile --production
 
 COPY . .
-RUN bun run --filter '@imogen/web' build
-
-# The reference viewer is copied into the web bundle during that build, so the
-# devDependency it came from has done its job. Reinstalling without development
-# dependencies keeps several hundred packages out of the runtime image.
-RUN rm -rf node_modules && bun install --frozen-lockfile --production
+# Fail here, before the runtime stage, when the context has no bundle.
+RUN test -s packages/web/dist/index.html
 
 # ---- Runtime --------------------------------------------------------------
 FROM oven/bun:1.3-debian AS runtime
